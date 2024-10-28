@@ -151,13 +151,27 @@ setup_geo_filter() {
     [ -n "$protocol" ] && base_rule="$base_rule $protocol"
 
     # Include src_port in the rule if set
-    if [ -n "$src_port" ]; then
-        base_rule="$base_rule sport { $src_port }"
+    if [ -n "$src_port" ] && [ "$src_port" != "any" ]; then
+        # Check if it's a port range
+        if echo "$src_port" | grep -q '-'; then
+            base_rule="$base_rule sport $src_port"
+        else
+            # Replace spaces with commas for nftables list format
+            src_port=$(echo "$src_port" | tr ' ' ',')
+            base_rule="$base_rule sport { $src_port }"
+        fi
     fi
 
     # Include dest_port in the rule if set
-    if [ -n "$dest_port" ]; then
-        base_rule="$base_rule dport { $dest_port }"
+    if [ -n "$dest_port" ] && [ "$dest_port" != "any" ]; then
+        # Check if it's a port range
+        if echo "$dest_port" | grep -q '-'; then
+            base_rule="$base_rule dport $dest_port"
+        else
+            # Replace spaces with commas for nftables list format
+            dest_port=$(echo "$dest_port" | tr ' ' ',')
+            base_rule="$base_rule dport { $dest_port }"
+        fi
     fi
 
     nft add rule inet geomate forward $base_rule ip daddr @${set_name}_allowed counter accept
@@ -217,14 +231,28 @@ create_dynamic_set() {
     [ -n "$src_ip" ] && base_rule="ip saddr $src_ip"
     [ -n "$protocol" ] && base_rule="$base_rule $protocol"
 
-    # Include src_port in the rule if set and not "any"
+    # Include src_port in the rule if set
     if [ -n "$src_port" ] && [ "$src_port" != "any" ]; then
-        base_rule="$base_rule sport { $src_port }"
+        # Check if it's a port range
+        if echo "$src_port" | grep -q '-'; then
+            base_rule="$base_rule sport $src_port"
+        else
+            # Replace spaces with commas for nftables list format
+            src_port=$(echo "$src_port" | tr ' ' ',')
+            base_rule="$base_rule sport { $src_port }"
+        fi
     fi
 
-    # Include dest_port in the rule if set and not "any"
+    # Include dest_port in the rule if set
     if [ -n "$dest_port" ] && [ "$dest_port" != "any" ]; then
-        base_rule="$base_rule dport { $dest_port }"
+        # Check if it's a port range
+        if echo "$dest_port" | grep -q '-'; then
+            base_rule="$base_rule dport $dest_port"
+        else
+            # Replace spaces with commas for nftables list format
+            dest_port=$(echo "$dest_port" | tr ' ' ',')
+            base_rule="$base_rule dport { $dest_port }"
+        fi
     fi
 
     # Add rule for the dynamic set
