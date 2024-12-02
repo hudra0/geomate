@@ -19,3 +19,10 @@ config geo_filter
 	list allowed_ip '185.216.14.7'
 	list allowed_region 'circle:53.826597:-0.922852:636905'
 
+config geo_filter
+	option name 'Fortnite'
+	option enabled '1'
+	option protocol 'udp'
+	option src_ip '192.168.1.208'
+	option dest_port '9000-9100'
+	option ip_list '/etc/geomate.d/fortnite_servers.txt'
