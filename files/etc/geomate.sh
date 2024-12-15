@@ -298,7 +298,13 @@ process_dynamic_set() {
 
         # Trigger geolocation update only if new IPs were added
         if [ $(wc -l < "$temp_file") -gt 0 ]; then
-            process_geo_data "$name" "$(config_get "$1" 'allowed_region')" "${set_name}_allowed" "${set_name}_blocked"
+            # Get the allowed regions
+            local allowed_region
+            config_get allowed_region "$1" 'allowed_region'
+            
+            # Process the geo data with correct parameter order:
+            # $1: name, $2: allowed_set, $3: blocked_set, $@: allowed_regions
+            process_geo_data "$name" "${set_name}_allowed" "${set_name}_blocked" "$allowed_region"
         fi
     else
         log_and_print "No new IPs in dynamic set for $name" 2
@@ -328,6 +334,7 @@ process_geo_data() {
     local geo_data_file="${GEOMATE_DATA_DIR}/${name}_geo_data.json"
 
     [ ! -f "$geo_data_file" ] && { log_and_print "Geo data file not found: $geo_data_file" 0; return; }
+    [ -z "$allowed_regions" ] && { log_and_print "No allowed regions specified for $name" 0; return; }
 
     log_and_print "Processing geo data for $name with allowed regions: $allowed_regions" 2
 
@@ -336,8 +343,10 @@ process_geo_data() {
 
     # Use jq to parse the JSON and feed it into the loop via Here-Document
     while IFS=$'\t' read -r ip lat lon; do
+        [ -z "$ip" ] || [ -z "$lat" ] || [ -z "$lon" ] && continue
         log_and_print "Checking IP: $ip, Lat: $lat, Lon: $lon" 2
 
+        # Check if IP is within any of the allowed regions
         if is_within_any_region "$lat" "$lon" $allowed_regions; then
             allowed_ips="${allowed_ips}${ip},"
             log_and_print "IP $ip is within allowed regions, added to $allowed_set" 2
@@ -500,12 +509,12 @@ run() {
             # Run geomate trigger to check for IP list changes and daily updates
             run_geomate_trigger
             
-            sleep 3600  # Check every hour
+            sleep 3600  # Check every hour (3600 seconds)
         done
     fi
     
     SLEEP_DURATION=60  # Desired sleep duration
-    CHECK_INTERVAL=1800  # Interval in seconds
+    CHECK_INTERVAL=1800  # Interval in seconds (1800 seconds = 30 minutes)
 
     last_config_md5=""
     last_check_time=$(date +%s)
