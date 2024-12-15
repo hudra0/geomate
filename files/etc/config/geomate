@@ -4,6 +4,7 @@ config global 'global'
 	option debug_level '0'
 	option strict_mode '1'
 	option operational_mode 'dynamic'
+	option geolocation_mode 'frequent'
 
 config settings 'settings'
 	option interface 'br-lan'
