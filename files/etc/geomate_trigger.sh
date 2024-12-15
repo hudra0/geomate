@@ -28,6 +28,9 @@ check_and_run_geolocate() {
     local last_geolocate_time=0
     local geolocate_interval=$MIN_GEOLOCATE_INTERVAL
     local new_ips_count=0
+    local geolocation_mode
+    
+    config_get geolocation_mode global geolocation_mode 'frequent'
 
     [ -f "$LAST_RUN_FILE" ] && last_geolocate_time=$(cat "$LAST_RUN_FILE")
     [ -f "${LAST_RUN_FILE}.interval" ] && geolocate_interval=$(cat "${LAST_RUN_FILE}.interval")
@@ -36,7 +39,17 @@ check_and_run_geolocate() {
 
     new_ips_count=$(wc -l < "$NEW_IPS_FILE")
 
-    if [ $((current_time - last_geolocate_time)) -ge $geolocate_interval ]; then
+    # Check if it's time for the daily update
+    local last_daily_update=0
+    [ -f "${LAST_RUN_FILE}.daily" ] && last_daily_update=$(cat "${LAST_RUN_FILE}.daily")
+    if [ $((current_time - last_daily_update)) -ge 86400 ]; then  # 86400 seconds = 24 hours
+        log_and_print "Geomate_Trigger: Starting daily update of all IPs" 1
+        /etc/geolocate.sh daily
+        echo $current_time > "${LAST_RUN_FILE}.daily"
+    fi
+
+    # Only do frequent updates if mode is 'frequent'
+    if [ "$geolocation_mode" = "frequent" ] && [ $((current_time - last_geolocate_time)) -ge $geolocate_interval ]; then
         local time_since_last_run=$((current_time - last_geolocate_time))
         local api_calls_allowed=$((RATE_LIMIT * (time_since_last_run / 60 + 1)))
         local ips_to_process=$((new_ips_count < api_calls_allowed ? new_ips_count : api_calls_allowed))
@@ -57,15 +70,6 @@ check_and_run_geolocate() {
         fi
         echo $geolocate_interval > "${LAST_RUN_FILE}.interval"
         echo $current_time > "$LAST_RUN_FILE"
-    fi
-
-    # Check if it's time for the daily update
-    local last_daily_update=0
-    [ -f "${LAST_RUN_FILE}.daily" ] && last_daily_update=$(cat "${LAST_RUN_FILE}.daily")
-    if [ $((current_time - last_daily_update)) -ge 86400 ]; then  # 86400 seconds = 24 hours
-        log_and_print "Geomate_Trigger: Starting daily update of all IPs" 1
-        /etc/geolocate.sh daily
-        echo $current_time > "${LAST_RUN_FILE}.daily"
     fi
 }
 
