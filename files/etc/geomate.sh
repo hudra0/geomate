@@ -13,6 +13,7 @@ load_config() {
     config_get interface settings interface 'br-lan'
     config_get debug_level global debug_level '0'
     config_get strict_mode global strict_mode '0'
+    config_get operational_mode global operational_mode 'dynamic'
 }
 
 # Log messages and optionally print them based on the debug level
@@ -218,13 +219,16 @@ create_dynamic_set() {
 
     local set_name="${NFT_SET_PREFIX}$(echo $name | tr ' ' '_')"
 
-    log_and_print "Setting up dynamic sets for $name" 1
+    log_and_print "Setting up sets for $name" 1
 
-    # Create existing dynamic set with 1-hour timeout
-    nft add set inet geomate ${set_name}_dynamic { type ipv4_addr\; flags dynamic,timeout\; timeout 1h\; }
-
-    # Create new dynamic set for the UI with 30-second timeout
+    # Create UI dynamic set in both modes (needed for map display)
     nft add set inet geomate ${set_name}_ui_dynamic { type ipv4_addr\; flags dynamic,timeout\; timeout 30s\; }
+
+    # Only create main dynamic set in dynamic mode
+    if [ "$operational_mode" != "static" ]; then
+        # Create existing dynamic set with 1-hour timeout
+        nft add set inet geomate ${set_name}_dynamic { type ipv4_addr\; flags dynamic,timeout\; timeout 1h\; }
+    fi
 
     # Create the base rule
     local base_rule=""
@@ -255,13 +259,15 @@ create_dynamic_set() {
         fi
     fi
 
-    # Add rule for the dynamic set
-    nft add rule inet geomate prerouting $base_rule update @${set_name}_dynamic { ip daddr }
-
-    # Add rule for the ui dynamic set
+    # Add rule for the ui dynamic set (always needed)
     nft add rule inet geomate prerouting $base_rule update @${set_name}_ui_dynamic { ip daddr }
 
-    log_and_print "Dynamic sets for $name set up successfully" 1
+    # Add rule for the main dynamic set only in dynamic mode
+    if [ "$operational_mode" != "static" ]; then
+        nft add rule inet geomate prerouting $base_rule update @${set_name}_dynamic { ip daddr }
+    fi
+
+    log_and_print "Sets for $name set up successfully" 1
 }
 
 # Process dynamic sets for a given configuration
@@ -476,6 +482,28 @@ run() {
     log_and_print "Service is running" 0
     echo $$ > "/var/run/geomate.pid"
     
+    # If in static mode, we don't need to run the monitoring loop
+    if [ "$operational_mode" = "static" ]; then
+        log_and_print "Running in static mode - checking for IP list changes" 1
+        
+        last_config_md5=""
+        
+        while true; do
+            # Check if the configuration has changed
+            current_config_md5=$(md5sum /etc/config/geomate)
+            if [ "$current_config_md5" != "$last_config_md5" ]; then
+                log_and_print "Configuration changed, updating filters" 1
+                setup_nftables_and_filters
+                last_config_md5=$current_config_md5
+            fi
+
+            # Run geomate trigger to check for IP list changes and daily updates
+            run_geomate_trigger
+            
+            sleep 3600  # Check every hour
+        done
+    fi
+    
     SLEEP_DURATION=60  # Desired sleep duration
     CHECK_INTERVAL=1800  # Interval in seconds
 
@@ -498,7 +526,7 @@ run() {
         remaining_time=$((CHECK_INTERVAL - elapsed_time))
         
         if [ $remaining_time -le 0 ]; then
-            # Perform actions
+            # Only perform dynamic updates in dynamic mode
             update_dynamic_ips
             run_geomate_trigger
             last_check_time=$current_time
