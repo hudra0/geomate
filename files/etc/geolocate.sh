@@ -9,6 +9,7 @@ IP_API_URL="http://ip-api.com/batch"
 BATCH_SIZE=90
 RATE_LIMIT=15
 RATE_LIMIT_WINDOW=60
+LOCK_FILE="/tmp/geomate_geolocation.lock"
 
 log_and_print() {
     local message="$1"
@@ -18,6 +19,18 @@ log_and_print() {
         echo "geolocate: $message"
     fi
 }
+
+cleanup() {
+    log_and_print "Removing lock file: $LOCK_FILE" 2
+    rm -f "$LOCK_FILE"
+}
+
+# Create lock file
+touch "$LOCK_FILE"
+log_and_print "Created lock file: $LOCK_FILE" 2
+
+# Ensure lock file is removed on script exit
+trap cleanup EXIT
 
 # Retrieves geographic information for a batch of IPs
 get_geo_info_batch() {
@@ -220,3 +233,18 @@ main() {
 }
 
 main "$@"
+status=$?
+
+if [ $status -eq 0 ]; then
+    log_and_print "Geolocation completed successfully, restarting geomate service"
+    /etc/init.d/geomate restart
+    restart_status=$?
+    if [ $restart_status -eq 0 ]; then
+        log_and_print "Service restart successful"
+    else
+        log_and_print "Service restart failed with status $restart_status"
+        status=$restart_status
+    fi
+fi
+
+exit $status
