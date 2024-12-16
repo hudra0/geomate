@@ -224,6 +224,32 @@ There are several ways to identify the correct ports and protocols for your game
    - You don't need to configure both source and destination ports
    - Port ranges are supported (e.g., '9000-9100')
 
+### Creating Multiple Regions for a Game
+
+You can allow game connections from multiple geographic areas by creating several circles for the same geofilter. Here's how:
+
+1. **Create Your First Circle**
+   - Click on the map to start drawing your first circle
+   - Enter a name for your geofilter (e.g., "COD" or "Fortnite")
+   - Configure your settings in the dialog box
+   - Click Save
+
+2. **Add More Circles to the Same Filter**
+   - Click on the map again to draw another circle
+   - Important: Use the exact same filter name as before
+   - The previous settings will appear automatically
+   - Adjust settings if needed, or keep them the same
+   - Click Save
+
+3. **Activate Your Changes**
+   - After adding all desired circles, click "Save & Apply"
+   - Your game can now connect to servers in all circled regions
+
+Example: If you want to play COD with friends from both Europe and USA:
+1. Draw a circle over Europe, name it "COD"
+2. Draw another circle over USA, use the same name "COD"
+3. Click "Save & Apply" - Done!
+
 ## Troubleshooting
 
 ### Common Issues and Solutions
