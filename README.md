@@ -25,6 +25,7 @@ Geomate is an OpenWrt application that enables you to control connections to gam
 - [Hardware Requirements](#hardware-requirements)
 - [Backup and Updates](#backup-and-updates)
 - [Support and Contribution](#support-and-contribution)
+- [Important Notes and Expectations](#important-notes-and-expectations)
 
 ## Alpha/Beta Use Terms
 
@@ -155,8 +156,7 @@ After installing Geomate and the LuCI interface:
 - Uses predefined IP lists
 - No automatic learning or IP tracking
 - Requires less system resources
-- Ideal for low-end routers or when you have complete server lists
-- More efficient operation due to reduced background processes
+- Probably better for low-end routers or when you have complete server lists
 
 ### Essential Server Whitelisting
 - **Matchmaking Servers**: Required by most games to find and join matches
@@ -169,7 +169,7 @@ After installing Geomate and the LuCI interface:
 
 ### Strict Mode Explained
 - **Disabled (Default)**: 
-  - Allows both known and untracked connections
+  - Allows both known and untracked connections - untracked connections are connections that are not yet geolocated by Geomate
   - Ideal during initial setup and learning phase
   - Helps build comprehensive IP lists
 
@@ -180,7 +180,7 @@ After installing Geomate and the LuCI interface:
 
 ### Geolocation Updates
 - **Frequent Mode**:
-  - Updates every 30-60 minutes
+  - Updates every 30-60 minutes - After this time geomate geolocates the newly collected IPs while gaming
   - Higher API usage
   - Better in early stages of learning
 
@@ -259,11 +259,13 @@ Example: If you want to play COD with friends from both Europe and USA:
      - Essential servers not whitelisted
      - Strict Mode enabled too early
      - Incorrect port configurations
+     - No game servers are within your allowed regions
    - Solutions:
      - Add necessary IPs to "Allowed IPs" list
      - Verify whitelist for matchmaking/relay servers
      - Confirm port configurations are correct
      - Disable Strict Mode during initial setup
+     - Change allowed regions (circles) if necessary
 
 2. **High Latency or Lag**
    - Causes:
@@ -297,6 +299,28 @@ Example: If you want to play COD with friends from both Europe and USA:
      - Consider hardware upgrade if persistent
      - Monitor system resources
 
+### Game-Specific Network Analysis
+- Use QoSmate for monitoring game connections
+- Consider Wireshark for detailed packet analysis
+- Use tcpdump for network traffic capture
+- Research your game's network behavior and server infrastructure
+- Some games may need specific server whitelisting
+
+### VPN-Related Issues
+- VPN usage may conflict with Geomate
+- Some games might not find matches with both active
+- Consider using either VPN or Geomate based on your needs
+
+### Matchmaking and Region Changes
+- Longer matchmaking times are normal with restricted regions
+- Game restart may be required after region changes
+- Consider expanding allowed regions if matchmaking is too slow
+
+### Additional Tips
+- During initial setup, keep Strict Mode disabled to allow IP learning
+- Regularly check log files for potential issues
+- After service restarts, allow time for firewall rules to rebuild
+
 ### Debug and Monitoring Tools
 
 1. **Debug Levels**
@@ -314,10 +338,9 @@ Example: If you want to play COD with friends from both Europe and USA:
    - Check for errors in IP list files
    - Monitor IP list updates and changes
 
-### Additional Tips
-- During initial setup, keep Strict Mode disabled to allow IP learning
-- Regularly check log files for potential issues
-- After service restarts, allow time for firewall rules to rebuild
+4. **Check nftables Rules**
+   - Use 'nft list table inet geomate' to view current rules
+   - Check for any unexpected rules or mislocated ips
 
 ## FAQ
 
@@ -333,6 +356,21 @@ A: When properly configured, Geomate should not noticeably impact game performan
 **Q: What happens if I restart Geomate during gameplay?**
 A: There might be a brief period where filtering is temporarily bypassed while firewall rules are rebuilt. This typically takes a few seconds to minutes.
 
+**Q: Will Geomate make my games easier or improve my gameplay?**
+A: No, Geomate is a connection management tool that helps you control which game servers you connect to. It doesn't affect gameplay mechanics or matchmaking algorithms.
+
+**Q: Can I use Geomate with a VPN?**
+A: While technically possible, using both Geomate and a VPN simultaneously may cause matchmaking issues. You might need to choose one or the other depending on your needs.
+
+**Q: Why does matchmaking take longer with Geomate?**
+A: When you restrict server regions, the game has fewer servers to choose from, which can increase matchmaking time. This is normal and expected behavior.
+
+**Q: Do I need to restart my game after changing regions?**
+A: Yes, if you modify region settings while a game is running, you may need to restart the game for the changes to take full effect.
+
+**Q: Will Geomate work with all my games?**
+A: Not necessarily. Games handle networking differently, and some may require specific configurations or might not work with geographic filtering at all. You may need to research your specific game's network behavior.
+
 **Q: Why do I need to whitelist certain servers?**
 A: Many games use central servers for matchmaking, authentication, and relay functions. These servers might be located outside your allowed regions but are essential for the game to function. Without whitelisting them, you might not be able to start the game or find matches, even if your game servers are properly configured.
 
@@ -346,6 +384,37 @@ A: The easiest way is to use QoSmate, another OpenWrt application:
 6. Look for UDP connections with consistent traffic - these are typically your game ports
 
 Important: Games may use either fixed ports (like CoD's source port 3074) or port ranges (like Fortnite's destination ports 9000-9100). Configure only the port that remains constant - you don't need to set both source and destination ports. Port ranges are supported using the format '9000-9100'.
+
+## Important Notes and Expectations
+
+### What Geomate Does and Doesn't Do
+- Geomate creates firewall rules to allow or block game servers based on their geographic location
+- It does NOT automatically make you a better player
+- It does NOT guarantee easier lobbies
+
+### Game Compatibility
+- Not all games have been tested with Geomate
+- Each game handles matchmaking differently
+- Some games may require specific server whitelisting
+- You might need to research your game's network behavior
+- Useful tools for game analysis:
+  - QoSmate
+  - Wireshark
+  - tcpdump
+
+## Tested Games Status
+
+| Game | Status | IP List Completeness | Notes |
+|------|--------|---------------------|--------|
+| Call of Duty (MW3, BO6, Warzone) | Working | High | Extensively tested, requires port 3074 UDP |
+| Fortnite | In Progress | Initial | Early testing phase, uses port range 9000-9100 |
+
+**Legend:**
+- Working: Tested and functioning as intended
+- In Progress: Currently being tested and improved
+- IP List Completeness:
+  - High: Most server IPs identified and verified
+  - Initial: Basic testing started, IP collection ongoing
 
 ## Hardware Requirements
 
@@ -403,9 +472,8 @@ This ensures that all your collected IP lists and configurations in the geomate.
 
 **Note**: Always make a backup of your IP lists before major updates, just to be safe.
 
-## Support and Contribution
+## Support
 
-For issues, questions, or contributions:
+For issues, questions
 - Open an issue on GitHub
-- Follow the contribution guidelines
-- Join our community discussions
+- Join our community discussions in the OpenWrt forums
