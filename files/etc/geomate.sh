@@ -1,5 +1,13 @@
 #!/bin/sh
 
+# shellcheck shell=ash
+# shellcheck disable=SC3043  # ash supports local variables
+# shellcheck disable=SC2317  # Functions are called by OpenWrt's system
+# shellcheck disable=SC2155  # Combined declaration and assignment is fine for our use case
+# shellcheck disable=SC1083  # nft syntax requires literal braces
+# shellcheck disable=SC1091  # OpenWrt's /lib/functions.sh is not available during shellcheck
+# shellcheck disable=SC2154  # Variables are assigned by OpenWrt's config_load
+
 . /lib/functions.sh
 
 GEOMATE_DATA_DIR="/etc/geomate.d"
@@ -175,12 +183,12 @@ setup_geo_filter() {
         fi
     fi
 
-    nft add rule inet geomate forward $base_rule ip daddr @${set_name}_allowed counter accept
-    nft add rule inet geomate forward $base_rule ip daddr @${set_name}_blocked counter drop
+    nft add rule inet geomate forward "$base_rule" ip daddr @"${set_name}"_allowed counter accept
+    nft add rule inet geomate forward "$base_rule" ip daddr @"${set_name}"_blocked counter drop
 
     # Add a default drop rule in Strict Mode
     if [ "$strict_mode" = "1" ]; then
-        nft add rule inet geomate forward $base_rule counter drop
+        nft add rule inet geomate forward "$base_rule" counter drop
         log_and_print "Strict mode: Added default drop rule for $name" 2
     fi
 
@@ -194,7 +202,7 @@ is_within_any_region() {
     local lat="$1"
     local lon="$2"
     shift 2
-    local allowed_regions="$@"
+    local allowed_regions="$*"
 
     for allowed_region in $allowed_regions; do
         [ -n "$allowed_region" ] || continue
@@ -260,11 +268,11 @@ create_dynamic_set() {
     fi
 
     # Add rule for the ui dynamic set (always needed)
-    nft add rule inet geomate prerouting $base_rule update @${set_name}_ui_dynamic { ip daddr }
+    nft add rule inet geomate prerouting "$base_rule" update @"${set_name}"_ui_dynamic { ip daddr }
 
     # Add rule for the main dynamic set only in dynamic mode
     if [ "$operational_mode" != "static" ]; then
-        nft add rule inet geomate prerouting $base_rule update @${set_name}_dynamic { ip daddr }
+        nft add rule inet geomate prerouting "$base_rule" update @"${set_name}"_dynamic { ip daddr }
     fi
 
     log_and_print "Sets for $name set up successfully" 1
@@ -330,7 +338,7 @@ process_geo_data() {
     local allowed_set="$2"
     local blocked_set="$3"
     shift 3
-    local allowed_regions="$@"
+    local allowed_regions="$*"
     local geo_data_file="${GEOMATE_DATA_DIR}/${name}_geo_data.json"
 
     [ ! -f "$geo_data_file" ] && { log_and_print "Geo data file not found: $geo_data_file" 0; return; }
@@ -342,7 +350,7 @@ process_geo_data() {
     local blocked_ips=""
 
     # Use jq to parse the JSON and feed it into the loop via Here-Document
-    while IFS=$'\t' read -r ip lat lon; do
+    while IFS="	" read -r ip lat lon; do
         [ -z "$ip" ] || [ -z "$lat" ] || [ -z "$lon" ] && continue
         log_and_print "Checking IP: $ip, Lat: $lat, Lon: $lon" 2
 
@@ -363,8 +371,8 @@ EOF
     blocked_ips=${blocked_ips%,}
 
     # Batch update the sets
-    [ -n "$allowed_ips" ] && nft add element inet geomate $allowed_set { $allowed_ips }
-    [ -n "$blocked_ips" ] && nft add element inet geomate $blocked_set { $blocked_ips }
+    [ -n "$allowed_ips" ] && nft add element inet geomate "$allowed_set" { "$allowed_ips" }
+    [ -n "$blocked_ips" ] && nft add element inet geomate "$blocked_set" { "$blocked_ips" }
 
     log_and_print "Finished processing geo data for $name" 2
 }
