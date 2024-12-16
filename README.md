@@ -198,7 +198,7 @@ There are several ways to identify the correct ports and protocols for your game
    - Install QoSmate on your router
    - Start your game and play normally
    - In LuCI, go to QoSmate's "Connections" tab
-   - Filter by your gaming device's IP
+   - Filter the list by your gaming device's IP
    - Sort by "AVG BPS" or "AVG PPS" in descending order
    - Look for UDP connections with consistent traffic
    - Gaming traffic typically shows constant activity
@@ -349,11 +349,11 @@ Important: Games may use either fixed ports (like CoD's source port 3074) or por
 
 ## Hardware Requirements
 
-### System Requirements
+### Minimum System Requirements
 - OpenWrt 23.05 or newer
 - Minimum 5MB free disk space (more for large IP lists, e.g., CoD needs ~5MB alone)
-- CPU with at least 580MHz recommended
 - Sufficient free RAM for IP list processing
+- CPU: 750MHz or faster recommended
 
 ### OpenWrt Requirements
 - Required packages:
@@ -363,10 +363,24 @@ Important: Games may use either fixed ports (like CoD's source port 3074) or por
   - luci-lua-runtime
   - luci (for web interface)
 
+### Tested Devices
+- FRITZ!Box 4020
+  - CPU: Qualcomm Atheros QCA9561 @ 750MHz
+  - RAM: 128MB
+  - Flash: 16MB
+  - Performance: Basic functionality works
+
+### Performance Notes
+- More RAM and CPU power will provide better performance
+- Multiple active filters require more system resources
+- Monitor system resources to prevent router overload
+- Low-end hardware may experience some limitations
+- Unofficial OpenWrt builds might have compatibility issues
+
 ### Not Recommended For
-- Routers with less than 64MB RAM
+- Routers with less than 64MB RAM (basic functionality might work but performance will be limited)
 - Very old or underpowered devices
-- Unofficial OpenWrt builds from third-party vendors
+- Unofficial OpenWrt builds from third-party vendors (compatibility issues may occur)
 
 ## Backup and Updates
 
