@@ -24,12 +24,10 @@ Geomate is an OpenWrt application that enables you to control connections to gam
 - [FAQ](#faq)
 - [Hardware Requirements](#hardware-requirements)
 - [Backup and Updates](#backup-and-updates)
-- [Support and Contribution](#support-and-contribution)
 - [Important Notes and Expectations](#important-notes-and-expectations)
 
-## Alpha/Beta Use Terms
-
-This application is provided for alpha/beta testing only. By using it, you agree **not** to distribute or share the software or any access credentials. Geomate is still under development, and feedback on functionality, usability, and issues is highly appreciated.
+## Development Status
+Geomate is under active development. Feedback on functionality, usability, and any issues is highly appreciated.
 
 ## Prerequisites
 
@@ -57,17 +55,16 @@ This application is provided for alpha/beta testing only. By using it, you agree
 ### Installing Geomate Core
 
 ```bash
-TOKEN="YOUR-TOKEN-HERE"
-
+# Install required dependencies
 opkg update && opkg install curl jq && \
 mkdir -p /etc/geomate.d && \
-curl -H "Authorization: Bearer $TOKEN" -L https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/init.d/geomate -o /etc/init.d/geomate && \
-curl -H "Authorization: Bearer $TOKEN" -L https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/geomate.sh -o /etc/geomate.sh && \
-curl -H "Authorization: Bearer $TOKEN" -L https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/geomate_trigger.sh -o /etc/geomate_trigger.sh && \
-curl -H "Authorization: Bearer $TOKEN" -L https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/geolocate.sh -o /etc/geolocate.sh && \
-curl -H "Authorization: Bearer $TOKEN" -L https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/geomate.d/cod_servers.txt -o /etc/geomate.d/cod_servers.txt && \
+wget -O /etc/init.d/geomate https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/init.d/geomate && \
+wget -O /etc/geomate.sh https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/geomate.sh && \
+wget -O /etc/geomate_trigger.sh https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/geomate_trigger.sh && \
+wget -O /etc/geolocate.sh https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/geolocate.sh && \
+wget -O /etc/geomate.d/cod_servers.txt https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/geomate.d/cod_servers.txt && \
 chmod +x /etc/init.d/geomate /etc/geomate.sh /etc/geomate_trigger.sh /etc/geolocate.sh && \
-[ ! -f /etc/config/geomate ] && curl -H "Authorization: Bearer $TOKEN" -L https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/config/geomate -o /etc/config/geomate && \
+[ ! -f /etc/config/geomate ] && wget -O /etc/config/geomate https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/config/geomate && \
 /etc/init.d/geomate enable && \
 /etc/init.d/geomate start
 ```
@@ -75,16 +72,15 @@ chmod +x /etc/init.d/geomate /etc/geomate.sh /etc/geomate_trigger.sh /etc/geoloc
 ### Installing the LuCI Web Interface
 
 ```bash
-TOKEN="YOUR-TOKEN-HERE"
-
+# Install required dependencies and setup directories
 opkg update && opkg install lua luci-lua-runtime && \
 mkdir -p /www/luci-static/resources/view/geomate /usr/share/luci/menu.d /usr/share/rpcd/acl.d /usr/libexec/rpcd && \
-curl -H "Authorization: Bearer $TOKEN" -L https://raw.githubusercontent.com/hudra0/luci-app-geomate/main/htdocs/luci-static/resources/view/geomate/view.js -o /www/luci-static/resources/view/geomate/view.js && \
-curl -H "Authorization: Bearer $TOKEN" -L https://raw.githubusercontent.com/hudra0/luci-app-geomate/main/htdocs/luci-static/resources/view/geomate/geofilters.js -o /www/luci-static/resources/view/geomate/geofilters.js && \
-curl -H "Authorization: Bearer $TOKEN" -L https://raw.githubusercontent.com/hudra0/luci-app-geomate/main/htdocs/luci-static/resources/view/geomate/map.html -o /www/luci-static/resources/view/geomate/map.html && \
-curl -H "Authorization: Bearer $TOKEN" -L https://raw.githubusercontent.com/hudra0/luci-app-geomate/main/root/usr/share/luci/menu.d/luci-app-geomate.json -o /usr/share/luci/menu.d/luci-app-geomate.json && \
-curl -H "Authorization: Bearer $TOKEN" -L https://raw.githubusercontent.com/hudra0/luci-app-geomate/main/root/usr/share/rpcd/acl.d/luci-app-geomate.json -o /usr/share/rpcd/acl.d/luci-app-geomate.json && \
-curl -H "Authorization: Bearer $TOKEN" -L https://raw.githubusercontent.com/hudra0/luci-app-geomate/main/root/usr/libexec/rpcd/luci.geomate -o /usr/libexec/rpcd/luci.geomate && \
+wget -O /www/luci-static/resources/view/geomate/view.js https://raw.githubusercontent.com/hudra0/luci-app-geomate/main/htdocs/luci-static/resources/view/geomate/view.js && \
+wget -O /www/luci-static/resources/view/geomate/geofilters.js https://raw.githubusercontent.com/hudra0/luci-app-geomate/main/htdocs/luci-static/resources/view/geomate/geofilters.js && \
+wget -O /www/luci-static/resources/view/geomate/map.html https://raw.githubusercontent.com/hudra0/luci-app-geomate/main/htdocs/luci-static/resources/view/geomate/map.html && \
+wget -O /usr/share/luci/menu.d/luci-app-geomate.json https://raw.githubusercontent.com/hudra0/luci-app-geomate/main/root/usr/share/luci/menu.d/luci-app-geomate.json && \
+wget -O /usr/share/rpcd/acl.d/luci-app-geomate.json https://raw.githubusercontent.com/hudra0/luci-app-geomate/main/root/usr/share/rpcd/acl.d/luci-app-geomate.json && \
+wget -O /usr/libexec/rpcd/luci.geomate https://raw.githubusercontent.com/hudra0/luci-app-geomate/main/root/usr/libexec/rpcd/luci.geomate && \
 chmod +x /usr/libexec/rpcd/luci.geomate && \
 /etc/init.d/rpcd restart && \
 /etc/init.d/uhttpd restart
@@ -392,6 +388,14 @@ Important: Games may use either fixed ports (like CoD's source port 3074) or por
 - It does NOT automatically make you a better player
 - It does NOT guarantee easier lobbies
 
+### Intended Use Case
+Geomate is specifically designed for precise geographic filtering of game servers, allowing you to define custom regions using circles on a map. If you need:
+- Country-wide geoblocking
+- Blocking access to your router from specific countries
+- General geoblocking for regular server connections
+
+Consider using alternatives like `banip` or `geoip-shell` instead, as they are better suited for these use cases.
+
 ### Game Compatibility
 - Not all games have been tested with Geomate
 - Each game handles matchmaking differently
@@ -426,7 +430,7 @@ Important: Games may use either fixed ports (like CoD's source port 3074) or por
 
 ### OpenWrt Requirements
 - Required packages:
-  - curl
+  - curl (needed for IP geolocation)
   - jq
   - lua
   - luci-lua-runtime
@@ -474,6 +478,6 @@ This ensures that all your collected IP lists and configurations in the geomate.
 
 ## Support
 
-For issues, questions
-- Open an issue on GitHub
-- Join our community discussions in the OpenWrt forums
+For issues and questions:
+- Submit issues on GitHub
+- Post in the OpenWrt forum thread
