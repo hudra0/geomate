@@ -45,13 +45,21 @@ trap cleanup EXIT
 
 # Retrieves geographic information for a batch of IPs
 get_geo_info_batch() {
-    local ip_list="$1"
-    # Set each IP individually in quotes and separate by commas
-    local json_data=$(echo "$ip_list" | awk '{for(i=1;i<=NF;i++) printf "\"%s\",", $i}' | sed 's/,$//')
-    json_data="[$json_data]"
-    local response=$(curl -s -X POST "$IP_API_URL" -H "Content-Type: application/json" --data "$json_data")
-    log_and_print "API request sent for $(echo "$ip_list" | wc -w) IPs" 2
-    echo "$response"
+    local batch="$1"
+    local response
+    
+    log_and_print "API request sent for $(echo "$batch" | wc -w) IPs" 2
+    response=$(curl -s --retry 3 "$IP_API_URL" \
+        -H "Content-Type: application/json" \
+        -d "[$(echo "$batch" | sed 's/[[:space:]]\+/","/g' | sed 's/^/"/;s/$/"/')]" \
+        2>/dev/null)
+    
+    if [ -n "$response" ]; then
+        echo "$response"
+        return 0
+    else
+        return 1
+    fi
 }
 
 # Processes IPs for a specific filter/game and updates the geo data file
@@ -127,18 +135,16 @@ process_batch() {
     local batch="$1"
     local output_file="$2"
     local batch_size=$(echo "$batch" | wc -w)
-    log_and_print "Processing batch of $batch_size IPs: $batch" 2
-    local response=$(get_geo_info_batch "$batch")
+    local response
     
-    log_and_print "API Response: $response" 2
+    log_and_print "Processing batch of $batch_size IPs: $batch" 2
+    response=$(get_geo_info_batch "$batch")
     
     if [ $? -eq 0 ] && [ -n "$response" ]; then
         echo "$response" | sed 's/^\[//;s/\]$//;s/},{/}\n{/g' | while IFS= read -r line; do
             if [ -n "$line" ] && echo "$line" | grep -q '"status":"success"'; then
                 echo "$line" >> "$output_file"
                 log_and_print "Added to output: $line" 2
-            else
-                log_and_print "Skipped line: $line" 2
             fi
         done
         log_and_print "Batch processed successfully" 2
