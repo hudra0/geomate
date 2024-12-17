@@ -1,4 +1,6 @@
 #!/bin/sh /etc/rc.common
+# shellcheck shell=ash
+# shellcheck disable=SC2034  # These variables are used by OpenWrt's rc.common
 
 USE_PROCD=1
 
