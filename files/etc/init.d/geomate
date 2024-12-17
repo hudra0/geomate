@@ -7,6 +7,10 @@ USE_PROCD=1
 START=95
 STOP=01
 
+EXTRA_COMMANDS="status geolocate"
+EXTRA_HELP="        status      Get service status
+        geolocate    Run geolocation for IP addresses"
+
 cmd="/etc/geomate.sh"
 name="geomate"
 pid_file="/var/run/${name}.pid"
@@ -47,6 +51,10 @@ reload_service() {
 
 service_triggers() {
     procd_add_reload_trigger "geomate"
+}
+
+geolocate() {
+    /etc/geolocate.sh
 }
 
 extra_command "status" "Get service status"
