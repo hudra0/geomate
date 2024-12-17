@@ -1,15 +1,22 @@
 #!/bin/sh
 
+# shellcheck shell=ash
+# shellcheck disable=SC3043  # ash supports local variables
+# shellcheck disable=SC2317  # Functions are called by OpenWrt's system
+# shellcheck disable=SC2155  # Combined declaration and assignment is fine for our use case
+# shellcheck disable=SC1091  # OpenWrt's /lib/functions.sh is not available during shellcheck
+
 . /lib/functions.sh
 config_load 'geomate'
 config_get debug_level global debug_level '0'
 
 GEOMATE_DATA_DIR="/etc/geomate.d"
+GEOMATE_TMP_DIR="/tmp/geomate"
 IP_API_URL="http://ip-api.com/batch"
 BATCH_SIZE=90
 RATE_LIMIT=15
 RATE_LIMIT_WINDOW=60
-LOCK_FILE="/tmp/geomate_geolocation.lock"
+LOCK_FILE="$GEOMATE_TMP_DIR/geolocation.lock"
 
 log_and_print() {
     local message="$1"
@@ -24,6 +31,10 @@ cleanup() {
     log_and_print "Removing lock file: $LOCK_FILE" 2
     rm -f "$LOCK_FILE"
 }
+
+# Create temporary directory if it doesn't exist
+mkdir -p "$GEOMATE_TMP_DIR"
+chmod 755 "$GEOMATE_TMP_DIR"
 
 # Create lock file
 touch "$LOCK_FILE"
@@ -73,7 +84,7 @@ process_game_ips() {
         batch="$batch $ip"
         batch_count=$((batch_count + 1))
 
-        if [ $batch_count -eq $BATCH_SIZE ]; then
+        if [ "$batch_count" -eq "$BATCH_SIZE" ]; then
             process_batch "$batch" "$temp_output_file"
             processed_count=$((processed_count + batch_count))
             log_and_print "Processed $processed_count IPs for $game_name" 2
@@ -84,10 +95,10 @@ process_game_ips() {
             current_time=$(date +%s)
             elapsed=$((current_time - start_time))
             log_and_print "Elapsed time: $elapsed seconds, Requests: $request_count" 2
-            if [ $elapsed -lt $RATE_LIMIT_WINDOW ] && [ $request_count -ge $RATE_LIMIT ]; then
+            if [ "$elapsed" -lt "$RATE_LIMIT_WINDOW" ] && [ "$request_count" -ge "$RATE_LIMIT" ]; then
                 sleep_time=$((RATE_LIMIT_WINDOW - elapsed + 1))
                 log_and_print "Rate limit reached. Sleeping for $sleep_time seconds." 1
-                sleep $sleep_time
+                sleep "$sleep_time"
                 start_time=$(date +%s)
                 request_count=0
             fi
@@ -189,7 +200,7 @@ process_specific_ips() {
     for ip in $ips; do
         batch="$batch $ip"
         count=$((count + 1))
-        if [ $count -eq $BATCH_SIZE ] || [ $count -eq $total_ips ]; then
+        if [ "$count" -eq "$BATCH_SIZE" ] || [ "$count" -eq "$total_ips" ]; then
             log_and_print "Processing batch of $count IPs" 2
             process_batch "$batch" "$temp_output_file"
             batch=""
