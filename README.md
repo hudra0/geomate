@@ -58,11 +58,11 @@ Geomate is under active development. Feedback on functionality, usability, and a
 # Install required dependencies
 opkg update && opkg install curl jq && \
 mkdir -p /etc/geomate.d && \
+curl -s https://api.github.com/repos/hudra0/geomate/contents/files/etc/geomate.d | jq -r '.[].download_url' | xargs -n 1 curl -o /etc/geomate.d/$(basename {}) -L && \
 wget -O /etc/init.d/geomate https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/init.d/geomate && \
 wget -O /etc/geomate.sh https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/geomate.sh && \
 wget -O /etc/geomate_trigger.sh https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/geomate_trigger.sh && \
 wget -O /etc/geolocate.sh https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/geolocate.sh && \
-wget -O /etc/geomate.d/cod_servers.txt https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/geomate.d/cod_servers.txt && \
 chmod +x /etc/init.d/geomate /etc/geomate.sh /etc/geomate_trigger.sh /etc/geolocate.sh && \
 [ ! -f /etc/config/geomate ] && wget -O /etc/config/geomate https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/config/geomate && \
 /etc/init.d/geomate enable && \
@@ -232,7 +232,7 @@ You can allow game connections from multiple geographic areas by creating severa
 
 2. **Add More Circles to the Same Filter**
    - Click on the map again to draw another circle
-   - Important: Use the exact same filter name as before
+   - **Important**: Use the exact same filter name as before
    - The previous settings will appear automatically
    - Adjust settings if needed, or keep them the same
    - Click Save
