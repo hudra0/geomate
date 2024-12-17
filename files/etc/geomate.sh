@@ -12,6 +12,7 @@
 
 GEOMATE_DATA_DIR="/etc/geomate.d"
 GEOMATE_RUNTIME_DIR="${GEOMATE_DATA_DIR}/runtime"
+GEOMATE_TMP_DIR="/tmp/geomate"
 NFT_SET_PREFIX="geomate_"
 debug_level=0
 
@@ -47,6 +48,9 @@ setup_geomate_d() {
 
     mkdir -p "$GEOMATE_RUNTIME_DIR"
     chmod 755 "$GEOMATE_RUNTIME_DIR"
+
+    mkdir -p "$GEOMATE_TMP_DIR"
+    chmod 755 "$GEOMATE_TMP_DIR"
 
     config_load 'geomate'
     config_foreach create_empty_ip_list 'geo_filter'
@@ -126,32 +130,32 @@ setup_geo_filter() {
 
     [ "$enabled" = "0" ] && return
 
-    local set_name="${NFT_SET_PREFIX}$(echo $name | tr ' ' '_')"
+    local set_name="${NFT_SET_PREFIX}$(echo "$name" | tr ' ' '_')"
 
     log_and_print "Setting up geo filter for $name" 1
 
     # Create sets for this filter
-    nft add set inet geomate ${set_name}_allowed { type ipv4_addr\; flags interval\; }
-    nft add set inet geomate ${set_name}_blocked { type ipv4_addr\; flags interval\; }
+    nft add set inet geomate "${set_name}_allowed" { type ipv4_addr\; flags interval\; }
+    nft add set inet geomate "${set_name}_blocked" { type ipv4_addr\; flags interval\; }
 
     # Add allowed IPs
     config_list_foreach "$1" 'allowed_ip' append_allowed_ip
     if [ -n "$allowed_ips" ]; then
         allowed_ips=${allowed_ips%,}
         log_and_print "Manually adding allowed IPs: $allowed_ips" 2
-        nft add element inet geomate ${set_name}_allowed { $allowed_ips }
+        nft add element inet geomate "${set_name}_allowed" { "$allowed_ips" }
     fi
 
     # Add blocked IPs
     if [ -n "$blocked_ips" ]; then
         log_and_print "Manually adding blocked IPs: $blocked_ips" 2
-        nft add element inet geomate ${set_name}_blocked { $blocked_ips }
+        nft add element inet geomate "${set_name}_blocked" { "$blocked_ips" }
     fi
 
     # Process all allowed regions together
     if [ -n "$allowed_regions" ]; then
         log_and_print "Processing geo data for $name with allowed regions: $allowed_regions" 2
-        process_geo_data "$name" "${set_name}_allowed" "${set_name}_blocked" $allowed_regions
+        process_geo_data "$name" "${set_name}_allowed" "${set_name}_blocked" "$allowed_regions"
     fi
 
     # Add rules for allowed and blocked IPs
@@ -186,7 +190,7 @@ setup_geo_filter() {
     nft add rule inet geomate forward "$base_rule" ip daddr @"${set_name}"_allowed counter accept
     nft add rule inet geomate forward "$base_rule" ip daddr @"${set_name}"_blocked counter drop
 
-    # Add a default drop rule in Strict Mode
+    # Strict mode rule
     if [ "$strict_mode" = "1" ]; then
         nft add rule inet geomate forward "$base_rule" counter drop
         log_and_print "Strict mode: Added default drop rule for $name" 2
@@ -225,17 +229,17 @@ create_dynamic_set() {
 
     [ "$enabled" = "0" ] && return
 
-    local set_name="${NFT_SET_PREFIX}$(echo $name | tr ' ' '_')"
+    local set_name="${NFT_SET_PREFIX}$(echo "$name" | tr ' ' '_')"
 
     log_and_print "Setting up sets for $name" 1
 
     # Create UI dynamic set in both modes (needed for map display)
-    nft add set inet geomate ${set_name}_ui_dynamic { type ipv4_addr\; flags dynamic,timeout\; timeout 30s\; }
+    nft add set inet geomate "${set_name}_ui_dynamic" { type ipv4_addr\; flags dynamic,timeout\; timeout 30s\; }
 
     # Only create main dynamic set in dynamic mode
     if [ "$operational_mode" != "static" ]; then
         # Create existing dynamic set with 1-hour timeout
-        nft add set inet geomate ${set_name}_dynamic { type ipv4_addr\; flags dynamic,timeout\; timeout 1h\; }
+        nft add set inet geomate "${set_name}_dynamic" { type ipv4_addr\; flags dynamic,timeout\; timeout 1h\; }
     fi
 
     # Create the base rule
@@ -283,7 +287,7 @@ process_dynamic_set() {
     local name ip_list
     config_get name "$1" 'name'
     config_get ip_list "$1" 'ip_list'
-    local set_name="${NFT_SET_PREFIX}$(echo $name | tr ' ' '_')"
+    local set_name="${NFT_SET_PREFIX}$(echo "$name" | tr ' ' '_')"
 
     log_and_print "Processing dynamic set for $name" 2
 
@@ -291,7 +295,7 @@ process_dynamic_set() {
     local temp_file="/tmp/geomate_${set_name}_temp.txt"
 
     # Retrieve IPs from the dynamic set
-    nft list set inet geomate ${set_name}_dynamic | sed -n '/elements = {/,/}/p' | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | sort -u > "$temp_file"
+    nft list set inet geomate "${set_name}_dynamic" | sed -n '/elements = {/,/}/p' | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | sort -u > "$temp_file"
 
     if [ -s "$temp_file" ]; then
         log_and_print "New IPs found in dynamic set for $name:" 2
@@ -355,7 +359,7 @@ process_geo_data() {
         log_and_print "Checking IP: $ip, Lat: $lat, Lon: $lon" 2
 
         # Check if IP is within any of the allowed regions
-        if is_within_any_region "$lat" "$lon" $allowed_regions; then
+        if is_within_any_region "$lat" "$lon" "$allowed_regions"; then
             allowed_ips="${allowed_ips}${ip},"
             log_and_print "IP $ip is within allowed regions, added to $allowed_set" 2
         else
@@ -383,13 +387,13 @@ is_within_region() {
     local lon="$2"
     local region="$3"
 
-    local region_type=$(echo $region | cut -d':' -f1)
+    local region_type=$(echo "$region" | cut -d':' -f1)
 
     case $region_type in
         "circle")
-            local center_lat=$(echo $region | cut -d':' -f2)
-            local center_lon=$(echo $region | cut -d':' -f3)
-            local radius=$(echo $region | cut -d':' -f4)
+            local center_lat=$(echo "$region" | cut -d':' -f2)
+            local center_lon=$(echo "$region" | cut -d':' -f3)
+            local radius=$(echo "$region" | cut -d':' -f4)
 
             if is_within_circle "$lat" "$lon" "$center_lat" "$center_lon" "$radius"; then
                 return 0
@@ -503,40 +507,19 @@ run() {
     if [ "$operational_mode" = "static" ]; then
         log_and_print "Running in static mode - checking for IP list changes" 1
         
-        last_config_md5=""
-        
         while true; do
-            # Check if the configuration has changed
-            current_config_md5=$(md5sum /etc/config/geomate)
-            if [ "$current_config_md5" != "$last_config_md5" ]; then
-                log_and_print "Configuration changed, updating filters" 1
-                setup_nftables_and_filters
-                last_config_md5=$current_config_md5
-            fi
-
             # Run geomate trigger to check for IP list changes and daily updates
             run_geomate_trigger
-            
             sleep 3600  # Check every hour (3600 seconds)
         done
     fi
     
     SLEEP_DURATION=60  # Desired sleep duration
     CHECK_INTERVAL=1800  # Interval in seconds (1800 seconds = 30 minutes)
-
-    last_config_md5=""
     last_check_time=$(date +%s)
 
     while true; do
         current_time=$(date +%s)
-        
-        # Check if the configuration has changed
-        current_config_md5=$(md5sum /etc/config/geomate)
-        if [ "$current_config_md5" != "$last_config_md5" ]; then
-            log_and_print "Configuration changed, updating filters" 1
-            setup_nftables_and_filters
-            last_config_md5=$current_config_md5
-        fi
         
         # Calculate the remaining time until the next interval
         elapsed_time=$((current_time - last_check_time))
