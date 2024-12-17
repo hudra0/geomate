@@ -1,5 +1,11 @@
 #!/bin/sh
 
+# shellcheck shell=ash
+# shellcheck disable=SC3043  # ash supports local variables
+# shellcheck disable=SC2317  # Functions are called by OpenWrt's system
+# shellcheck disable=SC2155  # Combined declaration and assignment is fine for our use case
+# shellcheck disable=SC1091  # OpenWrt's /lib/functions.sh is not available during shellcheck
+
 . /lib/functions.sh
 config_load 'geomate'
 config_get debug_level global debug_level '0'
@@ -45,11 +51,11 @@ check_and_run_geolocate() {
     if [ $((current_time - last_daily_update)) -ge 86400 ]; then  # 86400 seconds = 24 hours
         log_and_print "Geomate_Trigger: Starting daily update of all IPs" 1
         /etc/geolocate.sh daily
-        echo $current_time > "${LAST_RUN_FILE}.daily"
+        echo "$current_time" > "${LAST_RUN_FILE}.daily"
     fi
 
     # Only do frequent updates if mode is 'frequent'
-    if [ "$geolocation_mode" = "frequent" ] && [ $((current_time - last_geolocate_time)) -ge $geolocate_interval ]; then
+    if [ "$geolocation_mode" = "frequent" ] && [ $((current_time - last_geolocate_time)) -ge "$geolocate_interval" ]; then
         local time_since_last_run=$((current_time - last_geolocate_time))
         local api_calls_allowed=$((RATE_LIMIT * (time_since_last_run / 60 + 1)))
         local ips_to_process=$((new_ips_count < api_calls_allowed ? new_ips_count : api_calls_allowed))
@@ -75,11 +81,11 @@ check_and_run_geolocate() {
 
 # Checks for new IPs and logs the information
 check_new_ips() {
-    > "$NEW_IPS_FILE"
+    touch "$NEW_IPS_FILE"
     config_load 'geomate'
     config_foreach collect_new_ips 'geo_filter'
     log_and_print "New IPs file content:" 2
-    cat "$NEW_IPS_FILE" | log_and_print 2
+    log_and_print "$(cat "$NEW_IPS_FILE")" 2
 }
 
 # Collects new IPs from the configuration
@@ -146,7 +152,7 @@ process_batch_specific_ips() {
             # Process the previous batch if present
             if [ -n "$current_game" ] && [ -n "$ips" ]; then
                 log_and_print "Calling geolocate.sh for $current_game with IPs: $ips" 2
-                /etc/geolocate.sh specific "$current_game" $ips
+                /etc/geolocate.sh specific "$current_game" "$ips"
 
                 # Update last_processed_file for the current filter/game
                 update_last_processed_file "$current_game"
@@ -162,7 +168,7 @@ process_batch_specific_ips() {
     # Process the last batch
     if [ -n "$current_game" ] && [ -n "$ips" ]; then
         log_and_print "Calling geolocate.sh for $current_game with IPs: $ips" 2
-        /etc/geolocate.sh specific "$current_game" $ips
+        /etc/geolocate.sh specific "$current_game" "$ips"
 
         # Update last_processed_file for the current filter/game
         update_last_processed_file "$current_game"
