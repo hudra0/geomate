@@ -24,6 +24,8 @@ Geomate is an OpenWrt application that enables you to control connections to gam
 - [FAQ](#faq)
 - [Hardware Requirements](#hardware-requirements)
 - [Backup and Updates](#backup-and-updates)
+- [Uninstallation](#uninstallation)
+- [Support](#support)
 - [Important Notes and Expectations](#important-notes-and-expectations)
 
 ## Development Status
@@ -55,25 +57,50 @@ Geomate is under active development. Feedback on functionality, usability, and a
 ### Installing Geomate Core
 
 ```bash
-# Install required dependencies
-opkg update && opkg install curl jq && \
+# Detect package manager and install required dependencies
+if command -v apk >/dev/null 2>&1; then
+    PKG_MANAGER="apk"
+    $PKG_MANAGER add curl jq
+elif command -v opkg >/dev/null 2>&1; then
+    PKG_MANAGER="opkg"
+    $PKG_MANAGER update && $PKG_MANAGER install curl jq
+else
+    echo "Error: No supported package manager found (apk/opkg)"
+    exit 1
+fi && \
 mkdir -p /etc/geomate.d && \
-curl -s https://api.github.com/repos/hudra0/geomate/contents/files/etc/geomate.d | jq -r '.[].download_url' | xargs -n 1 curl -o /etc/geomate.d/$(basename {}) -L && \
+# Download server lists
+for file in $(curl -s https://api.github.com/repos/hudra0/geomate/contents/files/etc/geomate.d | jq -r '.[].name'); do
+    curl -L -o "/etc/geomate.d/$file" "https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/geomate.d/$file"
+done && \
+# Download and install core files
 wget -O /etc/init.d/geomate https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/init.d/geomate && \
 wget -O /etc/geomate.sh https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/geomate.sh && \
 wget -O /etc/geomate_trigger.sh https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/geomate_trigger.sh && \
 wget -O /etc/geolocate.sh https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/geolocate.sh && \
 chmod +x /etc/init.d/geomate /etc/geomate.sh /etc/geomate_trigger.sh /etc/geolocate.sh && \
-[ ! -f /etc/config/geomate ] && wget -O /etc/config/geomate https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/config/geomate && \
+if [ ! -f /etc/config/geomate ]; then wget -O /etc/config/geomate https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/config/geomate; fi && \
+# Enable and start service with a small delay
 /etc/init.d/geomate enable && \
-/etc/init.d/geomate start
+sleep 2 && \
+/etc/init.d/geomate start && \
+echo "Geomate service installation complete!"
 ```
 
 ### Installing the LuCI Web Interface
 
 ```bash
-# Install required dependencies and setup directories
-opkg update && opkg install lua luci-lua-runtime && \
+# Detect package manager and install required dependencies
+if command -v apk >/dev/null 2>&1; then
+    PKG_MANAGER="apk"
+    $PKG_MANAGER add lua luci-lua-runtime
+elif command -v opkg >/dev/null 2>&1; then
+    PKG_MANAGER="opkg"
+    $PKG_MANAGER update && $PKG_MANAGER install lua luci-lua-runtime
+else
+    echo "Error: No supported package manager found (apk/opkg)"
+    exit 1
+fi && \
 mkdir -p /www/luci-static/resources/view/geomate /usr/share/luci/menu.d /usr/share/rpcd/acl.d /usr/libexec/rpcd && \
 wget -O /www/luci-static/resources/view/geomate/view.js https://raw.githubusercontent.com/hudra0/luci-app-geomate/main/htdocs/luci-static/resources/view/geomate/view.js && \
 wget -O /www/luci-static/resources/view/geomate/geofilters.js https://raw.githubusercontent.com/hudra0/luci-app-geomate/main/htdocs/luci-static/resources/view/geomate/geofilters.js && \
@@ -186,6 +213,14 @@ After installing Geomate and the LuCI interface:
   - Updates once per day
   - Reduces API calls
 
+### Geolocation Process
+
+The geolocation process can be triggered manually through the UI or runs automatically based on your selected update mode. To optimize resource usage and API quota:
+
+- Only active filters are processed during geolocation
+- IP addresses are processed in batches to respect API rate limits
+- The process runs in the background and may take several minutes to complete
+
 ### Finding Game Ports and Protocols
 
 There are several ways to identify the correct ports and protocols for your games:
@@ -232,7 +267,7 @@ You can allow game connections from multiple geographic areas by creating severa
 
 2. **Add More Circles to the Same Filter**
    - Click on the map again to draw another circle
-   - **Important**: Use the exact same filter name as before
+   - Important: Use the exact same filter name as before
    - The previous settings will appear automatically
    - Adjust settings if needed, or keep them the same
    - Click Save
@@ -475,6 +510,28 @@ Geomate stores all IP lists in the `/etc/geomate.d/` directory. By default, this
 This ensures that all your collected IP lists and configurations in the geomate.d directory are preserved when you update your OpenWrt firmware.
 
 **Note**: Always make a backup of your IP lists before major updates, just to be safe.
+
+## Uninstallation
+
+To uninstall Geomate while preserving your configuration and collected server data:
+
+```bash
+# Stop and disable the service
+/etc/init.d/geomate stop && \
+/etc/init.d/geomate disable && \
+# Remove application files but keep config and data
+rm -f /etc/init.d/geomate /etc/geomate.sh /etc/geomate_trigger.sh /etc/geolocate.sh && \
+# Remove LuCI interface
+rm -rf /www/luci-static/resources/view/geomate /usr/share/luci/menu.d/luci-app-geomate.json /usr/share/rpcd/acl.d/luci-app-geomate.json /usr/libexec/rpcd/luci.geomate && \
+# Restart services
+/etc/init.d/rpcd restart && \
+/etc/init.d/uhttpd restart
+```
+
+Note: This will preserve your configuration (`/etc/config/geomate`) and collected server data (`/etc/geomate.d/`). If you want to completely remove everything, including configuration and data, add these commands:
+```bash
+rm -rf /etc/config/geomate /etc/geomate.d
+```
 
 ## Support
 
