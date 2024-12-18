@@ -184,7 +184,8 @@ daily_update() {
 process_specific_ips() {
     local game_name="$1"
     shift
-    local ips="$*"
+    # Deduplicate IPs before processing
+    local ips=$(echo "$*" | tr ' ' '\n' | sort -u | tr '\n' ' ')
     local output_file="${GEOMATE_DATA_DIR}/${game_name}_geo_data.json"
     local temp_output_file="${output_file}.tmp"
     local lock_file="${output_file}.lock"
