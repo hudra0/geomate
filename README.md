@@ -54,7 +54,7 @@ Geomate is under active development. Feedback on functionality, usability, and a
 
 ## Installation
 
-### Installing Geomate Core
+### 1. Installing Geomate Core
 
 ```bash
 # Detect package manager and install required dependencies
@@ -87,7 +87,7 @@ sleep 2 && \
 echo "Geomate service installation complete!"
 ```
 
-### Installing the LuCI Web Interface
+### 2. Installing the LuCI Web Interface
 
 ```bash
 # Detect package manager and install required dependencies
