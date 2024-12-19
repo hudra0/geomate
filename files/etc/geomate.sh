@@ -303,6 +303,10 @@ process_dynamic_set() {
         # Add only new IPs to the IP list
         while IFS= read -r ip; do
             if ! grep -q "^$ip$" "$ip_list"; then
+                if [ -s "$ip_list" ] && [ "$(tail -c 1 "$ip_list")" != "" ]; then
+                    # Ensure there's a newline at the end of the file
+                    echo "" >> "$ip_list"
+                fi
                 echo "$ip" >> "$ip_list"
                 log_and_print "  Added new IP: $ip" 2
             fi
@@ -516,6 +520,7 @@ run() {
     
     SLEEP_DURATION=60  # Desired sleep duration
     CHECK_INTERVAL=1800  # Interval in seconds (1800 seconds = 30 minutes)
+
     last_check_time=$(date +%s)
 
     while true; do
