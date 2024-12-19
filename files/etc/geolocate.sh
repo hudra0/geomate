@@ -207,7 +207,7 @@ process_specific_ips() {
     for ip in $ips; do
         batch="$batch $ip"
         count=$((count + 1))
-        if [ "$count" -eq "$BATCH_SIZE" ] || [ "$count" -eq "$total_ips" ]; then
+        if [ "$count" -eq "$BATCH_SIZE" ]; then
             log_and_print "Processing batch of $count IPs" 2
             process_batch "$batch" "$temp_output_file"
             batch=""
@@ -215,6 +215,12 @@ process_specific_ips() {
             sleep 4  # Wait 4 seconds between batches
         fi
     done
+
+    # Process remainder batch if it exists
+    if [ "$count" -gt 0 ]; then
+        log_and_print "Processing remaining $count IPs" 2
+        process_batch "$batch" "$temp_output_file"
+    fi
 
     if [ -s "$temp_output_file" ]; then
         log_and_print "Temporary file size: $(wc -l < "$temp_output_file") lines" 2
