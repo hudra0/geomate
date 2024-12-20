@@ -2,6 +2,8 @@
 
 Geomate is an OpenWrt application that enables you to control connections to game servers based on their geographic location. By drawing regions on a map, you can specify where you want to allow or block server connections. The application learns over time by collecting IP addresses of game servers you connect to, making the filtering more effective the more you play.
 
+![Geomate 3](https://github.com/user-attachments/assets/2c2300d8-11fd-469e-9b60-0faf6abc07cc)
+
 ## Features
 
 - 🌍 **Geographic Filtering**: Draw regions on a map to allow or block game server connections
@@ -161,12 +163,15 @@ After installing Geomate and the LuCI interface:
    - Protocol: Usually UDP for games
    - Gaming Device IP: Your console/PC IP (e.g., 192.168.1.208)
    - Ports: Use known values (e.g., 3074 for CoD) or see [Finding Game Ports and Protocols](#finding-game-ports-and-protocols)
-   - Whitelist: Add essential IPs for matchmaking/authentication
+   - Whitelist: Add essential IPs for matchmaking/authentication (see [Allowed IPs Explained](#allowed-ips-explained))
+   - IP List: Either use an existing list or create an empty one (see [Understanding IP Lists](#understanding-ip-lists-and-allowed-ips))
 
 4. **Save & Let Geomate Learn**
    - Click "Save" and then "Save and Apply"
    - Play your game - Geomate will learn server IPs
    - Keep Strict Mode disabled initially
+
+![GeomateAdd](https://github.com/user-attachments/assets/06b288dd-e126-47e4-8219-b65d8163c252)
 
 ## Detailed Configuration
 
@@ -222,6 +227,47 @@ The geolocation process can be triggered manually through the UI or runs automat
 - Only active filters are processed during geolocation
 - IP addresses are processed in batches to respect API rate limits
 - The process runs in the background and may take several minutes to complete
+
+### Understanding IP Lists and Allowed IPs
+
+#### IP List Files
+IP list files are essential for Geomate to identify game server IPs. These files contain collections of IP addresses that belong to game servers. Geomate needs these lists to determine which game servers should be filtered based on your geographic settings. The IP list, combined with your specified ports and source IP, helps Geomate identify and filter the actual game server connections.
+
+There are two ways to obtain these lists:
+
+1. **Dynamic Learning (Recommended for New Games)**
+   - Create a new geofilter with an empty IP list
+   - Use the "Create empty list" button in the dialog
+   - Set operational mode to Dynamic
+   - Geomate will automatically collect server IPs while you play
+
+2. **Using Existing Lists**
+   - Download pre-collected IP lists (e.g., Call of Duty servers)
+   - Place files in `/etc/geomate.d/`
+   - Either:
+     - Upload via the "Upload List" function in the geofilter dialog
+     - Manually move the file to `/etc/geomate.d/` and set the path in the config or UI
+   - Run "Manual Geolocation" for immediate use
+
+#### Allowed IPs Explained
+Games often require specific servers to be always accessible, regardless of location:
+- Matchmaking servers
+- Authentication servers
+- Relay servers
+
+For example, Call of Duty requires these IPs to be allowed:
+```
+185.34.107.128
+185.34.107.129
+185.216.14.7
+```
+
+Without proper Allowed IPs:
+- Games may fail to start
+- Matchmaking might not work
+- Connection errors may occur
+
+**Note:** Required IPs may vary by region. If you experience connection issues, you may need to identify and add region-specific servers to your Allowed IPs list.
 
 ### Finding Game Ports and Protocols
 
