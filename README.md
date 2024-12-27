@@ -269,6 +269,41 @@ Without proper Allowed IPs:
 
 **Note:** Required IPs may vary by region. If you experience connection issues, you may need to identify and add region-specific servers to your Allowed IPs list.
 
+### Finding Allowed IPs
+
+Finding the correct allowed IPs for games can involve some trial and error. Here's a systematic approach:
+
+#### Method 1: Initial Game Launch Analysis
+1. Start with no allowed IPs configured
+2. Launch the game
+3. Monitor initial connections in QoSmate
+4. Focus on IPs that generate traffic over the configured game ports
+5. These early connections are often essential servers
+
+#### Method 2: Error-Driven Discovery
+1. Start the game without allowed IPs
+2. If you encounter network/server connectivity errors:
+   - Check QoSmate for recent connection attempts
+   - Add the first few IPs that attempted connections
+   - Restart the game and test
+   - Repeat if necessary
+
+#### Important Notes on Allowed IPs
+- Don't add every IP blindly - this would defeat the purpose of geo-filtering
+- Focus on IPs that appear during game startup or matchmaking
+- Essential servers typically include:
+  - Authentication servers
+  - Matchmaking servers
+  - Login servers
+- Some games may work without explicit allowed IPs if their essential servers don't use the geo-filtered ports
+
+#### Best Practices
+- Start with minimal allowed IPs
+- Document which IPs resolve which issues
+- Remove allowed IPs that prove unnecessary
+- Use QoSmate to monitor traffic patterns
+- Test thoroughly after adding new allowed IPs
+
 ### Finding Game Ports and Protocols
 
 There are several ways to identify the correct ports and protocols for your games:
