@@ -502,8 +502,17 @@ trigger_geolocation() {
 run() {
     load_config
     setup_geomate_d
+
+    # Create loading flag file
+    log_and_print "Creating loading flag file at /tmp/geomate_loading" 1
+    touch /tmp/geomate_loading
+
     setup_nftables_and_filters
-    
+
+    # Remove loading flag file
+    log_and_print "Removing loading flag file at /tmp/geomate_loading" 1
+    rm -f /tmp/geomate_loading
+
     log_and_print "Service is running" 0
     echo $$ > "/var/run/geomate.pid"
     
