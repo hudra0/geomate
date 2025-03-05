@@ -2,7 +2,7 @@
 
 Geomate is an OpenWrt application that enables you to control connections to game servers based on their geographic location. By drawing regions on a map, you can specify where you want to allow or block server connections. The application learns over time by collecting IP addresses of game servers you connect to, making the filtering more effective the more you play.
 
-![Geomate 3](https://github.com/user-attachments/assets/2c2300d8-11fd-469e-9b60-0faf6abc07cc)
+![Geomate 3](https://github.com/user-attachments/assets/041934b4-446f-4c88-b62e-cd2a378c231f)
 
 ## Features
 
@@ -171,7 +171,7 @@ After installing Geomate and the LuCI interface:
    - Play your game - Geomate will learn server IPs
    - Keep Strict Mode disabled initially
 
-![GeomateAdd](https://github.com/user-attachments/assets/06b288dd-e126-47e4-8219-b65d8163c252)
+![GeomateAdd](https://github.com/user-attachments/assets/ffdd5da0-d8d6-4b88-af53-5da055d57138)
 
 ## Detailed Configuration
 
