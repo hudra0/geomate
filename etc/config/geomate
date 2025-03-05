@@ -1,0 +1,30 @@
+
+config global 'global'
+	option enabled '1'
+	option debug_level '0'
+	option strict_mode '1'
+	option operational_mode 'dynamic'
+	option geolocation_mode 'frequent'
+
+config settings 'settings'
+	option interface 'br-lan'
+
+config geo_filter
+	option name 'Call of Duty'
+	option protocol 'udp'
+	option src_ip '192.168.1.208'
+	option src_port '3074'
+	option ip_list '/etc/geomate.d/cod_servers.txt'
+	option enabled '1'
+	list allowed_ip '185.34.107.128'
+	list allowed_ip '185.34.107.129'
+	list allowed_ip '72.25.64.32'  
+	list allowed_region 'circle:53.826597:-0.922852:636905'
+
+config geo_filter
+	option name 'Fortnite'
+	option enabled '1'
+	option protocol 'udp'
+	option src_ip '192.168.1.208'
+	option dest_port '9000-9100'
+	option ip_list '/etc/geomate.d/fortnite_servers.txt'
