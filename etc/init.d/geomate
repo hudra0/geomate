@@ -1,0 +1,76 @@
+#!/bin/sh /etc/rc.common
+# shellcheck shell=ash
+# shellcheck disable=SC2034  # These variables are used by OpenWrt's rc.common
+
+USE_PROCD=1
+
+START=95
+STOP=01
+
+EXTRA_COMMANDS="status geolocate"
+EXTRA_HELP="        status      Get service status
+        geolocate    Run geolocation for IP addresses"
+
+cmd="/etc/geomate.sh"
+name="geomate"
+pid_file="/var/run/${name}.pid"
+
+log_and_print() {
+    logger -t geomate "$1"
+    echo "geomate: $1"
+}
+
+start_service() {
+    local enabled
+    config_load 'geomate'
+    config_get_bool enabled global enabled 0
+    
+    if [ "$enabled" -eq 0 ]; then
+        log_and_print "Service is disabled, not starting"
+        return 0
+    fi
+
+    echo "Starting geomate service..."
+
+    procd_open_instance
+    procd_set_param command $cmd run
+    procd_set_param respawn
+    procd_set_param pidfile $pid_file
+    procd_close_instance
+}
+
+stop_service() {
+    $cmd cleanup
+    log_and_print "Service stopped"
+}
+
+reload_service() {
+    stop
+    start
+}
+
+service_triggers() {
+    procd_add_reload_trigger "geomate"
+}
+
+geolocate() {
+    /etc/geolocate.sh
+}
+
+extra_command "status" "Get service status"
+status() {
+    local pid
+    if [ -f "$pid_file" ]; then
+        pid=$(cat "$pid_file")
+        if kill -0 "$pid" 2>/dev/null; then
+            log_and_print "Running (PID: $pid)"
+            return 0
+        else
+            log_and_print "Stopped (stale PID file)"
+            return 1
+        fi
+    else
+        log_and_print "Stopped"
+        return 1
+    fi
+}
