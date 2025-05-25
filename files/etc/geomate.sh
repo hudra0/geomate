@@ -234,7 +234,7 @@ create_dynamic_set() {
     log_and_print "Setting up sets for $name" 1
 
     # Create UI dynamic set in both modes (needed for map display)
-    nft add set inet geomate "${set_name}_ui_dynamic" { type ipv4_addr\; flags dynamic,timeout\; timeout 30s\; }
+    nft add set inet geomate "${set_name}_ui_dynamic" { type ipv4_addr\; flags dynamic,timeout\; timeout 10s\; }
 
     # Only create main dynamic set in dynamic mode
     if [ "$operational_mode" != "static" ]; then
@@ -378,9 +378,63 @@ EOF
     allowed_ips=${allowed_ips%,}
     blocked_ips=${blocked_ips%,}
 
-    # Batch update the sets
-    [ -n "$allowed_ips" ] && nft add element inet geomate "$allowed_set" { "$allowed_ips" }
-    [ -n "$blocked_ips" ] && nft add element inet geomate "$blocked_set" { "$blocked_ips" }
+    # Batch update the sets - handling potential large IP lists
+    add_ips_to_set() {
+        local set_name="$1"
+        local ip_list="$2"
+        local chunk_size=1000
+        local total_ips
+        local start=1
+        local success=1
+        local end
+        local chunk
+        local nft_cmd
+        local error_output
+        local ret
+        
+        total_ips=$(echo "$ip_list" | tr ',' '\n' | wc -l)
+        log_and_print "Adding IPs to $set_name, total IPs: $total_ips" 2
+        
+        if [ -z "$ip_list" ]; then
+            log_and_print "No IPs to add to $set_name" 2
+            return 0
+        fi
+        
+        # Process in smaller chunks to avoid command line limits
+        while [ "$start" -le "$total_ips" ]; do
+            end=$((start + chunk_size - 1))
+            [ "$end" -gt "$total_ips" ] && end="$total_ips"
+            
+            # Extract chunk of IPs
+            chunk=$(echo "$ip_list" | tr ',' '\n' | sed -n "${start},${end}p" | tr '\n' ',' | sed 's/,$//')
+            
+            log_and_print "Processing IPs $start to $end of $total_ips" 3
+            
+            # Execute nft command for this chunk
+            nft_cmd="nft add element inet geomate \"$set_name\" { $chunk }"
+            error_output=$(eval "$nft_cmd" 2>&1)
+            ret=$?
+            
+            if [ "$ret" -ne 0 ]; then
+                log_and_print "ERROR: Failed to add IPs (chunk $start-$end) to set $set_name: $error_output" 0
+                success=0
+            fi
+            
+            start=$((end + 1))
+        done
+        
+        return "$success"
+    }
+    
+    # Add allowed IPs to set
+    if [ -n "$allowed_ips" ]; then
+        add_ips_to_set "$allowed_set" "$allowed_ips"
+    fi
+    
+    # Add blocked IPs to set
+    if [ -n "$blocked_ips" ]; then
+        add_ips_to_set "$blocked_set" "$blocked_ips"
+    fi
 
     log_and_print "Finished processing geo data for $name" 2
 }
