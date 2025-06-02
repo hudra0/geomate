@@ -22,6 +22,10 @@ _NL_='
 DEFAULT_IFS=" 	${_NL_}"
 IFS="$DEFAULT_IFS"
 
+cmd="/etc/geomate.sh"
+name="geomate"
+pid_file="/var/run/${name}.pid"
+
 ### repo-related vars
 
 # GH repo author (can be overriden for testing)
@@ -103,10 +107,6 @@ GEOMATE_EXEC_FILES_FRONTEND="
 	"$GEOMATE_MAIN_FILE_BACKEND" "$GEOMATE_FILE_TYPES_BACKEND" "$GEOMATE_GEN_FILES_BACKEND" \
 	"$GEOMATE_EXEC_FILES_BACKEND" "$GEOMATE_EXTRA_FILES_BACKEND" "$GEOMATE_FILE_TYPES_FRONTEND" \
 	"$GEOMATE_GEN_FILES_FRONTEND" "$GEOMATE_EXTRA_FILES_FRONTEND" "$GEOMATE_EXEC_FILES_FRONTEND"
-
-cmd="/etc/geomate.sh"
-name="geomate"
-pid_file="/var/run/${name}.pid"
 
 ### Utility functions
 
@@ -249,8 +249,7 @@ geolocate() {
     /etc/geolocate.sh
 }
 
-extra_command "status" "Get service status"
-status() {
+status_service() {
     local pid
     if [ -f "$pid_file" ]; then
         pid=$(cat "$pid_file")
@@ -266,7 +265,6 @@ status() {
         return 1
     fi
 }
-
 ### Update-related functions
 
 # 1 - component: <BACKEND|FRONTEND>
