@@ -3,4 +3,3 @@
 # This file is used during updates to handle directory structure changes
 # Example: /old/directory/path=/new/directory/path
 # Maps repository structure to OpenWrt filesystem structure
-/files/etc=/etc 
