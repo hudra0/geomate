@@ -1,6 +1,0 @@
-# Directory fixups for geomate backend
-# Format: old_directory_path=new_directory_path
-# This file is used during updates to handle directory structure changes
-# Example: /old/directory/path=/new/directory/path
-# Maps repository structure to OpenWrt filesystem structure
-/files/etc=/etc 
