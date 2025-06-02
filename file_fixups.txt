@@ -1,4 +1,0 @@
-# File fixups for geomate backend
-# Format: old_file_path=new_file_path
-# This file is used during updates to handle file path changes
-# Example: /etc/old_filename.sh=/etc/new_filename.sh 
