@@ -374,8 +374,20 @@ fetch_geomate_component() {
 	rm -f "$ucl_err_file"
 
 	[ "$fetch_rv" = 0 ] && {
-		mv "${extract_dir:-?}"/* "${upd_dir:-?}/" ||
-			{ rm -rf "${extract_dir:-?}"; error_out "Failed to move files to dist dir."; return 1; }
+		# For BACKEND, move files from files/ directory
+		if [ "$component" = "BACKEND" ]; then
+			mv "${extract_dir}/files/"* "${upd_dir}/" 2>/dev/null || {
+				rm -rf "${extract_dir:-?}"
+				error_out "Failed to move files from files/ directory."
+				return 1
+			}
+		else
+			mv "${extract_dir:-?}"/* "${upd_dir:-?}/" || {
+				rm -rf "${extract_dir:-?}"
+				error_out "Failed to move files to dist dir."
+				return 1
+			}
+		fi
 	}
 	rm -rf "${extract_dir:-?}"
 
