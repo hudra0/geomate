@@ -3,7 +3,4 @@
 # This file is used during updates to handle directory structure changes
 # Example: /old/directory/path=/new/directory/path
 # Maps repository structure to OpenWrt filesystem structure
-/files/etc=/etc
-/files/etc/config=/etc/config
-/files/etc/init.d=/etc/init.d
-/files/etc/geomate.d=/etc/geomate.d 
+/files/etc=/etc 
