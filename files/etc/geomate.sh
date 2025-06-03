@@ -74,6 +74,11 @@ create_empty_ip_list() {
 setup_nftables_and_filters() {
     log_and_print "Setting up nftables rules and filters..." 1
     
+    # Log operational mode
+    if [ "$operational_mode" = "monitor" ]; then
+        log_and_print "Running in MONITOR MODE - connections will be tracked but NOT blocked" 0
+    fi
+    
     # Delete existing table and recreate it
     nft delete table inet geomate 2>/dev/null
     nft add table inet geomate
@@ -85,8 +90,10 @@ setup_nftables_and_filters() {
     config_foreach setup_geo_filter 'geo_filter'
     config_foreach create_dynamic_set 'geo_filter'
 
-    # Add a catch-all rule based on strict_mode
-    if [ "$strict_mode" = "1" ]; then
+    # Add a catch-all rule based on strict_mode - but not in monitor mode
+    if [ "$operational_mode" = "monitor" ]; then
+        log_and_print "Monitor mode: No blocking rules will be applied" 1
+    elif [ "$strict_mode" = "1" ]; then
         log_and_print "Strict mode enabled: No default forward policy set" 1
     else
         nft add rule inet geomate forward counter accept
@@ -188,10 +195,16 @@ setup_geo_filter() {
     fi
 
     nft add rule inet geomate forward "$base_rule" ip daddr @"${set_name}"_allowed counter accept
-    nft add rule inet geomate forward "$base_rule" ip daddr @"${set_name}"_blocked counter drop
+    
+    # Only add drop rule if not in monitor mode
+    if [ "$operational_mode" != "monitor" ]; then
+        nft add rule inet geomate forward "$base_rule" ip daddr @"${set_name}"_blocked counter drop
+    else
+        log_and_print "Monitor mode: Not adding drop rule for blocked IPs in $name" 2
+    fi
 
-    # Strict mode rule
-    if [ "$strict_mode" = "1" ]; then
+    # Strict mode rule - only apply if not in monitor mode
+    if [ "$strict_mode" = "1" ] && [ "$operational_mode" != "monitor" ]; then
         nft add rule inet geomate forward "$base_rule" counter drop
         log_and_print "Strict mode: Added default drop rule for $name" 2
     fi
@@ -570,8 +583,10 @@ run() {
     log_and_print "Service is running" 0
     echo $$ > "/var/run/geomate.pid"
     
-    # If in static mode, we don't need to run the monitoring loop
-    if [ "$operational_mode" = "static" ]; then
+    # Log operational mode at startup
+    if [ "$operational_mode" = "monitor" ]; then
+        log_and_print "MONITOR MODE ACTIVE - Connections are tracked but NOT blocked" 0
+    elif [ "$operational_mode" = "static" ]; then
         log_and_print "Running in static mode - checking for IP list changes" 1
         
         while true; do
