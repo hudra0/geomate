@@ -172,8 +172,10 @@ After installing Geomate and the LuCI interface:
 
 4. **Save & Let Geomate Learn**
    - Click "Save" and then "Save and Apply"
-   - Play your game - Geomate will learn server IPs
-   - Keep Strict Mode disabled initially
+   - Start with Dynamic or Monitor Mode to begin collecting server IPs
+   - Play several matches to allow Geomate to collect and geolocate server IPs
+   - The map will populate as IPs are discovered and geolocated
+   - Keep Strict Mode disabled until you've built a comprehensive IP list
 
 ![GeomateAdd](https://github.com/user-attachments/assets/ffdd5da0-d8d6-4b88-af53-5da055d57138)
 
@@ -191,6 +193,21 @@ After installing Geomate and the LuCI interface:
 - No automatic learning or IP tracking
 - Requires less system resources
 - Probably better for low-end routers or when you have complete server lists
+
+#### Monitor Mode
+- Tracks and logs connections without blocking any traffic
+- Collects and geolocates IPs just like Dynamic Mode, but never blocks any connections
+- Perfect for initial setup, testing, and analyzing game connections
+- **Key Benefits**:
+  - No risk of blocking legitimate connections during testing
+  - Visualize all server connections on the map as they're discovered
+  - Build your IP database while monitoring connections
+  - Ideal for understanding your game's server infrastructure
+- **Important Notes**:
+  - On new filters the map starts empty - play multiple matches to build your IP database
+  - IPs will appear on the map after they've been geolocated
+  - Use this mode when you want to analyze connections without any filtering
+  - Switch to Dynamic or Strict Mode when ready to enable filtering
 
 ### Essential Server Whitelisting
 - **Matchmaking Servers**: Required by most games to find and join matches
@@ -276,14 +293,27 @@ Without proper Allowed IPs:
 
 Finding the correct allowed IPs for games can involve some trial and error. Here's a systematic approach:
 
-#### Method 1: Initial Game Launch Analysis
+#### Method 1: Using Monitor Mode (Recommended)
+1. Set Geomate to **Monitor Mode** in the LuCI interface
+2. Play your game normally - all connections will be tracked but not blocked
+3. Monitor the LuCI interface to see which servers your game connects to. You can click on the connection icon to view the IP address - if needed, pause the UI by clicking on "refresh" to make clicking the icon easier.
+4. The map will populate with server locations as they're discovered and geolocated
+5. Play multiple matches to build a comprehensive IP database
+6. Pay attention to patterns - which servers are used for matchmaking vs. actual gameplay
+7. Make note of essential servers (like authentication and matchmaking) for whitelisting
+8. Once you've identified all necessary servers, decide on your filtering approach:
+   - Use Dynamic Mode for automatic filtering
+   - Use Static Mode if you want to manually manage IP lists
+   - Enable Strict Mode when you're confident in your IP database
+
+#### Method 2: Initial Game Launch Analysis
 1. Start with no allowed IPs configured
 2. Launch the game
 3. Monitor initial connections in QoSmate
 4. Focus on IPs that generate traffic over the configured game ports
 5. These early connections are often essential servers
 
-#### Method 2: Error-Driven Discovery
+#### Method 3: Error-Driven Discovery
 1. Start the game without allowed IPs
 2. If you encounter network/server connectivity errors:
    - Check QoSmate for recent connection attempts
