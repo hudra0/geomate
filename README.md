@@ -61,6 +61,8 @@ Tip: You can copy all commands from each section at once and paste them into you
 ### 1. Installing Geomate Core
 
 ```bash
+# Get latest release tag and install Geomate Core
+LATEST_TAG=$(uclient-fetch -O - https://api.github.com/repos/hudra0/geomate/releases/latest 2>/dev/null | grep -o '"tag_name":"[^"]*' | sed 's/"tag_name":"//') && \
 # Detect package manager and install required dependencies
 if command -v apk >/dev/null 2>&1; then
     PKG_MANAGER="apk"
@@ -74,16 +76,16 @@ else
 fi && \
 mkdir -p /etc/geomate.d && \
 # Download server lists
-for file in $(curl -s https://api.github.com/repos/hudra0/geomate/contents/files/etc/geomate.d | jq -r '.[].name'); do
-    curl -L -o "/etc/geomate.d/$file" "https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/geomate.d/$file"
+for file in $(curl -s https://api.github.com/repos/hudra0/geomate/contents/files/etc/geomate.d?ref=$LATEST_TAG | jq -r '.[].name'); do
+    uclient-fetch -O "/etc/geomate.d/$file" "https://raw.githubusercontent.com/hudra0/geomate/$LATEST_TAG/files/etc/geomate.d/$file"
 done && \
 # Download and install core files
-wget -O /etc/init.d/geomate https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/init.d/geomate && \
-wget -O /etc/geomate.sh https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/geomate.sh && \
-wget -O /etc/geomate_trigger.sh https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/geomate_trigger.sh && \
-wget -O /etc/geolocate.sh https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/geolocate.sh && \
+uclient-fetch -O /etc/init.d/geomate https://raw.githubusercontent.com/hudra0/geomate/$LATEST_TAG/files/etc/init.d/geomate && \
+uclient-fetch -O /etc/geomate.sh https://raw.githubusercontent.com/hudra0/geomate/$LATEST_TAG/files/etc/geomate.sh && \
+uclient-fetch -O /etc/geomate_trigger.sh https://raw.githubusercontent.com/hudra0/geomate/$LATEST_TAG/files/etc/geomate_trigger.sh && \
+uclient-fetch -O /etc/geolocate.sh https://raw.githubusercontent.com/hudra0/geomate/$LATEST_TAG/files/etc/geolocate.sh && \
 chmod +x /etc/init.d/geomate /etc/geomate.sh /etc/geomate_trigger.sh /etc/geolocate.sh && \
-if [ ! -f /etc/config/geomate ]; then wget -O /etc/config/geomate https://raw.githubusercontent.com/hudra0/geomate/main/files/etc/config/geomate; fi && \
+[ ! -f /etc/config/geomate ] && uclient-fetch -O /etc/config/geomate https://raw.githubusercontent.com/hudra0/geomate/$LATEST_TAG/files/etc/config/geomate; \
 # Enable and start service with a small delay
 /etc/init.d/geomate enable && \
 sleep 2 && \
@@ -94,6 +96,8 @@ echo "Geomate service installation complete!"
 ### 2. Installing the LuCI Web Interface
 
 ```bash
+# Get latest release tag and install LuCI Web Interface
+LATEST_TAG=$(uclient-fetch -O - https://api.github.com/repos/hudra0/luci-app-geomate/releases/latest 2>/dev/null | grep -o '"tag_name":"[^"]*' | sed 's/"tag_name":"//') && \
 # Detect package manager and install required dependencies
 if command -v apk >/dev/null 2>&1; then
     PKG_MANAGER="apk"
@@ -106,12 +110,12 @@ else
     exit 1
 fi && \
 mkdir -p /www/luci-static/resources/view/geomate /usr/share/luci/menu.d /usr/share/rpcd/acl.d /usr/libexec/rpcd && \
-wget -O /www/luci-static/resources/view/geomate/view.js https://raw.githubusercontent.com/hudra0/luci-app-geomate/main/htdocs/luci-static/resources/view/geomate/view.js && \
-wget -O /www/luci-static/resources/view/geomate/geofilters.js https://raw.githubusercontent.com/hudra0/luci-app-geomate/main/htdocs/luci-static/resources/view/geomate/geofilters.js && \
-wget -O /www/luci-static/resources/view/geomate/map.html https://raw.githubusercontent.com/hudra0/luci-app-geomate/main/htdocs/luci-static/resources/view/geomate/map.html && \
-wget -O /usr/share/luci/menu.d/luci-app-geomate.json https://raw.githubusercontent.com/hudra0/luci-app-geomate/main/root/usr/share/luci/menu.d/luci-app-geomate.json && \
-wget -O /usr/share/rpcd/acl.d/luci-app-geomate.json https://raw.githubusercontent.com/hudra0/luci-app-geomate/main/root/usr/share/rpcd/acl.d/luci-app-geomate.json && \
-wget -O /usr/libexec/rpcd/luci.geomate https://raw.githubusercontent.com/hudra0/luci-app-geomate/main/root/usr/libexec/rpcd/luci.geomate && \
+uclient-fetch -O /www/luci-static/resources/view/geomate/view.js https://raw.githubusercontent.com/hudra0/luci-app-geomate/$LATEST_TAG/htdocs/luci-static/resources/view/geomate/view.js && \
+uclient-fetch -O /www/luci-static/resources/view/geomate/geofilters.js https://raw.githubusercontent.com/hudra0/luci-app-geomate/$LATEST_TAG/htdocs/luci-static/resources/view/geomate/geofilters.js && \
+uclient-fetch -O /www/luci-static/resources/view/geomate/map.html https://raw.githubusercontent.com/hudra0/luci-app-geomate/$LATEST_TAG/htdocs/luci-static/resources/view/geomate/map.html && \
+uclient-fetch -O /usr/share/luci/menu.d/luci-app-geomate.json https://raw.githubusercontent.com/hudra0/luci-app-geomate/$LATEST_TAG/root/usr/share/luci/menu.d/luci-app-geomate.json && \
+uclient-fetch -O /usr/share/rpcd/acl.d/luci-app-geomate.json https://raw.githubusercontent.com/hudra0/luci-app-geomate/$LATEST_TAG/root/usr/share/rpcd/acl.d/luci-app-geomate.json && \
+uclient-fetch -O /usr/libexec/rpcd/luci.geomate https://raw.githubusercontent.com/hudra0/luci-app-geomate/$LATEST_TAG/root/usr/libexec/rpcd/luci.geomate && \
 chmod +x /usr/libexec/rpcd/luci.geomate && \
 /etc/init.d/rpcd restart && \
 /etc/init.d/uhttpd restart
