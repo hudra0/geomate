@@ -578,6 +578,85 @@ Consider using alternatives like `banip` or `geoip-shell` instead, as they are b
 
 ## Backup and Updates
 
+### Updating Geomate
+
+Geomate includes a flexible update system to keep your installation current with the latest features and improvements.
+
+#### Basic Update
+To update Geomate to the latest release version:
+
+```bash
+/etc/init.d/geomate update
+```
+
+This command will:
+- Check for updates to both backend and frontend components
+- Download and install the latest release versions if available
+- Restart the service automatically if required
+
+Geomate will preserve your existing configuration settings during updates.
+
+#### Advanced Update Options
+
+For more control over the update process, Geomate supports several command-line options:
+
+```bash
+/etc/init.d/geomate update [options]
+```
+
+| Option | Description | Example |
+|--------|-------------|---------|
+| `-c COMPONENT` | Update only a specific component (BACKEND or FRONTEND) | `-c BACKEND` |
+| `-v VERSION_OR_CHANNEL` | Specify version or channel in various formats:<br>- Version number: `-v 1.2.0`<br>- Channel selection: `-v release`, `-v snapshot`<br>- Branch selection: `-v branch=dev`<br>- Commit hash: `-v commit=a1b2c3d4` | `-v 1.2.0` |
+| `-f` | Force update even if no newer version is available | `-f` |
+| `-i` | Ignore cache results | `-i` |
+| `-U CHANNEL` | Override update channel (takes precedence over `-v`) | `-U snapshot` |
+
+#### Update Channels
+- `release`: Stable versions (recommended for most users)
+- `snapshot`: Latest code from the main branch
+- `branch=NAME`: Code from a specific branch
+- `commit=HASH`: Specific commit version
+
+#### Usage Examples
+
+Check for available updates without installing them:
+```bash
+/etc/init.d/geomate check_version
+```
+
+Update only the backend component:
+```bash
+/etc/init.d/geomate update -c BACKEND
+```
+
+Update to a specific version:
+```bash
+/etc/init.d/geomate update -v 1.2.0
+```
+
+Update to the latest release version:
+```bash
+/etc/init.d/geomate update -v release
+```
+
+Update to the latest snapshot (development) version:
+```bash
+/etc/init.d/geomate update -v snapshot
+```
+
+Update to a specific branch:
+```bash
+/etc/init.d/geomate update -v branch=dev
+```
+
+Update to a specific commit hash:
+```bash
+/etc/init.d/geomate update -v commit=a1b2c3d4e5f6...
+```
+
+> **Note:** The default update approach (using the release channel) is recommended for most users. Other update channels and options are primarily intended for testing and development purposes.
+
 ### Preserving IP Lists During Firmware Updates
 
 Geomate stores all IP lists in the `/etc/geomate.d/` directory. By default, this directory is not preserved during OpenWrt firmware updates. To keep your IP lists across updates:
