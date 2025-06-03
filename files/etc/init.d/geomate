@@ -63,8 +63,7 @@ GEOMATE_GEN_FILES_BACKEND="
 	$GEOMATE_SERVICE_PATH
 	/etc/geomate.sh
 	/etc/geomate_trigger.sh
-	/etc/geolocate.sh
-	/etc/config/geomate"
+	/etc/geolocate.sh"
 GEOMATE_EXEC_FILES_BACKEND="
 	$GEOMATE_SERVICE_PATH
 	/etc/geomate.sh
