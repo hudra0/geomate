@@ -1140,6 +1140,13 @@ install_geomate_files() {
 		do
 			[ -f "$file" ] || continue
 
+			# Migration: preserve config files during v1.1.0->v1.1.1 transition
+			case "$file" in
+				*/config/geomate)
+					log_msg "Preserving configuration file: '$file'"
+					continue ;;
+			esac
+
 			# check for $file in $new_file_list, allowing newline as list delimiter
 			case "$new_file_list" in
 				"$file"|"${file}${_NL_}"*|*"${_NL_}${file}"|*"${_NL_}${file}${_NL_}"*)
