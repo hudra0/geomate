@@ -289,7 +289,7 @@ check_files_integrity() {
 	done
 
 	IFS="$DEFAULT_IFS"
-	md5sum -c "$reg_file" 2>/dev/null || return 3
+	md5sum -c "$reg_file" >/dev/null 2>&1 || return 3
 	:
 }
 
