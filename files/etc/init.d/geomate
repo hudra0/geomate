@@ -212,6 +212,21 @@ start_service() {
 		esac
 	done
 
+    # Recovery: Download default config if missing (e.g., after failed update)
+    if [ ! -f /etc/config/geomate ]; then
+        log_msg -warn "Config file missing, downloading default configuration from repository"
+        local config_url="${GEOMATE_GH_RAW_URL_BACKEND_MAIN}/files/etc/config/geomate"
+        if uclient-fetch "$config_url" -O /etc/config/geomate 2>/dev/null; then
+            chmod 644 /etc/config/geomate
+            log_msg "Default configuration downloaded successfully"
+        else
+            log_msg -err "Failed to download config, creating minimal fallback"
+            echo "config global 'global'
+	option enabled '1'" > /etc/config/geomate
+            chmod 644 /etc/config/geomate
+        fi
+    fi
+
     local enabled
     config_load 'geomate'
     config_get_bool enabled global enabled 0
@@ -1140,12 +1155,6 @@ install_geomate_files() {
 		do
 			[ -f "$file" ] || continue
 
-			# Migration: preserve config files during v1.1.0->v1.1.1 transition
-			case "$file" in
-				*/config/geomate)
-					log_msg "Preserving configuration file: '$file'"
-					continue ;;
-			esac
 
 			# check for $file in $new_file_list, allowing newline as list delimiter
 			case "$new_file_list" in
