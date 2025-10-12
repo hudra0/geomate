@@ -172,41 +172,61 @@ setup_geo_filter() {
 
     # Include src_port in the rule if set
     if [ -n "$src_port" ] && [ "$src_port" != "any" ]; then
-        # Check if it's a port range
-        if echo "$src_port" | grep -q '-'; then
-            base_rule="$base_rule sport $src_port"
-        else
-            # Replace spaces with commas for nftables list format
+        # Check if multiple values (separated by space) - need braces
+        if echo "$src_port" | grep -q ' '; then
             src_port=$(echo "$src_port" | tr ' ' ',')
             base_rule="$base_rule sport { $src_port }"
+        else
+            # Single value (port or range) - no braces needed
+            base_rule="$base_rule sport $src_port"
         fi
     fi
 
     # Include dest_port in the rule if set
     if [ -n "$dest_port" ] && [ "$dest_port" != "any" ]; then
-        # Check if it's a port range
-        if echo "$dest_port" | grep -q '-'; then
-            base_rule="$base_rule dport $dest_port"
-        else
-            # Replace spaces with commas for nftables list format
+        # Check if multiple values (separated by space) - need braces
+        if echo "$dest_port" | grep -q ' '; then
             dest_port=$(echo "$dest_port" | tr ' ' ',')
             base_rule="$base_rule dport { $dest_port }"
+        else
+            # Single value (port or range) - no braces needed
+            base_rule="$base_rule dport $dest_port"
         fi
     fi
 
-    nft add rule inet geomate forward "$base_rule" ip daddr @"${set_name}"_allowed counter accept
+    # Add forward rule for allowed IPs with error checking
+    log_and_print "Adding forward rule: $base_rule ip daddr @${set_name}_allowed counter accept" 2
+    if ! nft add rule inet geomate forward "$base_rule" ip daddr @"${set_name}"_allowed counter accept 2>&1 | tee /tmp/geomate_nft_error.log | grep -q .; then
+        log_and_print "Successfully added forward rule for allowed IPs in $name" 2
+    else
+        log_and_print "ERROR: Failed to add forward rule for $name! Check /tmp/geomate_nft_error.log" 0
+        log_and_print "Rule was: $base_rule ip daddr @${set_name}_allowed counter accept" 0
+        cat /tmp/geomate_nft_error.log | while read -r line; do log_and_print "nft error: $line" 0; done
+    fi
     
     # Only add drop rule if not in monitor mode
     if [ "$operational_mode" != "monitor" ]; then
-        nft add rule inet geomate forward "$base_rule" ip daddr @"${set_name}"_blocked counter drop
+        log_and_print "Adding drop rule: $base_rule ip daddr @${set_name}_blocked counter drop" 2
+        if ! nft add rule inet geomate forward "$base_rule" ip daddr @"${set_name}"_blocked counter drop 2>&1 | tee /tmp/geomate_nft_error.log | grep -q .; then
+            log_and_print "Successfully added drop rule for blocked IPs in $name" 2
+        else
+            log_and_print "ERROR: Failed to add drop rule for $name! Check /tmp/geomate_nft_error.log" 0
+            log_and_print "Rule was: $base_rule ip daddr @${set_name}_blocked counter drop" 0
+            cat /tmp/geomate_nft_error.log | while read -r line; do log_and_print "nft error: $line" 0; done
+        fi
     else
         log_and_print "Monitor mode: Not adding drop rule for blocked IPs in $name" 2
     fi
 
     # Strict mode rule - only apply if not in monitor mode
     if [ "$strict_mode" = "1" ] && [ "$operational_mode" != "monitor" ]; then
-        nft add rule inet geomate forward "$base_rule" counter drop
-        log_and_print "Strict mode: Added default drop rule for $name" 2
+        log_and_print "Strict mode: Adding default drop rule: $base_rule counter drop" 2
+        if ! nft add rule inet geomate forward "$base_rule" counter drop 2>&1 | tee /tmp/geomate_nft_error.log | grep -q .; then
+            log_and_print "Strict mode: Successfully added default drop rule for $name" 2
+        else
+            log_and_print "ERROR: Strict mode - Failed to add default drop rule for $name!" 0
+            cat /tmp/geomate_nft_error.log | while read -r line; do log_and_print "nft error: $line" 0; done
+        fi
     fi
 
     log_and_print "Geo filter for $name set up successfully" 1
@@ -262,34 +282,48 @@ create_dynamic_set() {
 
     # Include src_port in the rule if set
     if [ -n "$src_port" ] && [ "$src_port" != "any" ]; then
-        # Check if it's a port range
-        if echo "$src_port" | grep -q '-'; then
-            base_rule="$base_rule sport $src_port"
-        else
-            # Replace spaces with commas for nftables list format
+        # Check if multiple values (separated by space) - need braces
+        if echo "$src_port" | grep -q ' '; then
             src_port=$(echo "$src_port" | tr ' ' ',')
             base_rule="$base_rule sport { $src_port }"
+        else
+            # Single value (port or range) - no braces needed
+            base_rule="$base_rule sport $src_port"
         fi
     fi
 
     # Include dest_port in the rule if set
     if [ -n "$dest_port" ] && [ "$dest_port" != "any" ]; then
-        # Check if it's a port range
-        if echo "$dest_port" | grep -q '-'; then
-            base_rule="$base_rule dport $dest_port"
-        else
-            # Replace spaces with commas for nftables list format
+        # Check if multiple values (separated by space) - need braces
+        if echo "$dest_port" | grep -q ' '; then
             dest_port=$(echo "$dest_port" | tr ' ' ',')
             base_rule="$base_rule dport { $dest_port }"
+        else
+            # Single value (port or range) - no braces needed
+            base_rule="$base_rule dport $dest_port"
         fi
     fi
 
-    # Add rule for the ui dynamic set (always needed)
-    nft add rule inet geomate prerouting "$base_rule" update @"${set_name}"_ui_dynamic { ip daddr }
+    # Add rule for the ui dynamic set (always needed) with error checking
+    log_and_print "Adding prerouting rule for UI: $base_rule update @${set_name}_ui_dynamic { ip daddr }" 2
+    if ! nft add rule inet geomate prerouting "$base_rule" update @"${set_name}"_ui_dynamic { ip daddr } 2>&1 | tee /tmp/geomate_nft_error.log | grep -q .; then
+        log_and_print "Successfully added UI dynamic set rule for $name" 2
+    else
+        log_and_print "ERROR: Failed to add UI dynamic set rule for $name! Check /tmp/geomate_nft_error.log" 0
+        log_and_print "Rule was: $base_rule update @${set_name}_ui_dynamic { ip daddr }" 0
+        cat /tmp/geomate_nft_error.log | while read -r line; do log_and_print "nft error: $line" 0; done
+    fi
 
     # Add rule for the main dynamic set only in dynamic mode
     if [ "$operational_mode" != "static" ]; then
-        nft add rule inet geomate prerouting "$base_rule" update @"${set_name}"_dynamic { ip daddr }
+        log_and_print "Adding prerouting rule for dynamic set: $base_rule update @${set_name}_dynamic { ip daddr }" 2
+        if ! nft add rule inet geomate prerouting "$base_rule" update @"${set_name}"_dynamic { ip daddr } 2>&1 | tee /tmp/geomate_nft_error.log | grep -q .; then
+            log_and_print "Successfully added main dynamic set rule for $name" 2
+        else
+            log_and_print "ERROR: Failed to add main dynamic set rule for $name! Check /tmp/geomate_nft_error.log" 0
+            log_and_print "Rule was: $base_rule update @${set_name}_dynamic { ip daddr }" 0
+            cat /tmp/geomate_nft_error.log | while read -r line; do log_and_print "nft error: $line" 0; done
+        fi
     fi
 
     log_and_print "Sets for $name set up successfully" 1
@@ -326,7 +360,7 @@ process_dynamic_set() {
         done < "$temp_file"
 
         # Trigger geolocation update only if new IPs were added
-        if [ $(wc -l < "$temp_file") -gt 0 ]; then
+        if [ "$(wc -l < "$temp_file")" -gt 0 ]; then
             # Get the allowed regions
             local allowed_region
             config_get allowed_region "$1" 'allowed_region'
@@ -510,7 +544,7 @@ is_within_circle() {
 
     log_and_print "Distance calculation for $lat1,$lon1 to $lat2,$lon2: distance=$distance, radius=$radius" 2
 
-    if [ $(awk -v distance="$distance" -v radius="$radius" 'BEGIN {print (distance <= radius) ? 1 : 0}') -eq 1 ]; then
+    if [ "$(awk -v distance="$distance" -v radius="$radius" 'BEGIN {print (distance <= radius) ? 1 : 0}')" -eq 1 ]; then
         log_and_print "IP is within the circle (distance: $distance, radius: $radius)" 2
         return 0  # Within the circle
     else
@@ -527,12 +561,47 @@ verify_nftables_rules() {
     log_and_print "Full table output:" 2
     echo "$table_output"
     
-    local prerouting_rules=$(echo "$table_output" | sed -n '/chain prerouting {/,/}/p')
-    if [ -z "$prerouting_rules" ]; then
-        log_and_print "No rules found in prerouting chain!" 0
+    # Count actual rules (not just chain definitions)
+    local prerouting_rule_count=$(echo "$table_output" | sed -n '/chain prerouting {/,/}/p' | grep -c 'update\|counter\|accept\|drop' || echo "0")
+    local forward_rule_count=$(echo "$table_output" | sed -n '/chain forward {/,/}/p' | grep -c 'update\|counter\|accept\|drop' || echo "0")
+    
+    log_and_print "Rule count analysis:" 1
+    log_and_print "  Prerouting chain: $prerouting_rule_count rules" 1
+    log_and_print "  Forward chain: $forward_rule_count rules" 1
+    
+    # Critical warnings if chains are empty
+    if [ "$prerouting_rule_count" -eq 0 ]; then
+        log_and_print "WARNING: No rules in prerouting chain! IP collection will NOT work!" 0
+        log_and_print "This usually means there was an error creating the nft rules." 0
+        log_and_print "Check /tmp/geomate_nft_error.log for details." 0
     else
+        log_and_print "✓ Prerouting chain has rules - IP collection should work" 1
+    fi
+    
+    if [ "$forward_rule_count" -eq 0 ] && [ "$operational_mode" != "monitor" ]; then
+        log_and_print "WARNING: No rules in forward chain! Filtering will NOT work!" 0
+        log_and_print "This usually means there was an error creating the nft rules." 0
+        log_and_print "Check /tmp/geomate_nft_error.log for details." 0
+    else
+        if [ "$operational_mode" = "monitor" ]; then
+            log_and_print "Monitor mode: Forward chain rules not required" 1
+        else
+            log_and_print "✓ Forward chain has rules - filtering should work" 1
+        fi
+    fi
+    
+    # Show the actual rules in prerouting
+    local prerouting_rules=$(echo "$table_output" | sed -n '/chain prerouting {/,/}/p')
+    if [ -n "$prerouting_rules" ]; then
         log_and_print "Rules in prerouting chain:" 2
         echo "$prerouting_rules"
+    fi
+    
+    # Show the actual rules in forward
+    local forward_rules=$(echo "$table_output" | sed -n '/chain forward {/,/}/p')
+    if [ -n "$forward_rules" ]; then
+        log_and_print "Rules in forward chain:" 2
+        echo "$forward_rules"
     fi
     
     # Check if dynamic sets have been created
@@ -543,15 +612,6 @@ verify_nftables_rules() {
         log_and_print "Dynamic sets:" 2
         echo "$dynamic_sets"
     fi
-
-    # Display all chains
-    log_and_print "All chains:" 2
-    echo "$table_output" | sed -n '/chain/,/}/p'
-
-    # Show the number of rules in each chain
-    log_and_print "Rule count per chain:" 2
-    echo "$table_output" | grep -c 'chain prerouting' | xargs echo "prerouting:"
-    echo "$table_output" | grep -c 'chain forward' | xargs echo "forward:"
 }
 
 # Execute the Geomate trigger script
