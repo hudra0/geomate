@@ -171,7 +171,9 @@ setup_geo_filter() {
     [ -n "$protocol" ] && base_rule="$base_rule $protocol"
 
     # Include src_port in the rule if set
+    local has_sport=0
     if [ -n "$src_port" ] && [ "$src_port" != "any" ]; then
+        has_sport=1
         # Check if multiple values (separated by space) - need braces
         if echo "$src_port" | grep -q ' '; then
             src_port=$(echo "$src_port" | tr ' ' ',')
@@ -184,6 +186,7 @@ setup_geo_filter() {
 
     # Include dest_port in the rule if set
     if [ -n "$dest_port" ] && [ "$dest_port" != "any" ]; then
+        [ "$has_sport" = "1" ] && [ -n "$protocol" ] && base_rule="$base_rule $protocol"
         # Check if multiple values (separated by space) - need braces
         if echo "$dest_port" | grep -q ' '; then
             dest_port=$(echo "$dest_port" | tr ' ' ',')
@@ -281,7 +284,9 @@ create_dynamic_set() {
     [ -n "$protocol" ] && base_rule="$base_rule $protocol"
 
     # Include src_port in the rule if set
+    local has_sport=0
     if [ -n "$src_port" ] && [ "$src_port" != "any" ]; then
+        has_sport=1
         # Check if multiple values (separated by space) - need braces
         if echo "$src_port" | grep -q ' '; then
             src_port=$(echo "$src_port" | tr ' ' ',')
@@ -294,6 +299,7 @@ create_dynamic_set() {
 
     # Include dest_port in the rule if set
     if [ -n "$dest_port" ] && [ "$dest_port" != "any" ]; then
+        [ "$has_sport" = "1" ] && [ -n "$protocol" ] && base_rule="$base_rule $protocol"
         # Check if multiple values (separated by space) - need braces
         if echo "$dest_port" | grep -q ' '; then
             dest_port=$(echo "$dest_port" | tr ' ' ',')
