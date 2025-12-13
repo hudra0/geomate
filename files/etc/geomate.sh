@@ -3,10 +3,13 @@
 # shellcheck shell=ash
 # shellcheck disable=SC3043  # ash supports local variables
 # shellcheck disable=SC2317  # Functions are called by OpenWrt's system
+# shellcheck disable=SC2329  # Functions are invoked indirectly via config_foreach
 # shellcheck disable=SC2155  # Combined declaration and assignment is fine for our use case
 # shellcheck disable=SC1083  # nft syntax requires literal braces
 # shellcheck disable=SC1091  # OpenWrt's /lib/functions.sh is not available during shellcheck
 # shellcheck disable=SC2154  # Variables are assigned by OpenWrt's config_load
+# shellcheck disable=SC2181  # Using $? is intentional for clarity in error handling
+# shellcheck disable=SC2002  # cat with pipe is used for readability in error log processing
 
 . /lib/functions.sh
 
