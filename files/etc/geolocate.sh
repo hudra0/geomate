@@ -3,8 +3,11 @@
 # shellcheck shell=ash
 # shellcheck disable=SC3043  # ash supports local variables
 # shellcheck disable=SC2317  # Functions are called by OpenWrt's system
+# shellcheck disable=SC2329  # Functions are invoked indirectly via config_foreach
 # shellcheck disable=SC2155  # Combined declaration and assignment is fine for our use case
 # shellcheck disable=SC1091  # OpenWrt's /lib/functions.sh is not available during shellcheck
+# shellcheck disable=SC2154  # Variables are assigned by OpenWrt's config_load
+# shellcheck disable=SC2181  # Using $? is intentional for clarity in error handling
 
 . /lib/functions.sh
 config_load 'geomate'
@@ -82,7 +85,7 @@ process_game_ips() {
 
     log_and_print "Total IPs in list for $game_name: $(wc -l < "$ip_list")" 2
 
-    > "$temp_output_file"
+    : > "$temp_output_file"
     log_and_print "Temporary file created and emptied" 2
 
     while IFS= read -r ip || [ -n "$ip" ]; do
@@ -200,7 +203,7 @@ process_specific_ips() {
     done
     touch "$lock_file"
 
-    > "$temp_output_file"
+    : > "$temp_output_file"
 
     local batch=""
     local count=0
