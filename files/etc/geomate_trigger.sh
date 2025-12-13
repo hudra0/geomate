@@ -3,8 +3,11 @@
 # shellcheck shell=ash
 # shellcheck disable=SC3043  # ash supports local variables
 # shellcheck disable=SC2317  # Functions are called by OpenWrt's system
+# shellcheck disable=SC2329  # Functions are invoked indirectly via config_foreach
 # shellcheck disable=SC2155  # Combined declaration and assignment is fine for our use case
 # shellcheck disable=SC1091  # OpenWrt's /lib/functions.sh is not available during shellcheck
+# shellcheck disable=SC2154  # Variables are assigned by OpenWrt's config_load
+# shellcheck disable=SC2181  # Using $? is intentional for clarity in error handling
 
 . /lib/functions.sh
 config_load 'geomate'
@@ -64,7 +67,6 @@ check_and_run_geolocate() {
             log_and_print "Geomate_Trigger: Processing $ips_to_process new IPs for geolocation" 1
             process_batch_specific_ips "$ips_to_process"
             last_geolocate_time=$current_time
-            remaining_time=$geolocate_interval
         fi
 
         # Trigger geolocation update only if new IPs have been added
@@ -74,8 +76,8 @@ check_and_run_geolocate() {
             geolocate_interval=$((geolocate_interval * 2))
             [ $geolocate_interval -gt $MAX_GEOLOCATE_INTERVAL ] && geolocate_interval=$MAX_GEOLOCATE_INTERVAL
         fi
-        echo $geolocate_interval > "${LAST_RUN_FILE}.interval"
-        echo $current_time > "$LAST_RUN_FILE"
+        echo "$geolocate_interval" > "${LAST_RUN_FILE}.interval"
+        echo "$current_time" > "$LAST_RUN_FILE"
     fi
 }
 
