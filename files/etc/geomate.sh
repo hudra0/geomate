@@ -3,23 +3,41 @@
 # shellcheck shell=ash
 # shellcheck disable=SC3043  # ash supports local variables
 # shellcheck disable=SC2317  # Functions are called by OpenWrt's system
+# shellcheck disable=SC2329  # Functions are invoked indirectly via config_foreach
 # shellcheck disable=SC2155  # Combined declaration and assignment is fine for our use case
 # shellcheck disable=SC1083  # nft syntax requires literal braces
 # shellcheck disable=SC1091  # OpenWrt's /lib/functions.sh is not available during shellcheck
 # shellcheck disable=SC2154  # Variables are assigned by OpenWrt's config_load
+# shellcheck disable=SC2181  # Using $? is intentional for clarity in error handling
+# shellcheck disable=SC2002  # cat with pipe is used for readability in error log processing
 
 . /lib/functions.sh
 
 GEOMATE_DATA_DIR="/etc/geomate.d"
 GEOMATE_RUNTIME_DIR="${GEOMATE_DATA_DIR}/runtime"
 GEOMATE_TMP_DIR="/tmp/geomate"
+NFT_ERROR_LOG="/tmp/geomate_nft_errors.log"
 NFT_SET_PREFIX="geomate_"
+CHECK_INTERVAL=1800  # Interval in seconds (30 minutes) - used for geolocation status
 debug_level=0
+
+# Wrapper for nft commands with error logging
+# Logs failed commands to error log file for debugging
+nft_exec() {
+    local result rv
+    result=$(nft "$@" 2>&1)
+    rv=$?
+    if [ $rv -ne 0 ]; then
+        log_and_print "nft command failed: nft $*" 0
+        log_and_print "Error: $result" 0
+        printf '[%s] nft %s -> Error: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" "$result" >> "$NFT_ERROR_LOG"
+    fi
+    return $rv
+}
 
 # Load configuration settings
 load_config() {
     config_load 'geomate'
-    config_get interface settings interface 'br-lan'
     config_get debug_level global debug_level '0'
     config_get strict_mode global strict_mode '0'
     config_get operational_mode global operational_mode 'dynamic'
@@ -81,9 +99,9 @@ setup_nftables_and_filters() {
     
     # Delete existing table and recreate it
     nft delete table inet geomate 2>/dev/null
-    nft add table inet geomate
-    nft add chain inet geomate forward { type filter hook forward priority -150 \; policy accept \; }
-    nft add chain inet geomate prerouting { type filter hook prerouting priority -150 \; policy accept \; }
+    nft_exec add table inet geomate
+    nft_exec add chain inet geomate forward { type filter hook forward priority -150 \; policy accept \; }
+    nft_exec add chain inet geomate prerouting { type filter hook prerouting priority -150 \; policy accept \; }
 
     # Set up filters from configuration
     config_load 'geomate'
@@ -96,7 +114,7 @@ setup_nftables_and_filters() {
     elif [ "$strict_mode" = "1" ]; then
         log_and_print "Strict mode enabled: No default forward policy set" 1
     else
-        nft add rule inet geomate forward counter accept
+        nft_exec add rule inet geomate forward counter accept
         log_and_print "Normal mode: Default forward policy set to accept" 1
     fi
 
@@ -142,21 +160,21 @@ setup_geo_filter() {
     log_and_print "Setting up geo filter for $name" 1
 
     # Create sets for this filter
-    nft add set inet geomate "${set_name}_allowed" { type ipv4_addr\; flags interval\; }
-    nft add set inet geomate "${set_name}_blocked" { type ipv4_addr\; flags interval\; }
+    nft_exec add set inet geomate "${set_name}_allowed" { type ipv4_addr\; flags interval\; }
+    nft_exec add set inet geomate "${set_name}_blocked" { type ipv4_addr\; flags interval\; }
 
     # Add allowed IPs
     config_list_foreach "$1" 'allowed_ip' append_allowed_ip
     if [ -n "$allowed_ips" ]; then
         allowed_ips=${allowed_ips%,}
         log_and_print "Manually adding allowed IPs: $allowed_ips" 2
-        nft add element inet geomate "${set_name}_allowed" { "$allowed_ips" }
+        nft_exec add element inet geomate "${set_name}_allowed" { "$allowed_ips" }
     fi
 
     # Add blocked IPs
     if [ -n "$blocked_ips" ]; then
         log_and_print "Manually adding blocked IPs: $blocked_ips" 2
-        nft add element inet geomate "${set_name}_blocked" { "$blocked_ips" }
+        nft_exec add element inet geomate "${set_name}_blocked" { "$blocked_ips" }
     fi
 
     # Process all allowed regions together
@@ -199,23 +217,23 @@ setup_geo_filter() {
 
     # Add forward rule for allowed IPs with error checking
     log_and_print "Adding forward rule: $base_rule ip daddr @${set_name}_allowed counter accept" 2
-    if ! nft add rule inet geomate forward "$base_rule" ip daddr @"${set_name}"_allowed counter accept 2>&1 | tee /tmp/geomate_nft_error.log | grep -q .; then
+    if ! nft add rule inet geomate forward "$base_rule" ip daddr @"${set_name}"_allowed counter accept 2>&1 | tee $NFT_ERROR_LOG | grep -q .; then
         log_and_print "Successfully added forward rule for allowed IPs in $name" 2
     else
-        log_and_print "ERROR: Failed to add forward rule for $name! Check /tmp/geomate_nft_error.log" 0
+        log_and_print "ERROR: Failed to add forward rule for $name! Check $NFT_ERROR_LOG" 0
         log_and_print "Rule was: $base_rule ip daddr @${set_name}_allowed counter accept" 0
-        cat /tmp/geomate_nft_error.log | while read -r line; do log_and_print "nft error: $line" 0; done
+        cat $NFT_ERROR_LOG | while read -r line; do log_and_print "nft error: $line" 0; done
     fi
     
     # Only add drop rule if not in monitor mode
     if [ "$operational_mode" != "monitor" ]; then
         log_and_print "Adding drop rule: $base_rule ip daddr @${set_name}_blocked counter drop" 2
-        if ! nft add rule inet geomate forward "$base_rule" ip daddr @"${set_name}"_blocked counter drop 2>&1 | tee /tmp/geomate_nft_error.log | grep -q .; then
+        if ! nft add rule inet geomate forward "$base_rule" ip daddr @"${set_name}"_blocked counter drop 2>&1 | tee $NFT_ERROR_LOG | grep -q .; then
             log_and_print "Successfully added drop rule for blocked IPs in $name" 2
         else
-            log_and_print "ERROR: Failed to add drop rule for $name! Check /tmp/geomate_nft_error.log" 0
+            log_and_print "ERROR: Failed to add drop rule for $name! Check $NFT_ERROR_LOG" 0
             log_and_print "Rule was: $base_rule ip daddr @${set_name}_blocked counter drop" 0
-            cat /tmp/geomate_nft_error.log | while read -r line; do log_and_print "nft error: $line" 0; done
+            cat $NFT_ERROR_LOG | while read -r line; do log_and_print "nft error: $line" 0; done
         fi
     else
         log_and_print "Monitor mode: Not adding drop rule for blocked IPs in $name" 2
@@ -224,11 +242,11 @@ setup_geo_filter() {
     # Strict mode rule - only apply if not in monitor mode
     if [ "$strict_mode" = "1" ] && [ "$operational_mode" != "monitor" ]; then
         log_and_print "Strict mode: Adding default drop rule: $base_rule counter drop" 2
-        if ! nft add rule inet geomate forward "$base_rule" counter drop 2>&1 | tee /tmp/geomate_nft_error.log | grep -q .; then
+        if ! nft add rule inet geomate forward "$base_rule" counter drop 2>&1 | tee $NFT_ERROR_LOG | grep -q .; then
             log_and_print "Strict mode: Successfully added default drop rule for $name" 2
         else
             log_and_print "ERROR: Strict mode - Failed to add default drop rule for $name!" 0
-            cat /tmp/geomate_nft_error.log | while read -r line; do log_and_print "nft error: $line" 0; done
+            cat $NFT_ERROR_LOG | while read -r line; do log_and_print "nft error: $line" 0; done
         fi
     fi
 
@@ -270,12 +288,12 @@ create_dynamic_set() {
     log_and_print "Setting up sets for $name" 1
 
     # Create UI dynamic set in both modes (needed for map display)
-    nft add set inet geomate "${set_name}_ui_dynamic" { type ipv4_addr\; flags dynamic,timeout\; timeout 10s\; }
+    nft_exec add set inet geomate "${set_name}_ui_dynamic" { type ipv4_addr\; flags dynamic,timeout\; timeout 10s\; }
 
     # Only create main dynamic set in dynamic mode
     if [ "$operational_mode" != "static" ]; then
         # Create existing dynamic set with 1-hour timeout
-        nft add set inet geomate "${set_name}_dynamic" { type ipv4_addr\; flags dynamic,timeout\; timeout 1h\; }
+        nft_exec add set inet geomate "${set_name}_dynamic" { type ipv4_addr\; flags dynamic,timeout\; timeout 1h\; }
     fi
 
     # Create the base rule
@@ -312,23 +330,23 @@ create_dynamic_set() {
 
     # Add rule for the ui dynamic set (always needed) with error checking
     log_and_print "Adding prerouting rule for UI: $base_rule update @${set_name}_ui_dynamic { ip daddr }" 2
-    if ! nft add rule inet geomate prerouting "$base_rule" update @"${set_name}"_ui_dynamic { ip daddr } 2>&1 | tee /tmp/geomate_nft_error.log | grep -q .; then
+    if ! nft add rule inet geomate prerouting "$base_rule" update @"${set_name}"_ui_dynamic { ip daddr } 2>&1 | tee $NFT_ERROR_LOG | grep -q .; then
         log_and_print "Successfully added UI dynamic set rule for $name" 2
     else
-        log_and_print "ERROR: Failed to add UI dynamic set rule for $name! Check /tmp/geomate_nft_error.log" 0
+        log_and_print "ERROR: Failed to add UI dynamic set rule for $name! Check $NFT_ERROR_LOG" 0
         log_and_print "Rule was: $base_rule update @${set_name}_ui_dynamic { ip daddr }" 0
-        cat /tmp/geomate_nft_error.log | while read -r line; do log_and_print "nft error: $line" 0; done
+        cat $NFT_ERROR_LOG | while read -r line; do log_and_print "nft error: $line" 0; done
     fi
 
     # Add rule for the main dynamic set only in dynamic mode
     if [ "$operational_mode" != "static" ]; then
         log_and_print "Adding prerouting rule for dynamic set: $base_rule update @${set_name}_dynamic { ip daddr }" 2
-        if ! nft add rule inet geomate prerouting "$base_rule" update @"${set_name}"_dynamic { ip daddr } 2>&1 | tee /tmp/geomate_nft_error.log | grep -q .; then
+        if ! nft add rule inet geomate prerouting "$base_rule" update @"${set_name}"_dynamic { ip daddr } 2>&1 | tee $NFT_ERROR_LOG | grep -q .; then
             log_and_print "Successfully added main dynamic set rule for $name" 2
         else
-            log_and_print "ERROR: Failed to add main dynamic set rule for $name! Check /tmp/geomate_nft_error.log" 0
+            log_and_print "ERROR: Failed to add main dynamic set rule for $name! Check $NFT_ERROR_LOG" 0
             log_and_print "Rule was: $base_rule update @${set_name}_dynamic { ip daddr }" 0
-            cat /tmp/geomate_nft_error.log | while read -r line; do log_and_print "nft error: $line" 0; done
+            cat $NFT_ERROR_LOG | while read -r line; do log_and_print "nft error: $line" 0; done
         fi
     fi
 
@@ -386,6 +404,85 @@ process_dynamic_set() {
 update_dynamic_ips() {
     config_load 'geomate'
     config_foreach process_dynamic_set 'geo_filter'
+    
+    # Write geolocation status after processing
+    write_geolocation_status
+}
+
+# Write geolocation status to JSON file for UI/CLI consumption
+# This is called once per cycle (every 30 min) - minimal performance impact
+write_geolocation_status() {
+    local status_file="${GEOMATE_RUNTIME_DIR}/geolocation_status.json"
+    local current_time
+    local next_cycle
+    local last_geolocate=0
+    local geolocate_interval=1800
+    local pending_ips=0
+    
+    current_time=$(date +%s)
+    next_cycle=$((current_time + CHECK_INTERVAL))
+    
+    # Read geolocation timing info
+    [ -f "${GEOMATE_RUNTIME_DIR}/last_geolocate_run" ] && last_geolocate=$(cat "${GEOMATE_RUNTIME_DIR}/last_geolocate_run")
+    [ -f "${GEOMATE_RUNTIME_DIR}/last_geolocate_run.interval" ] && geolocate_interval=$(cat "${GEOMATE_RUNTIME_DIR}/last_geolocate_run.interval")
+    [ -f "${GEOMATE_RUNTIME_DIR}/new_ips.txt" ] && pending_ips=$(wc -l < "${GEOMATE_RUNTIME_DIR}/new_ips.txt" 2>/dev/null || echo 0)
+    
+    # Start JSON
+    printf '{\n' > "$status_file"
+    printf '  "timestamp": %s,\n' "$current_time" >> "$status_file"
+    printf '  "next_cycle": %s,\n' "$next_cycle" >> "$status_file"
+    printf '  "cycle_interval": %s,\n' "${CHECK_INTERVAL:-1800}" >> "$status_file"
+    
+    # Geolocation info
+    printf '  "geolocation": {\n' >> "$status_file"
+    printf '    "last_run": %s,\n' "$last_geolocate" >> "$status_file"
+    printf '    "interval": %s,\n' "$geolocate_interval" >> "$status_file"
+    printf '    "next_run": %s,\n' "$((last_geolocate + geolocate_interval))" >> "$status_file"
+    printf '    "pending_ips": %s\n' "$pending_ips" >> "$status_file"
+    printf '  },\n' >> "$status_file"
+    
+    # Collect filter stats
+    printf '  "filters": {\n' >> "$status_file"
+    
+    local first_filter=1
+    collect_filter_stats() {
+        local name ip_list geo_data_file
+        local total_ips=0 geolocated_ips=0
+        
+        config_get name "$1" 'name'
+        config_get ip_list "$1" 'ip_list'
+        geo_data_file="${GEOMATE_DATA_DIR}/${name}_geo_data.json"
+        
+        # Count IPs in list file
+        [ -f "$ip_list" ] && total_ips=$(wc -l < "$ip_list" 2>/dev/null || echo 0)
+        
+        # Count geolocated IPs (lines in geo_data.json)
+        [ -f "$geo_data_file" ] && geolocated_ips=$(wc -l < "$geo_data_file" 2>/dev/null || echo 0)
+        
+        # Add comma before all but first filter
+        if [ "$first_filter" = "1" ]; then
+            first_filter=0
+        else
+            printf ',\n' >> "$status_file"
+        fi
+        
+        # Escape filter name for JSON (replace quotes)
+        local escaped_name
+        escaped_name=$(echo "$name" | sed 's/"/\\"/g')
+        
+        printf '    "%s": {\n' "$escaped_name" >> "$status_file"
+        printf '      "total_ips": %s,\n' "$total_ips" >> "$status_file"
+        printf '      "geolocated": %s\n' "$geolocated_ips" >> "$status_file"
+        printf '    }' >> "$status_file"
+    }
+    
+    config_load 'geomate'
+    config_foreach collect_filter_stats 'geo_filter'
+    
+    printf '\n  }\n' >> "$status_file"
+    printf '}\n' >> "$status_file"
+    
+    log_and_print "Geolocation status updated: $status_file" 2
 }
 
 # Helper function to collect allowed_ip entries
@@ -579,7 +676,7 @@ verify_nftables_rules() {
     if [ "$prerouting_rule_count" -eq 0 ]; then
         log_and_print "WARNING: No rules in prerouting chain! IP collection will NOT work!" 0
         log_and_print "This usually means there was an error creating the nft rules." 0
-        log_and_print "Check /tmp/geomate_nft_error.log for details." 0
+        log_and_print "Check $NFT_ERROR_LOG for details." 0
     else
         log_and_print "✓ Prerouting chain has rules - IP collection should work" 1
     fi
@@ -587,7 +684,7 @@ verify_nftables_rules() {
     if [ "$forward_rule_count" -eq 0 ] && [ "$operational_mode" != "monitor" ]; then
         log_and_print "WARNING: No rules in forward chain! Filtering will NOT work!" 0
         log_and_print "This usually means there was an error creating the nft rules." 0
-        log_and_print "Check /tmp/geomate_nft_error.log for details." 0
+        log_and_print "Check $NFT_ERROR_LOG for details." 0
     else
         if [ "$operational_mode" = "monitor" ]; then
             log_and_print "Monitor mode: Forward chain rules not required" 1
@@ -645,6 +742,9 @@ run() {
     # Remove loading flag file
     log_and_print "Removing loading flag file at /tmp/geomate_loading" 1
     rm -f /tmp/geomate_loading
+
+    # Write initial geolocation status
+    write_geolocation_status
 
     log_and_print "Service is running" 0
     echo $$ > "/var/run/geomate.pid"
