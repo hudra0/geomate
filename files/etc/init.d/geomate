@@ -10,11 +10,12 @@ UPD_CHANNEL="release"
 START=95
 STOP=01
 
-EXTRA_COMMANDS="status geolocate check_version update"
-EXTRA_HELP="        status      Get service status
-        geolocate    Run geolocation for IP addresses
-        check_version              Check for updates
-        update                     Update geomate"
+EXTRA_COMMANDS="status geolocate check_version update health_check"
+EXTRA_HELP="        status          Get detailed service status
+        geolocate       Run geolocation for IP addresses
+        check_version   Check for updates
+        update          Update geomate
+        health_check    Check if Geomate is properly configured"
 
 ### Utility vars
 _NL_='
@@ -264,21 +265,337 @@ geolocate() {
 }
 
 status_service() {
-    local pid
+    local pid running=0 loading=0
+
+    print_msg "==== Geomate Status ===="
+
+    # Check if filters are currently loading
+    if [ -f "/tmp/geomate_loading" ]; then
+        loading=1
+        print_msg "*** LOADING: Filters are being initialized - please wait ***"
+        print_msg ""
+    fi
+
+    # Check service status
     if [ -f "$pid_file" ]; then
         pid=$(cat "$pid_file")
         if kill -0 "$pid" 2>/dev/null; then
-            log_and_print "Running (PID: $pid)"
-            return 0
+            if [ "$loading" = "1" ]; then
+                print_msg "Service: Starting (PID: $pid) - loading filters..."
+            else
+                print_msg "Service: Running (PID: $pid)"
+            fi
+            running=1
         else
-            log_and_print "Stopped (stale PID file)"
-            return 1
+            print_msg "Service: Stopped (stale PID file)"
         fi
     else
-        log_and_print "Stopped"
-        return 1
+        print_msg "Service: Stopped"
     fi
+
+    # Check autostart
+    if enabled; then
+        print_msg "Autostart: enabled"
+    else
+        print_msg "Autostart: disabled"
+    fi
+
+    # Load config and show settings
+    config_load 'geomate'
+    local global_enabled debug_level operational_mode
+    config_get_bool global_enabled global enabled 0
+    config_get debug_level global debug_level '0'
+    config_get operational_mode global operational_mode 'dynamic'
+
+    print_msg "" "==== Configuration ===="
+    if [ "$global_enabled" = "1" ]; then
+        print_msg "Config enabled: yes"
+    else
+        print_msg "Config enabled: no"
+    fi
+    print_msg "Operational mode: $operational_mode"
+    print_msg "Debug level: $debug_level"
+
+    # Show active filters
+    print_msg "" "==== Active Filters ===="
+    local filter_count=0
+    count_filter() {
+        local filter_enabled filter_name
+        config_get_bool filter_enabled "$1" enabled 0
+        config_get filter_name "$1" name
+        if [ "$filter_enabled" = "1" ]; then
+            filter_count=$((filter_count + 1))
+            local set_name
+            set_name=$(echo "$filter_name" | tr ' ' '_')
+            local allowed_count=0 blocked_count=0
+
+            # Count IPs in nftables sets
+            if nft list table inet geomate >/dev/null 2>&1; then
+                allowed_count=$(nft list set inet geomate "geomate_${set_name}_allowed" 2>/dev/null | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | wc -l)
+                blocked_count=$(nft list set inet geomate "geomate_${set_name}_blocked" 2>/dev/null | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | wc -l)
+            fi
+            print_msg "- $filter_name: $allowed_count allowed, $blocked_count blocked IPs"
+        fi
+    }
+    config_foreach count_filter 'geo_filter'
+    [ "$filter_count" -eq 0 ] && print_msg "No active filters"
+
+    # Check nftables status
+    print_msg "" "==== nftables Status ===="
+    if nft list table inet geomate >/dev/null 2>&1; then
+        print_msg "Table inet geomate: active"
+        local set_count
+        set_count=$(nft list sets inet geomate 2>/dev/null | grep -c "set geomate_")
+        print_msg "Sets: $set_count active"
+    else
+        print_msg "Table inet geomate: NOT active"
+    fi
+
+    # Show geolocation status
+    print_msg "" "==== Geolocation Status ===="
+    show_geolocation_status
+
+    # Show nft error log if exists
+    local nft_error_log="/tmp/geomate_nft_errors.log"
+    if [ -s "$nft_error_log" ]; then
+        print_msg "" "==== Recent nft Errors ===="
+        tail -5 "$nft_error_log"
+    fi
+
+    # Show version info
+    print_msg "" "==== Version Information ===="
+    check_version -n
+
+    # Run health check
+    print_msg "" "==== Health Check ===="
+    health_check
+
+    [ "$running" = "1" ] && return 0 || return 1
 }
+
+# Show geolocation status from pre-computed JSON file
+show_geolocation_status() {
+    local status_file="/etc/geomate.d/runtime/geolocation_status.json"
+    
+    if [ ! -f "$status_file" ]; then
+        print_msg "No geolocation data available yet."
+        print_msg "Start the service and wait for the first cycle."
+        return
+    fi
+    
+    # Parse JSON values
+    local timestamp next_cycle last_geo pending_geo
+    
+    timestamp=$(grep '"timestamp"' "$status_file" | sed 's/[^0-9]//g' | head -1)
+    next_cycle=$(grep '"next_cycle"' "$status_file" | sed 's/[^0-9]//g' | head -1)
+    last_geo=$(grep '"last_run"' "$status_file" | sed 's/[^0-9]//g' | head -1)
+    pending_geo=$(grep '"pending_ips"' "$status_file" | sed 's/[^0-9]//g' | head -1)
+    
+    local current_time
+    current_time=$(date +%s)
+    
+    # Calculate times (with defaults to avoid errors)
+    local last_update_ago=0 next_cycle_in=0
+    
+    if [ -n "$timestamp" ] && [ "$timestamp" -gt 0 ] 2>/dev/null; then
+        last_update_ago=$((current_time - timestamp))
+    fi
+    
+    if [ -n "$next_cycle" ] && [ "$next_cycle" -gt 0 ] 2>/dev/null; then
+        next_cycle_in=$((next_cycle - current_time))
+        [ "$next_cycle_in" -lt 0 ] && next_cycle_in=0
+    fi
+    
+    # Format times as minutes
+    local last_mins=$((last_update_ago / 60))
+    local next_mins=$((next_cycle_in / 60))
+    
+    print_msg "Cycle: Last update ${last_mins} min ago, next in ${next_mins} min"
+    
+    # Show geolocation status
+    if [ -n "$last_geo" ] && [ "$last_geo" -gt 0 ] 2>/dev/null; then
+        local geo_ago=$(( (current_time - last_geo) / 60 ))
+        print_msg "Geolocation: Last run ${geo_ago} min ago, ${pending_geo:-0} IPs pending"
+    else
+        print_msg "Geolocation: Not yet run"
+    fi
+    
+    # Show per-filter stats
+    print_msg ""
+    print_msg "Filter IP Stats (from last cycle):"
+    
+    # Extract filter stats - parse the filters section
+    sed -n '/"filters"/,/^  }/p' "$status_file" | \
+    awk '
+    /^    "[^"]+": \{/ {
+        # Extract filter name
+        gsub(/^    "/, "", $0)
+        gsub(/": \{.*/, "", $0)
+        filter_name = $0
+        total = 0
+        geo = 0
+        next
+    }
+    /"total_ips":/ {
+        gsub(/[^0-9]/, "", $0)
+        total = $0
+        next
+    }
+    /"geolocated":/ {
+        gsub(/[^0-9]/, "", $0)
+        geo = $0
+        if (filter_name != "") {
+            printf "  - %s: %d IPs (%d geolocated)\n", filter_name, total, geo
+        }
+        next
+    }
+    '
+}
+
+# Health check function - verifies Geomate is properly configured
+# Output format: status=key:value;key:value;errors=N
+# Return codes: 0 = healthy, 1 = errors found
+health_check() {
+    local status="" errors=0 service_enabled=0 config_status="ok" loading=0
+
+    . /lib/functions.sh
+
+    # Check 0: Loading status (not an error, just info)
+    if [ -f "/tmp/geomate_loading" ]; then
+        loading=1
+        status="${status}loading:yes;"
+    else
+        status="${status}loading:no;"
+    fi
+
+    # Check 1: Config file exists and is valid
+    if [ ! -f /etc/config/geomate ]; then
+        status="${status}config:missing;"
+        errors=$((errors + 1))
+        config_status="missing"
+    else
+        config_load 'geomate' 2>/dev/null
+        if [ $? -ne 0 ]; then
+            status="${status}config:invalid;"
+            errors=$((errors + 1))
+            config_status="invalid"
+        else
+            status="${status}config:ok;"
+        fi
+    fi
+
+    # Check 2: Service enabled status
+    local global_enabled
+    config_get_bool global_enabled global enabled 0
+    enabled && service_enabled=1
+
+    case "${service_enabled}${global_enabled}" in
+        11) status="${status}service:enabled;" ;;
+        00) status="${status}service:disabled;" ;;
+        10) status="${status}service:autostart_only;" ;;
+        01) status="${status}service:config_only;" ;;
+    esac
+
+    # Check 3: nftables table exists
+    if nft list table inet geomate >/dev/null 2>&1; then
+        status="${status}nft:ok;"
+    else
+        status="${status}nft:missing;"
+        if [ "$global_enabled" = "1" ]; then
+            errors=$((errors + 1))
+        fi
+    fi
+
+    # Check 4: Required files exist
+    local files_ok=1
+    for file in /etc/geomate.sh /etc/geolocate.sh /etc/geomate_trigger.sh; do
+        if [ ! -f "$file" ]; then
+            status="${status}file_${file##*/}:missing;"
+            errors=$((errors + 1))
+            files_ok=0
+        fi
+    done
+    [ "$files_ok" = "1" ] && status="${status}files:ok;"
+
+    # Check 5: Data directory exists
+    if [ -d /etc/geomate.d ]; then
+        status="${status}datadir:ok;"
+    else
+        status="${status}datadir:missing;"
+        errors=$((errors + 1))
+    fi
+
+    # Check 6: Check each enabled filter has required sets
+    if [ "$config_status" = "ok" ]; then
+        local sets_ok=1
+        check_filter_sets() {
+            local filter_enabled filter_name
+            config_get_bool filter_enabled "$1" enabled 0
+            config_get filter_name "$1" name
+
+            if [ "$filter_enabled" = "1" ]; then
+                local set_name
+                set_name=$(echo "$filter_name" | tr ' ' '_')
+                # Check if allowed and blocked sets exist
+                if ! nft list set inet geomate "geomate_${set_name}_allowed" >/dev/null 2>&1; then
+                    sets_ok=0
+                fi
+                if ! nft list set inet geomate "geomate_${set_name}_blocked" >/dev/null 2>&1; then
+                    sets_ok=0
+                fi
+            fi
+        }
+
+        if nft list table inet geomate >/dev/null 2>&1; then
+            config_foreach check_filter_sets 'geo_filter'
+            if [ "$sets_ok" = "1" ]; then
+                status="${status}sets:ok;"
+            else
+                status="${status}sets:incomplete;"
+                if [ "$global_enabled" = "1" ]; then
+                    errors=$((errors + 1))
+                fi
+            fi
+        fi
+    fi
+
+    # Check 7: Process running (if enabled)
+    if [ "$global_enabled" = "1" ]; then
+        if [ -f "$pid_file" ]; then
+            local pid
+            pid=$(cat "$pid_file")
+            if kill -0 "$pid" 2>/dev/null; then
+                status="${status}process:running;"
+            else
+                status="${status}process:stale_pid;"
+                errors=$((errors + 1))
+            fi
+        else
+            status="${status}process:not_running;"
+            errors=$((errors + 1))
+        fi
+    else
+        status="${status}process:disabled;"
+    fi
+
+    # Output result
+    echo "status=${status}errors=${errors}"
+
+    # Print summary
+    if [ "$loading" = "1" ]; then
+        print_msg "*** LOADING IN PROGRESS - Filters are being initialized ***"
+    fi
+
+    if [ $errors -eq 0 ]; then
+        print_msg "All checks passed (0 errors)"
+    else
+        print_msg "Found $errors error(s) - review status above"
+    fi
+
+    [ $errors -eq 0 ] || return 1
+    return 0
+}
+
 ### Update-related functions
 
 # 1 - component: <BACKEND|FRONTEND>
