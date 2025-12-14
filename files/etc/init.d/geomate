@@ -514,16 +514,16 @@ health_check() {
         fi
     fi
 
-    # Check 2: Service enabled status
+    # Check 2: Autostart enabled status
     local global_enabled
     config_get_bool global_enabled global enabled 0
     enabled && service_enabled=1
 
     case "${service_enabled}${global_enabled}" in
-        11) status="${status}service:enabled;" ;;
-        00) status="${status}service:disabled;" ;;
-        10) status="${status}service:autostart_only;" ;;
-        01) status="${status}service:config_only;" ;;
+        11) status="${status}autostart:enabled;" ;;
+        00) status="${status}autostart:disabled;" ;;
+        10) status="${status}autostart:init_only;" ;;
+        01) status="${status}autostart:config_only;" ;;
     esac
 
     # Check 3: nftables table exists
