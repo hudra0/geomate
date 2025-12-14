@@ -384,40 +384,70 @@ show_geolocation_status() {
     fi
     
     # Parse JSON values
-    local timestamp next_cycle last_geo pending_geo
+    local timestamp next_cycle last_geo pending_geo op_mode geo_mode last_daily
     
     timestamp=$(grep '"timestamp"' "$status_file" | sed 's/[^0-9]//g' | head -1)
     next_cycle=$(grep '"next_cycle"' "$status_file" | sed 's/[^0-9]//g' | head -1)
-    last_geo=$(grep '"last_run"' "$status_file" | sed 's/[^0-9]//g' | head -1)
+    op_mode=$(grep '"operational_mode"' "$status_file" | sed 's/.*: *"\([^"]*\)".*/\1/' | head -1)
+    geo_mode=$(grep '"geolocation_mode"' "$status_file" | sed 's/.*: *"\([^"]*\)".*/\1/' | head -1)
+    
+    # Parse geolocation section (frequent)
+    last_geo=$(sed -n '/"geolocation":/,/}/p' "$status_file" | grep '"last_run"' | head -1 | sed 's/[^0-9]//g')
     pending_geo=$(grep '"pending_ips"' "$status_file" | sed 's/[^0-9]//g' | head -1)
+    
+    # Parse geolocation_daily section
+    last_daily=$(sed -n '/"geolocation_daily":/,/}/p' "$status_file" | grep '"last_run"' | head -1 | sed 's/[^0-9]//g')
     
     local current_time
     current_time=$(date +%s)
     
-    # Calculate times (with defaults to avoid errors)
-    local last_update_ago=0 next_cycle_in=0
+    # Show operational mode info
+    case "$op_mode" in
+        static)
+            print_msg "Mode: Static - no automatic IP collection"
+            ;;
+        monitor)
+            print_msg "Mode: Monitor - IPs collected but not blocked"
+            ;;
+        *)
+            # Dynamic mode - show cycle info
+            local last_update_ago=0 next_cycle_in=0
+            if [ -n "$timestamp" ] && [ "$timestamp" -gt 0 ] 2>/dev/null; then
+                last_update_ago=$((current_time - timestamp))
+            fi
+            if [ -n "$next_cycle" ] && [ "$next_cycle" -gt 0 ] 2>/dev/null; then
+                next_cycle_in=$((next_cycle - current_time))
+                [ "$next_cycle_in" -lt 0 ] && next_cycle_in=0
+            fi
+            local last_mins=$((last_update_ago / 60))
+            local next_mins=$((next_cycle_in / 60))
+            print_msg "Cycle: Last update ${last_mins} min ago, next in ${next_mins} min"
+            ;;
+    esac
     
-    if [ -n "$timestamp" ] && [ "$timestamp" -gt 0 ] 2>/dev/null; then
-        last_update_ago=$((current_time - timestamp))
+    # Show frequent geolocation status (only in frequent mode)
+    if [ "$geo_mode" = "frequent" ]; then
+        if [ -n "$last_geo" ] && [ "$last_geo" -gt 0 ] 2>/dev/null; then
+            local geo_ago=$(( (current_time - last_geo) / 60 ))
+            print_msg "Geolocation (frequent): Last ${geo_ago} min ago, ${pending_geo:-0} IPs pending"
+        else
+            print_msg "Geolocation (frequent): Not yet run"
+        fi
     fi
     
-    if [ -n "$next_cycle" ] && [ "$next_cycle" -gt 0 ] 2>/dev/null; then
-        next_cycle_in=$((next_cycle - current_time))
-        [ "$next_cycle_in" -lt 0 ] && next_cycle_in=0
-    fi
-    
-    # Format times as minutes
-    local last_mins=$((last_update_ago / 60))
-    local next_mins=$((next_cycle_in / 60))
-    
-    print_msg "Cycle: Last update ${last_mins} min ago, next in ${next_mins} min"
-    
-    # Show geolocation status
-    if [ -n "$last_geo" ] && [ "$last_geo" -gt 0 ] 2>/dev/null; then
-        local geo_ago=$(( (current_time - last_geo) / 60 ))
-        print_msg "Geolocation: Last run ${geo_ago} min ago, ${pending_geo:-0} IPs pending"
+    # Show daily geolocation status (always runs)
+    if [ -n "$last_daily" ] && [ "$last_daily" -gt 0 ] 2>/dev/null; then
+        local daily_ago_sec=$((current_time - last_daily))
+        local daily_next_sec=$((86400 - daily_ago_sec))
+        [ "$daily_next_sec" -lt 0 ] && daily_next_sec=0
+        
+        # Format as hours
+        local daily_ago_h=$((daily_ago_sec / 3600))
+        local daily_next_h=$((daily_next_sec / 3600))
+        
+        print_msg "Geolocation (daily): Last ${daily_ago_h}h ago, next in ~${daily_next_h}h"
     else
-        print_msg "Geolocation: Not yet run"
+        print_msg "Geolocation (daily): Not yet run"
     fi
     
     # Show per-filter stats
@@ -425,7 +455,7 @@ show_geolocation_status() {
     print_msg "Filter IP Stats (from last cycle):"
     
     # Extract filter stats - parse the filters section
-    sed -n '/"filters"/,/^  }/p' "$status_file" | \
+    sed -n '/"filters":/,/^  }/p' "$status_file" | \
     awk '
     /^    "[^"]+": \{/ {
         # Extract filter name
