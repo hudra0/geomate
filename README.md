@@ -152,6 +152,12 @@ After installing Geomate and the LuCI interface:
 | operational_mode | How IP lists are managed | 'dynamic' (automatic learning), 'static' (predefined lists) | 'dynamic' |
 | geolocation_mode | Frequency of IP geolocation updates | 'frequent' (30-60 min), 'daily' (once per day) | 'frequent' |
 
+### Per-Filter Options
+
+| Option | Description | Values | Default |
+|--------|-------------|---------|---------|
+| ip_expiry_days | Automatically remove IPs not seen for this many days | 0 (disabled), or number of days | 0 |
+
 ## Quick Start Guide
 
 1. **Access the Web Interface**
@@ -336,6 +342,39 @@ Finding the correct allowed IPs for games can involve some trial and error. Here
 - Remove allowed IPs that prove unnecessary
 - Use QoSmate to monitor traffic patterns
 - Test thoroughly after adding new allowed IPs
+
+### IP List Maintenance
+
+Over time, IP lists can grow large and may contain outdated or invalid entries. Geomate provides tools to keep your IP lists clean and efficient.
+
+#### Automatic IP Expiry
+
+You can configure automatic removal of inactive IPs on a per-filter basis:
+
+1. Edit a geo filter in the LuCI interface
+2. Set **IP Expiry (Days)** to your preferred value (e.g., 180)
+3. IPs not seen for that many days will be automatically removed on service start
+
+**Note:** Existing filters default to `0` (disabled) for backward compatibility. New filters can be configured with expiry enabled.
+
+#### Manual Cleanup
+
+To remove private/invalid IPs from all IP lists:
+
+```bash
+/etc/init.d/geomate cleanup_ips
+```
+
+This command:
+- Removes private IPs (10.x, 172.16-31.x, 192.168.x)
+- Removes loopback (127.x) and link-local (169.254.x) addresses
+- Cleans corresponding entries from geo_data.json files
+- Shows a summary of removed/kept IPs
+
+After cleanup, restart Geomate to apply changes:
+```bash
+/etc/init.d/geomate restart
+```
 
 ### Finding Game Ports and Protocols
 
