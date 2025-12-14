@@ -418,27 +418,47 @@ write_geolocation_status() {
     local last_geolocate=0
     local geolocate_interval=1800
     local pending_ips=0
+    local last_daily=0
+    local geolocation_mode_cfg
     
     current_time=$(date +%s)
     next_cycle=$((current_time + CHECK_INTERVAL))
     
-    # Read geolocation timing info
+    # Get config values
+    config_load 'geomate'
+    local operational_mode_cfg
+    config_get operational_mode_cfg global operational_mode 'dynamic'
+    config_get geolocation_mode_cfg global geolocation_mode 'frequent'
+    
+    # Read geolocation timing info (frequent mode)
     [ -f "${GEOMATE_RUNTIME_DIR}/last_geolocate_run" ] && last_geolocate=$(cat "${GEOMATE_RUNTIME_DIR}/last_geolocate_run")
     [ -f "${GEOMATE_RUNTIME_DIR}/last_geolocate_run.interval" ] && geolocate_interval=$(cat "${GEOMATE_RUNTIME_DIR}/last_geolocate_run.interval")
     [ -f "${GEOMATE_RUNTIME_DIR}/new_ips.txt" ] && pending_ips=$(wc -l < "${GEOMATE_RUNTIME_DIR}/new_ips.txt" 2>/dev/null || echo 0)
+    
+    # Read daily geolocation timing
+    [ -f "${GEOMATE_RUNTIME_DIR}/last_geolocate_run.daily" ] && last_daily=$(cat "${GEOMATE_RUNTIME_DIR}/last_geolocate_run.daily")
     
     # Start JSON
     printf '{\n' > "$status_file"
     printf '  "timestamp": %s,\n' "$current_time" >> "$status_file"
     printf '  "next_cycle": %s,\n' "$next_cycle" >> "$status_file"
     printf '  "cycle_interval": %s,\n' "${CHECK_INTERVAL:-1800}" >> "$status_file"
+    printf '  "operational_mode": "%s",\n' "$operational_mode_cfg" >> "$status_file"
+    printf '  "geolocation_mode": "%s",\n' "$geolocation_mode_cfg" >> "$status_file"
     
-    # Geolocation info
+    # Geolocation info (frequent)
     printf '  "geolocation": {\n' >> "$status_file"
     printf '    "last_run": %s,\n' "$last_geolocate" >> "$status_file"
     printf '    "interval": %s,\n' "$geolocate_interval" >> "$status_file"
     printf '    "next_run": %s,\n' "$((last_geolocate + geolocate_interval))" >> "$status_file"
     printf '    "pending_ips": %s\n' "$pending_ips" >> "$status_file"
+    printf '  },\n' >> "$status_file"
+    
+    # Daily geolocation info
+    printf '  "geolocation_daily": {\n' >> "$status_file"
+    printf '    "last_run": %s,\n' "$last_daily" >> "$status_file"
+    printf '    "interval": 86400,\n' >> "$status_file"
+    printf '    "next_run": %s\n' "$((last_daily + 86400))" >> "$status_file"
     printf '  },\n' >> "$status_file"
     
     # Collect filter stats
