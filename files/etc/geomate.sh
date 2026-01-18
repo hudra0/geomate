@@ -53,6 +53,115 @@ log_and_print() {
     fi
 }
 
+# Check if an IP is a valid public IP (not private/reserved)
+# Returns 0 (true) for public IPs, 1 (false) for private/invalid IPs
+is_valid_public_ip() {
+    local ip="$1"
+    case "$ip" in
+        # Private networks (RFC 1918)
+        10.*) return 1 ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) return 1 ;;
+        192.168.*) return 1 ;;
+        # Loopback
+        127.*) return 1 ;;
+        # Link-local
+        169.254.*) return 1 ;;
+        # Reserved/Invalid
+        0.*) return 1 ;;
+        # Multicast and reserved
+        224.*|225.*|226.*|227.*|228.*|229.*|230.*|231.*) return 1 ;;
+        232.*|233.*|234.*|235.*|236.*|237.*|238.*|239.*) return 1 ;;
+        # Future use
+        240.*|241.*|242.*|243.*|244.*|245.*|246.*|247.*) return 1 ;;
+        248.*|249.*|250.*|251.*|252.*|253.*|254.*|255.*) return 1 ;;
+        # Valid public IP
+        *) return 0 ;;
+    esac
+}
+
+# Clean up expired IPs from IP lists based on ip_expiry_days setting per filter
+# Format: IP or IP,timestamp - IPs without timestamp are treated as "today"
+cleanup_expired_ips_for_filter() {
+    local name="$1"
+    local ip_list="$2"
+    local expiry_days="$3"
+    
+    # If expiry is 0 or not set, do nothing (disabled)
+    [ -z "$expiry_days" ] || [ "$expiry_days" = "0" ] && return 0
+    
+    [ ! -f "$ip_list" ] && return 0
+    
+    local current_time=$(date +%s)
+    local expiry_seconds=$((expiry_days * 86400))
+    local cutoff_time=$((current_time - expiry_seconds))
+    local temp_file="${ip_list}.cleanup_tmp"
+    local removed_count=0
+    local kept_count=0
+    
+    log_and_print "Cleaning up expired IPs for $name (expiry: $expiry_days days)" 2
+    
+    # Process each line
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -z "$line" ] && continue
+        
+        # Parse IP and timestamp (format: IP or IP,timestamp)
+        local ip timestamp
+        case "$line" in
+            *,*)
+                ip="${line%%,*}"
+                timestamp="${line#*,}"
+                ;;
+            *)
+                ip="$line"
+                # No timestamp = treat as today (won't be expired)
+                timestamp="$current_time"
+                ;;
+        esac
+        
+        # Check if expired
+        if [ "$timestamp" -lt "$cutoff_time" ] 2>/dev/null; then
+            removed_count=$((removed_count + 1))
+            log_and_print "  Removed expired IP: $ip (last seen: $timestamp)" 3
+        else
+            # Keep the IP with its timestamp
+            echo "${ip},${timestamp}" >> "$temp_file"
+            kept_count=$((kept_count + 1))
+        fi
+    done < "$ip_list"
+    
+    # Replace original file atomically
+    if [ -f "$temp_file" ]; then
+        mv "$temp_file" "$ip_list"
+    else
+        # All IPs expired, create empty file
+        : > "$ip_list"
+    fi
+    
+    [ "$removed_count" -gt 0 ] && log_and_print "Removed $removed_count expired IPs for $name, kept $kept_count" 1
+    
+    return 0
+}
+
+# Process all filters and clean up expired IPs
+cleanup_all_expired_ips() {
+    log_and_print "Checking for expired IPs in all filters..." 2
+    config_load 'geomate'
+    config_foreach cleanup_filter_ips 'geo_filter'
+}
+
+# Helper function called by config_foreach
+cleanup_filter_ips() {
+    local name ip_list expiry_days enabled
+    config_get name "$1" 'name'
+    config_get ip_list "$1" 'ip_list'
+    config_get expiry_days "$1" 'ip_expiry_days' '0'
+    config_get enabled "$1" 'enabled' '0'
+    
+    # Only process enabled filters with expiry > 0
+    [ "$enabled" = "1" ] && [ "$expiry_days" != "0" ] && \
+        cleanup_expired_ips_for_filter "$name" "$ip_list" "$expiry_days"
+}
+
 # Set up necessary directories for Geomate
 setup_geomate_d() {
     if [ ! -d "$GEOMATE_DATA_DIR" ]; then
@@ -355,15 +464,16 @@ create_dynamic_set() {
 
 # Process dynamic sets for a given configuration
 process_dynamic_set() {
-    local name ip_list
+    local name ip_list expiry_days
     config_get name "$1" 'name'
     config_get ip_list "$1" 'ip_list'
+    config_get expiry_days "$1" 'ip_expiry_days' '0'
     local set_name="${NFT_SET_PREFIX}$(echo "$name" | tr ' ' '_')"
 
     log_and_print "Processing dynamic set for $name" 2
 
-    # Use a fixed temporary file per set
     local temp_file="/tmp/geomate_${set_name}_temp.txt"
+    local ip_list_tmp="${ip_list}.tmp"
 
     # Retrieve IPs from the dynamic set
     nft list set inet geomate "${set_name}_dynamic" | sed -n '/elements = {/,/}/p' | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | sort -u > "$temp_file"
@@ -371,20 +481,82 @@ process_dynamic_set() {
     if [ -s "$temp_file" ]; then
         log_and_print "New IPs found in dynamic set for $name:" 2
         
-        # Add only new IPs to the IP list
+        local added_count=0 skipped_private=0 updated_count=0
+        local current_time=$(date +%s)
+        
+        # Build list of new IPs to add and IPs to update timestamps for
+        local new_ips_file="/tmp/geomate_${set_name}_new.txt"
+        local update_ips_file="/tmp/geomate_${set_name}_update.txt"
+        : > "$new_ips_file"
+        : > "$update_ips_file"
+        
         while IFS= read -r ip; do
-            if ! grep -q "^$ip$" "$ip_list"; then
-                if [ -s "$ip_list" ] && [ "$(tail -c 1 "$ip_list")" != "" ]; then
-                    # Ensure there's a newline at the end of the file
-                    echo "" >> "$ip_list"
+            # Skip private/invalid IPs
+            if ! is_valid_public_ip "$ip"; then
+                skipped_private=$((skipped_private + 1))
+                log_and_print "  Skipped private/invalid IP: $ip" 3
+                continue
+            fi
+            
+            # Check if IP already exists (with or without timestamp)
+            if grep -q "^${ip}\(,\|$\)" "$ip_list" 2>/dev/null; then
+                # IP exists - mark for timestamp update if expiry enabled
+                if [ "$expiry_days" != "0" ]; then
+                    echo "$ip" >> "$update_ips_file"
+                    updated_count=$((updated_count + 1))
+                    log_and_print "  Will update timestamp for IP: $ip" 3
                 fi
-                echo "$ip" >> "$ip_list"
-                log_and_print "  Added new IP: $ip" 2
+            else
+                # New IP - add to new IPs list
+                echo "$ip" >> "$new_ips_file"
+                added_count=$((added_count + 1))
+                log_and_print "  Will add new IP: $ip" 2
             fi
         done < "$temp_file"
 
+        [ "$skipped_private" -gt 0 ] && log_and_print "Skipped $skipped_private private/invalid IPs for $name" 2
+
+        # Only write to flash if there are changes
+        if [ "$added_count" -gt 0 ] || [ "$updated_count" -gt 0 ]; then
+            {
+                # Process existing IPs - update timestamps where needed
+                if [ -f "$ip_list" ]; then
+                    while IFS= read -r line || [ -n "$line" ]; do
+                        [ -z "$line" ] && continue
+                        local existing_ip="${line%%,*}"
+                        
+                        # Check if this IP needs timestamp update
+                        if grep -q "^${existing_ip}$" "$update_ips_file" 2>/dev/null; then
+                            # Update timestamp
+                            echo "${existing_ip},${current_time}"
+                        else
+                            # Keep as-is
+                            echo "$line"
+                        fi
+                    done < "$ip_list"
+                fi
+                
+                # Add new IPs
+                while IFS= read -r new_ip || [ -n "$new_ip" ]; do
+                    [ -z "$new_ip" ] && continue
+                    if [ "$expiry_days" != "0" ]; then
+                        echo "${new_ip},${current_time}"
+                    else
+                        echo "$new_ip"
+                    fi
+                done < "$new_ips_file"
+            } > "$ip_list_tmp"
+            
+            # Atomic move to replace original
+            mv "$ip_list_tmp" "$ip_list"
+            log_and_print "Updated IP list for $name: $added_count added, $updated_count timestamps updated" 2
+        fi
+        
+        # Cleanup temp files
+        rm -f "$new_ips_file" "$update_ips_file"
+
         # Trigger geolocation update only if new IPs were added
-        if [ "$(wc -l < "$temp_file")" -gt 0 ]; then
+        if [ "$added_count" -gt 0 ]; then
             # Get the allowed regions
             local allowed_region
             config_get allowed_region "$1" 'allowed_region'
@@ -524,29 +696,88 @@ process_geo_data() {
 
     log_and_print "Processing geo data for $name with allowed regions: $allowed_regions" 2
 
-    local allowed_ips=""
-    local blocked_ips=""
+    # PERFORMANCE OPTIMIZATION: Process ALL IPs in a SINGLE awk process
+    # Instead of spawning a new awk process for each IP (11000+ processes),
+    # we do everything in one pass: parse regions, calculate haversine, categorize IPs
+    # Output format: First line = comma-separated allowed IPs, Second line = comma-separated blocked IPs
+    local result
+    result=$(jq -r '. | [.query, .lat, .lon] | @tsv' "$geo_data_file" 2>/dev/null | \
+        awk -v regions="$allowed_regions" '
+        function haversine(lat1, lon1, lat2, lon2) {
+            # Convert degrees to radians
+            lat1 = lat1 * 3.14159265359 / 180
+            lon1 = lon1 * 3.14159265359 / 180
+            lat2 = lat2 * 3.14159265359 / 180
+            lon2 = lon2 * 3.14159265359 / 180
+            
+            dlat = lat2 - lat1
+            dlon = lon2 - lon1
+            
+            a = sin(dlat/2)^2 + cos(lat1) * cos(lat2) * sin(dlon/2)^2
+            c = 2 * atan2(sqrt(a), sqrt(1-a))
+            return 6371000 * c  # Earth radius in meters
+        }
+        BEGIN {
+            FS = "\t"
+            allowed_list = ""
+            blocked_list = ""
+            # Parse all regions (format: "circle:lat:lon:radius circle:lat:lon:radius ...")
+            n_regions = split(regions, region_arr, " ")
+            for (i = 1; i <= n_regions; i++) {
+                n_parts = split(region_arr[i], parts, ":")
+                if (parts[1] == "circle" && n_parts >= 4) {
+                    region_type[i] = "circle"
+                    region_lat[i] = parts[2] + 0  # Force numeric
+                    region_lon[i] = parts[3] + 0
+                    region_radius[i] = parts[4] + 0
+                }
+            }
+        }
+        {
+            ip = $1
+            lat = $2 + 0  # Force numeric
+            lon = $3 + 0
+            
+            # Skip invalid entries
+            if (ip == "" || $2 == "" || $3 == "") next
+            
+            # Check if IP is within ANY allowed region
+            allowed = 0
+            for (i = 1; i <= n_regions; i++) {
+                if (region_type[i] == "circle") {
+                    dist = haversine(lat, lon, region_lat[i], region_lon[i])
+                    if (dist <= region_radius[i]) {
+                        allowed = 1
+                        break
+                    }
+                }
+            }
+            
+            # Append to appropriate list
+            if (allowed) {
+                if (allowed_list != "") allowed_list = allowed_list ","
+                allowed_list = allowed_list ip
+            } else {
+                if (blocked_list != "") blocked_list = blocked_list ","
+                blocked_list = blocked_list ip
+            }
+        }
+        END {
+            # Output two lines: allowed IPs, then blocked IPs
+            print allowed_list
+            print blocked_list
+        }')
 
-    # Use jq to parse the JSON and feed it into the loop via Here-Document
-    while IFS="	" read -r ip lat lon; do
-        [ -z "$ip" ] || [ -z "$lat" ] || [ -z "$lon" ] && continue
-        log_and_print "Checking IP: $ip, Lat: $lat, Lon: $lon" 2
+    # Parse the two-line result
+    local allowed_ips blocked_ips
+    allowed_ips=$(echo "$result" | sed -n '1p')
+    blocked_ips=$(echo "$result" | sed -n '2p')
 
-        # Check if IP is within any of the allowed regions
-        if is_within_any_region "$lat" "$lon" "$allowed_regions"; then
-            allowed_ips="${allowed_ips}${ip},"
-            log_and_print "IP $ip is within allowed regions, added to $allowed_set" 2
-        else
-            blocked_ips="${blocked_ips}${ip},"
-            log_and_print "IP $ip is outside allowed regions, added to $blocked_set" 2
-        fi
-    done <<EOF
-$(jq -r '. | [.query, .lat, .lon] | @tsv' "$geo_data_file")
-EOF
-
-    # Remove the last comma
-    allowed_ips=${allowed_ips%,}
-    blocked_ips=${blocked_ips%,}
+    # Count IPs for logging
+    local allowed_count=0 blocked_count=0
+    [ -n "$allowed_ips" ] && allowed_count=$(echo "$allowed_ips" | tr ',' '\n' | wc -l)
+    [ -n "$blocked_ips" ] && blocked_count=$(echo "$blocked_ips" | tr ',' '\n' | wc -l)
+    log_and_print "Geo processing for $name: $allowed_count allowed, $blocked_count blocked IPs" 1
 
     # Batch update the sets - handling potential large IP lists
     add_ips_to_set() {
@@ -556,19 +787,12 @@ EOF
         local total_ips
         local start=1
         local success=1
-        local end
-        local chunk
-        local nft_cmd
-        local error_output
-        local ret
+        local end chunk nft_cmd error_output ret
+        
+        [ -z "$ip_list" ] && return 0
         
         total_ips=$(echo "$ip_list" | tr ',' '\n' | wc -l)
         log_and_print "Adding IPs to $set_name, total IPs: $total_ips" 2
-        
-        if [ -z "$ip_list" ]; then
-            log_and_print "No IPs to add to $set_name" 2
-            return 0
-        fi
         
         # Process in smaller chunks to avoid command line limits
         while [ "$start" -le "$total_ips" ]; do
@@ -597,14 +821,10 @@ EOF
     }
     
     # Add allowed IPs to set
-    if [ -n "$allowed_ips" ]; then
-        add_ips_to_set "$allowed_set" "$allowed_ips"
-    fi
+    [ -n "$allowed_ips" ] && add_ips_to_set "$allowed_set" "$allowed_ips"
     
     # Add blocked IPs to set
-    if [ -n "$blocked_ips" ]; then
-        add_ips_to_set "$blocked_set" "$blocked_ips"
-    fi
+    [ -n "$blocked_ips" ] && add_ips_to_set "$blocked_set" "$blocked_ips"
 
     log_and_print "Finished processing geo data for $name" 2
 }
@@ -752,6 +972,9 @@ trigger_geolocation() {
 run() {
     load_config
     setup_geomate_d
+
+    # Clean up expired IPs before loading filters
+    cleanup_all_expired_ips
 
     # Create loading flag file
     log_and_print "Creating loading flag file at /tmp/geomate_loading" 1

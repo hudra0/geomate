@@ -3,8 +3,11 @@
 # shellcheck shell=ash
 # shellcheck disable=SC3043  # ash supports local variables
 # shellcheck disable=SC2317  # Functions are called by OpenWrt's system
+# shellcheck disable=SC2329  # Functions are invoked indirectly via config_foreach
 # shellcheck disable=SC2155  # Combined declaration and assignment is fine for our use case
 # shellcheck disable=SC1091  # OpenWrt's /lib/functions.sh is not available during shellcheck
+# shellcheck disable=SC2154  # Variables are assigned by OpenWrt's config_load
+# shellcheck disable=SC2181  # Using $? is intentional for clarity in error handling
 
 . /lib/functions.sh
 config_load 'geomate'
@@ -26,6 +29,32 @@ log_and_print() {
         logger -t geomate "$message"
         echo "geomate: $message"
     fi
+}
+
+# Check if an IP is a valid public IP (not private/reserved)
+# Returns 0 (true) for public IPs, 1 (false) for private/invalid IPs
+is_valid_public_ip() {
+    local ip="$1"
+    case "$ip" in
+        # Private networks (RFC 1918)
+        10.*) return 1 ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) return 1 ;;
+        192.168.*) return 1 ;;
+        # Loopback
+        127.*) return 1 ;;
+        # Link-local
+        169.254.*) return 1 ;;
+        # Reserved/Invalid
+        0.*) return 1 ;;
+        # Multicast and reserved
+        224.*|225.*|226.*|227.*|228.*|229.*|230.*|231.*) return 1 ;;
+        232.*|233.*|234.*|235.*|236.*|237.*|238.*|239.*) return 1 ;;
+        # Future use
+        240.*|241.*|242.*|243.*|244.*|245.*|246.*|247.*) return 1 ;;
+        248.*|249.*|250.*|251.*|252.*|253.*|254.*|255.*) return 1 ;;
+        # Valid public IP
+        *) return 0 ;;
+    esac
 }
 
 # Checks if geolocation should be run and executes it if necessary
@@ -64,7 +93,6 @@ check_and_run_geolocate() {
             log_and_print "Geomate_Trigger: Processing $ips_to_process new IPs for geolocation" 1
             process_batch_specific_ips "$ips_to_process"
             last_geolocate_time=$current_time
-            remaining_time=$geolocate_interval
         fi
 
         # Trigger geolocation update only if new IPs have been added
@@ -74,8 +102,8 @@ check_and_run_geolocate() {
             geolocate_interval=$((geolocate_interval * 2))
             [ $geolocate_interval -gt $MAX_GEOLOCATE_INTERVAL ] && geolocate_interval=$MAX_GEOLOCATE_INTERVAL
         fi
-        echo $geolocate_interval > "${LAST_RUN_FILE}.interval"
-        echo $current_time > "$LAST_RUN_FILE"
+        echo "$geolocate_interval" > "${LAST_RUN_FILE}.interval"
+        echo "$current_time" > "$LAST_RUN_FILE"
     fi
 }
 
@@ -88,7 +116,7 @@ check_new_ips() {
     log_and_print "$(cat "$NEW_IPS_FILE")" 2
 }
 
-# Collects new IPs from the configuration
+# Collects new IPs from the configuration (only valid public IPs)
 collect_new_ips() {
     local name ip_list last_processed_file temp_new_ips
     config_get name "$1" 'name'
@@ -99,13 +127,15 @@ collect_new_ips() {
     if [ -f "$ip_list" ]; then
         if [ ! -f "$last_processed_file" ]; then
             while read -r ip; do
-                echo "$name|$ip" >> "$NEW_IPS_FILE"
+                # Skip private/invalid IPs
+                is_valid_public_ip "$ip" && echo "$name|$ip" >> "$NEW_IPS_FILE"
             done < "$ip_list"
         else
             # Write the new IPs to a temporary file
             awk 'NR==FNR{a[$0];next} !($0 in a)' "$last_processed_file" "$ip_list" > "$temp_new_ips"
             while read -r ip; do
-                echo "$name|$ip" >> "$NEW_IPS_FILE"
+                # Skip private/invalid IPs
+                is_valid_public_ip "$ip" && echo "$name|$ip" >> "$NEW_IPS_FILE"
             done < "$temp_new_ips"
             rm -f "$temp_new_ips"
         fi
