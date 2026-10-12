@@ -118,28 +118,24 @@ check_new_ips() {
 
 # Collects new IPs from the configuration (only valid public IPs)
 collect_new_ips() {
-    local name ip_list last_processed_file temp_new_ips
+    local name ip_list last_processed_file
     config_get name "$1" 'name'
     config_get ip_list "$1" 'ip_list'
     last_processed_file="${GEOMATE_RUNTIME_DIR}/${name}_last_processed"
-    temp_new_ips="${GEOMATE_RUNTIME_DIR}/${name}_temp_new_ips.txt"
 
-    if [ -f "$ip_list" ]; then
-        if [ ! -f "$last_processed_file" ]; then
-            while read -r ip; do
-                # Skip private/invalid IPs
-                is_valid_public_ip "$ip" && echo "$name|$ip" >> "$NEW_IPS_FILE"
-            done < "$ip_list"
-        else
-            # Write the new IPs to a temporary file
-            awk 'NR==FNR{a[$0];next} !($0 in a)' "$last_processed_file" "$ip_list" > "$temp_new_ips"
-            while read -r ip; do
-                # Skip private/invalid IPs
-                is_valid_public_ip "$ip" && echo "$name|$ip" >> "$NEW_IPS_FILE"
-            done < "$temp_new_ips"
-            rm -f "$temp_new_ips"
-        fi
-    fi
+    [ -f "$ip_list" ] || return 0
+    # Without a last processed copy every IP in the list is new
+    [ -f "$last_processed_file" ] || last_processed_file=/dev/null
+
+    # Lines are "IP" or "IP,timestamp": compare and queue the IP part only, so a
+    # refreshed timestamp does not queue a known IP again
+    awk -F, -v old="$last_processed_file" '
+        FILENAME == old { seen[$1]; next }
+        $1 != "" && !($1 in seen) { print $1 }
+    ' "$last_processed_file" "$ip_list" | while read -r ip; do
+        # Skip private/invalid IPs
+        is_valid_public_ip "$ip" && echo "$name|$ip" >> "$NEW_IPS_FILE"
+    done
 }
 
 # Updates the last processed file for a specific filter
