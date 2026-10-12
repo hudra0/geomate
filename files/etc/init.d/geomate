@@ -1237,7 +1237,7 @@ update() {
 			fixup_type="$1" fixup_file="$2" dist_dir="$3"
 		[ -n "$1" ] && [ -n "$2" ] && [ -n "$3" ] || { error_out "$me: missing args."; return 1; }
 
-		while IFS='' read -r fixup_line; do
+		while IFS='' read -r fixup_line || [ -n "$fixup_line" ]; do
 			case "$fixup_line" in
 				"#"*) continue ;; # skip comments
 				*=*)

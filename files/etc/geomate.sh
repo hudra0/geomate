@@ -9,7 +9,6 @@
 # shellcheck disable=SC1091  # OpenWrt's /lib/functions.sh is not available during shellcheck
 # shellcheck disable=SC2154  # Variables are assigned by OpenWrt's config_load
 # shellcheck disable=SC2181  # Using $? is intentional for clarity in error handling
-# shellcheck disable=SC2002  # cat with pipe is used for readability in error log processing
 
 . /lib/functions.sh
 
@@ -206,6 +205,9 @@ setup_nftables_and_filters() {
         log_and_print "Running in MONITOR MODE - connections will be tracked but NOT blocked" 0
     fi
     
+    # Every rebuild starts with an empty nft error log (nft_exec appends to it)
+    : > "$NFT_ERROR_LOG"
+
     # Delete existing table and recreate it
     nft delete table inet geomate 2>/dev/null
     nft_exec add table inet geomate
@@ -326,23 +328,19 @@ setup_geo_filter() {
 
     # Add forward rule for allowed IPs with error checking
     log_and_print "Adding forward rule: $base_rule ip daddr @${set_name}_allowed counter accept" 2
-    if ! nft add rule inet geomate forward "$base_rule" ip daddr @"${set_name}"_allowed counter accept 2>&1 | tee $NFT_ERROR_LOG | grep -q .; then
+    if nft_exec add rule inet geomate forward "$base_rule" ip daddr @"${set_name}"_allowed counter accept; then
         log_and_print "Successfully added forward rule for allowed IPs in $name" 2
     else
         log_and_print "ERROR: Failed to add forward rule for $name! Check $NFT_ERROR_LOG" 0
-        log_and_print "Rule was: $base_rule ip daddr @${set_name}_allowed counter accept" 0
-        cat $NFT_ERROR_LOG | while read -r line; do log_and_print "nft error: $line" 0; done
     fi
     
     # Only add drop rule if not in monitor mode
     if [ "$operational_mode" != "monitor" ]; then
         log_and_print "Adding drop rule: $base_rule ip daddr @${set_name}_blocked counter drop" 2
-        if ! nft add rule inet geomate forward "$base_rule" ip daddr @"${set_name}"_blocked counter drop 2>&1 | tee $NFT_ERROR_LOG | grep -q .; then
+        if nft_exec add rule inet geomate forward "$base_rule" ip daddr @"${set_name}"_blocked counter drop; then
             log_and_print "Successfully added drop rule for blocked IPs in $name" 2
         else
             log_and_print "ERROR: Failed to add drop rule for $name! Check $NFT_ERROR_LOG" 0
-            log_and_print "Rule was: $base_rule ip daddr @${set_name}_blocked counter drop" 0
-            cat $NFT_ERROR_LOG | while read -r line; do log_and_print "nft error: $line" 0; done
         fi
     else
         log_and_print "Monitor mode: Not adding drop rule for blocked IPs in $name" 2
@@ -351,33 +349,16 @@ setup_geo_filter() {
     # Strict mode rule - only apply if not in monitor mode
     if [ "$strict_mode" = "1" ] && [ "$operational_mode" != "monitor" ]; then
         log_and_print "Strict mode: Adding default drop rule: $base_rule counter drop" 2
-        if ! nft add rule inet geomate forward "$base_rule" counter drop 2>&1 | tee $NFT_ERROR_LOG | grep -q .; then
+        if nft_exec add rule inet geomate forward "$base_rule" counter drop; then
             log_and_print "Strict mode: Successfully added default drop rule for $name" 2
         else
             log_and_print "ERROR: Strict mode - Failed to add default drop rule for $name!" 0
-            cat $NFT_ERROR_LOG | while read -r line; do log_and_print "nft error: $line" 0; done
         fi
     fi
 
     log_and_print "Geo filter for $name set up successfully" 1
     log_and_print "Added allowed IPs from config: $allowed_ips" 2
     log_and_print "Added blocked IPs: $blocked_ips" 2
-}
-
-# Check if coordinates are within any allowed region
-is_within_any_region() {
-    local lat="$1"
-    local lon="$2"
-    shift 2
-    local allowed_regions="$*"
-
-    for allowed_region in $allowed_regions; do
-        [ -n "$allowed_region" ] || continue
-        if is_within_region "$lat" "$lon" "$allowed_region"; then
-            return 0  # Within one of the allowed regions
-        fi
-    done
-    return 1  # Outside all allowed regions
 }
 
 # Create dynamic sets based on configuration
@@ -439,23 +420,19 @@ create_dynamic_set() {
 
     # Add rule for the ui dynamic set (always needed) with error checking
     log_and_print "Adding prerouting rule for UI: $base_rule update @${set_name}_ui_dynamic { ip daddr }" 2
-    if ! nft add rule inet geomate prerouting "$base_rule" update @"${set_name}"_ui_dynamic { ip daddr } 2>&1 | tee $NFT_ERROR_LOG | grep -q .; then
+    if nft_exec add rule inet geomate prerouting "$base_rule" update @"${set_name}"_ui_dynamic { ip daddr }; then
         log_and_print "Successfully added UI dynamic set rule for $name" 2
     else
         log_and_print "ERROR: Failed to add UI dynamic set rule for $name! Check $NFT_ERROR_LOG" 0
-        log_and_print "Rule was: $base_rule update @${set_name}_ui_dynamic { ip daddr }" 0
-        cat $NFT_ERROR_LOG | while read -r line; do log_and_print "nft error: $line" 0; done
     fi
 
     # Add rule for the main dynamic set only in dynamic mode
     if [ "$operational_mode" != "static" ]; then
         log_and_print "Adding prerouting rule for dynamic set: $base_rule update @${set_name}_dynamic { ip daddr }" 2
-        if ! nft add rule inet geomate prerouting "$base_rule" update @"${set_name}"_dynamic { ip daddr } 2>&1 | tee $NFT_ERROR_LOG | grep -q .; then
+        if nft_exec add rule inet geomate prerouting "$base_rule" update @"${set_name}"_dynamic { ip daddr }; then
             log_and_print "Successfully added main dynamic set rule for $name" 2
         else
             log_and_print "ERROR: Failed to add main dynamic set rule for $name! Check $NFT_ERROR_LOG" 0
-            log_and_print "Rule was: $base_rule update @${set_name}_dynamic { ip daddr }" 0
-            cat $NFT_ERROR_LOG | while read -r line; do log_and_print "nft error: $line" 0; done
         fi
     fi
 
@@ -787,7 +764,7 @@ process_geo_data() {
         local total_ips
         local start=1
         local success=1
-        local end chunk nft_cmd error_output ret
+        local end chunk error_output ret
         
         [ -z "$ip_list" ] && return 0
         
@@ -804,9 +781,8 @@ process_geo_data() {
             
             log_and_print "Processing IPs $start to $end of $total_ips" 3
             
-            # Execute nft command for this chunk
-            nft_cmd="nft add element inet geomate \"$set_name\" { $chunk }"
-            error_output=$(eval "$nft_cmd" 2>&1)
+            # Add this chunk to the set (no eval: the set name comes from the filter name)
+            error_output=$(nft add element inet geomate "$set_name" { "$chunk" } 2>&1)
             ret=$?
             
             if [ "$ret" -ne 0 ]; then
@@ -827,73 +803,6 @@ process_geo_data() {
     [ -n "$blocked_ips" ] && add_ips_to_set "$blocked_set" "$blocked_ips"
 
     log_and_print "Finished processing geo data for $name" 2
-}
-
-# Determine if coordinates are within a specific region
-is_within_region() {
-    local lat="$1"
-    local lon="$2"
-    local region="$3"
-
-    local region_type=$(echo "$region" | cut -d':' -f1)
-
-    case $region_type in
-        "circle")
-            local center_lat=$(echo "$region" | cut -d':' -f2)
-            local center_lon=$(echo "$region" | cut -d':' -f3)
-            local radius=$(echo "$region" | cut -d':' -f4)
-
-            if is_within_circle "$lat" "$lon" "$center_lat" "$center_lon" "$radius"; then
-                return 0
-            else
-                return 1
-            fi
-            ;;
-        # Additional region types like "rectangle" or "polygon" can be added here
-        *)
-            log_and_print "Unknown region type: $region_type" 1
-            return 1
-            ;;
-    esac
-}
-
-# Check if coordinates are within a circle using the Haversine formula
-is_within_circle() {
-    local lat1="$1"
-    local lon1="$2"
-    local lat2="$3"
-    local lon2="$4"
-    local radius="$5"
-
-    # Haversine formula in awk
-    local distance=$(awk -v lat1="$lat1" -v lon1="$lon1" -v lat2="$lat2" -v lon2="$lon2" '
-    BEGIN {
-        # Convert degrees to radians
-        lat1 = lat1 * 3.14159 / 180;
-        lon1 = lon1 * 3.14159 / 180;
-        lat2 = lat2 * 3.14159 / 180;
-        lon2 = lon2 * 3.14159 / 180;
-
-        # Difference in coordinates
-        dlat = lat2 - lat1;
-        dlon = lon2 - lon1;
-
-        # Haversine formula
-        a = sin(dlat/2) * sin(dlat/2) + cos(lat1) * cos(lat2) * sin(dlon/2) * sin(dlon/2);
-        c = 2 * atan2(sqrt(a), sqrt(1-a));
-        earth_radius = 6371000;  # Earth radius in meters
-        print earth_radius * c;  # Result in meters
-    }')
-
-    log_and_print "Distance calculation for $lat1,$lon1 to $lat2,$lon2: distance=$distance, radius=$radius" 2
-
-    if [ "$(awk -v distance="$distance" -v radius="$radius" 'BEGIN {print (distance <= radius) ? 1 : 0}')" -eq 1 ]; then
-        log_and_print "IP is within the circle (distance: $distance, radius: $radius)" 2
-        return 0  # Within the circle
-    else
-        log_and_print "IP is outside the circle (distance: $distance, radius: $radius)" 2
-        return 1  # Outside the circle
-    fi
 }
 
 # Verify the nftables rules to ensure they are set up correctly
@@ -960,12 +869,6 @@ verify_nftables_rules() {
 # Execute the Geomate trigger script
 run_geomate_trigger() {
     /etc/geomate_trigger.sh
-}
-
-# Manually trigger a geolocation update
-trigger_geolocation() {
-    log_and_print "Manually triggering geolocation update" 1
-    run_geomate_trigger
 }
 
 # Main function to run the service
