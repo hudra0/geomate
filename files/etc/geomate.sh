@@ -680,6 +680,17 @@ process_geo_data() {
     local result
     result=$(jq -r '. | [.query, .lat, .lon] | @tsv' "$geo_data_file" 2>/dev/null | \
         awk -v regions="$allowed_regions" '
+        # Is (y = lat, x = lon) inside polygon region r? (ray casting; added for polygon regions)
+        function in_poly(r, y, x,    k, j, inside, yi, xi, yj, xj) {
+            inside = 0
+            j = poly_n[r]
+            for (k = 1; k <= poly_n[r]; k++) {
+                yi = poly_lat[r, k]; xi = poly_lon[r, k]; yj = poly_lat[r, j]; xj = poly_lon[r, j]
+                if (((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) inside = !inside
+                j = k
+            }
+            return inside
+        }
         function haversine(lat1, lon1, lat2, lon2) {
             # Convert degrees to radians
             lat1 = lat1 * 3.14159265359 / 180
@@ -707,6 +718,13 @@ process_geo_data() {
                     region_lat[i] = parts[2] + 0  # Force numeric
                     region_lon[i] = parts[3] + 0
                     region_radius[i] = parts[4] + 0
+                } else if (parts[1] == "polygon" && n_parts >= 2) {
+                    cnt = split(parts[2], pts, ";")
+                    m = 0
+                    for (k = 1; k <= cnt; k++) {
+                        if (split(pts[k], ll, ",") == 2) { m++; poly_lat[i, m] = ll[1] + 0; poly_lon[i, m] = ll[2] + 0 }
+                    }
+                    if (m >= 3) { region_type[i] = "polygon"; poly_n[i] = m }
                 }
             }
         }
@@ -727,6 +745,9 @@ process_geo_data() {
                         allowed = 1
                         break
                     }
+                } else if (region_type[i] == "polygon" && (in_poly(i, lat, lon) || in_poly(i, lat, lon + 360) || in_poly(i, lat, lon - 360))) {
+                    allowed = 1
+                    break
                 }
             }
             

@@ -86,13 +86,16 @@ GEOMATE_FILE_TYPES_FRONTEND="GEN EXTRA JS" # change the value if adding more typ
 GEOMATE_GEN_FILES_FRONTEND="
 	/usr/share/luci/menu.d/luci-app-geomate.json
 	/usr/share/rpcd/acl.d/luci-app-geomate.json
-	/usr/libexec/rpcd/luci.geomate"
+	/usr/libexec/rpcd/luci.geomate
+	/usr/libexec/ping-adjuster
+	/etc/init.d/ping_adjuster"
 GEOMATE_EXTRA_FILES_FRONTEND="
 	/www/luci-static/resources/view/geomate/map.html" # HTML files
 
 GEOMATE_JS_FILENAMES="
 	view.js
-	geofilters.js"
+	geofilters.js
+	pingadjuster.js"
 # generate js file list with paths
 GEOMATE_JS_FILES_FRONTEND=
 for js_file in ${GEOMATE_JS_FILENAMES}; do
@@ -100,7 +103,9 @@ for js_file in ${GEOMATE_JS_FILENAMES}; do
 done
 
 GEOMATE_EXEC_FILES_FRONTEND="
-	/usr/libexec/rpcd/luci.geomate"
+	/usr/libexec/rpcd/luci.geomate
+	/usr/libexec/ping-adjuster
+	/etc/init.d/ping_adjuster"
 
 # Silence shellcheck unused vars warnings
 : "$START" "$STOP" "$USE_PROCD" "$VERSION" "$UPD_CHANNEL" "$EXTRA_COMMANDS" "$EXTRA_HELP" \
