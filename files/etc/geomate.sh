@@ -447,6 +447,7 @@ process_dynamic_set() {
     config_get name "$1" 'name'
     config_get ip_list "$1" 'ip_list'
     config_get expiry_days "$1" 'ip_expiry_days' '0'
+    [ -n "$ip_list" ] || { log_and_print "Filter $name has no ip_list configured, skipping harvest" 2; return 0; }
     local set_name="${NFT_SET_PREFIX}$(echo "$name" | tr ' ' '_')"
 
     log_and_print "Processing dynamic set for $name" 2
