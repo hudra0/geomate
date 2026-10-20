@@ -156,7 +156,7 @@ After installing Geomate and the LuCI interface:
 
 | Option | Description | Values | Default |
 |--------|-------------|---------|---------|
-| ip_list | Path of the IP list file (e.g. `/etc/geomate.d/cod_servers.txt`). Required for geographic filtering: dynamic and monitor mode collect IPs into it, static mode geolocates its entries. Without it the filter geolocates no IPs and relies on `allowed_ip` entries | File path | none |
+| ip_list | Path of the IP list file (e.g. `/etc/geomate.d/cod_servers.txt`). Required for geographic filtering: its entries are geolocated in every mode; dynamic and monitor mode also collect new server IPs into it, static mode only uses what it contains. Without it the filter geolocates no IPs and relies on `allowed_ip` entries | File path | none |
 | ip_expiry_days | Automatically remove IPs not seen for this many days | 0 (disabled), or number of days | 0 |
 
 ## Quick Start Guide
