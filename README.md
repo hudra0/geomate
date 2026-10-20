@@ -213,13 +213,13 @@ Every change on the map (a new, moved, resized or deleted circle, a new filter, 
 3. Existing filter: the circle is added at once, without a dialog. For a disabled filter, a message in the map says "Filter … is disabled." with an **Enable** button. Drawing never enables a filter, and a disabled filter filters nothing.
 4. New filter: a dialog asks for the filter name and the filter options (Enable, Protocol, Source IP, Source Port, Destination Port, Allowed IPs, IP Expiry (Days), IP List File). The name may contain letters, digits, spaces, `_`, `.` and `-`. **Cancel** removes the circle. The **Geo Filters** link in the dialog opens the page with the same options plus the region list.
 
-Each filter has its own color. The label of a circle shows the filter name; it is hidden on small circles. A disabled filter is drawn faded. The circles of a filter with unsaved changes are dashed, also when the filter is disabled. The legend shows the four states: Enabled, Disabled, Unsaved and Selected.
+Each filter has a color of its own; with more than eight filters the colors repeat. The label of a circle shows the filter name; it is hidden on small circles. A disabled filter is drawn faded. The circles of a filter with unsaved changes are dashed, also when the filter is disabled. The legend shows the four states: Enabled, Disabled, Unsaved and Selected.
 
 ### Editing and Deleting a Circle
 
 - Click a circle to select it. Only one circle is selected at a time. Where circles overlap, the click selects the smallest one; click again at the same spot to select the next larger one. A small circle is zoomed in first so that the handles fit.
 - Drag the **centre handle** to move the circle and the **edge handle** to resize it. A thin dashed ghost shows the old size, and the radius shows live next to the edge handle.
-- Or type the radius in km in the bar below the map. The circle follows at once.
+- Or type the radius in km in the bar at the bottom of the map. The circle follows at once.
 - **Done** (or a click on the empty map) keeps the change. **Cancel** or **Esc** restores the circle as it was.
 - **Delete** asks "Delete circle?". **Yes** removes the circle, **No** keeps it. Deleting one circle never deletes the filter.
 - The last circle of a filter opens the dialog "Delete the last circle of …?". For an enabled filter, **Delete and disable** is preselected; the other choices are **Delete** (the filter stays enabled) and **Cancel**. A filter without a region puts no geolocated IP into its allowed or blocked set. With Strict Mode on (and not in Monitor Mode), an enabled filter without a region therefore blocks all its traffic except its allowed IPs; the dialog says which case applies. For a disabled filter, the dialog only asks to confirm.
@@ -238,7 +238,7 @@ The legend is closed by default on phones and when the map is narrower than 900 
 
 ### Active Connections
 
-Below the map, **Active connections** has its own **Show** / **Hide** button. The table stays hidden until you click Show, and the map gets shorter while it is shown. It lists every tracked game server connection with IP, Filter, Status, Country, City and ISP. Click a column header to sort. The data refreshes every 5 seconds while the tab is visible and pauses in a background tab. If it fails several times in a row, the status row above the map says so. Status is Whitelisted, Allowed, Blocked, Untracked (not geolocated) or Unknown. The service status above the map refreshes every 10 seconds.
+Below the map, **Active connections** has its own **Show** / **Hide** button. The table stays hidden until you click Show, and on wide screens the map gets shorter while it is shown. It lists every tracked game server connection with IP, Filter, Status, Country, City and ISP. Click a column header to sort. The data refreshes every 5 seconds while the tab is visible and pauses in a background tab. If it fails several times in a row, the status row above the map says so. Status is Whitelisted, Allowed, Blocked, Untracked (not geolocated) or Unknown. The service status above the map refreshes every 10 seconds.
 
 Country, city and ISP come from the geolocation data of the filter. They show "–" when no data is known for an IP yet, and after an update from an older version until the next service start or geolocation batch refreshes the lookup cache. A connection with a known position also gets a marker on the map: green for Allowed, red for Blocked, blue for Whitelisted. Markers close together form a cluster with a count. Click a marker for the details.
 
@@ -246,12 +246,12 @@ Country, city and ISP come from the geolocation data of the filter. They show "�
 
 The **Geo Filters** tab lists every filter with Enable, Name, Status, IPs/Located and Regions. Regions shows the number and radii of the circles, for example "2 circles · 436 km, 683 km", and a **Show on map** link that opens the View tab at that filter. The edit dialog has all filter options. Allowed Regions is easier to edit on the map. IPs/Located shows the IPs in the list and how many are located: "120 ✓" for all, "120 (60%)" for part of them, "120 (stale)" when the geo data holds IPs that left the list.
 
-The Status column shows what the running service does with the filter:
+The Status column shows the state of each filter in the configuration:
 
 | Status | Meaning |
 |--------|---------|
 | Active | Enabled, with regions and an IP list, nothing unsaved and no error |
-| Disabled | The filter is off |
+| Disabled | The filter is off and has no unsaved changes |
 | Unsaved | The filter has unsaved changes. An enabled filter also shows it while the global Enable switch has an unsaved change |
 | No regions | An enabled filter has no valid circle |
 | No IP list | An enabled filter has no IP List File |
