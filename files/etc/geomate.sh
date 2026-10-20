@@ -20,7 +20,7 @@ NFT_SET_PREFIX="geomate_"
 SETS_LOCK="${GEOMATE_TMP_DIR}/sets.lock"           # Held while IP lists or sets are rewritten
 BUILT_CONFIG_DIR="${GEOMATE_TMP_DIR}/config"       # Copy of the configuration the running sets were built from
 CHECK_INTERVAL=1800  # Interval in seconds (30 minutes) - used for geolocation status
-harvest_refresh_age=0  # A harvest refreshes list timestamps at least this many seconds old
+harvest_refresh_per_day=0  # A harvest refreshes list timestamps this many seconds old per expiry day (0: all)
 debug_level=0
 
 # Wrapper for nft commands with error logging
@@ -57,15 +57,23 @@ log_and_print() {
 
 # Lock shared by the loop's harvest, the 'harvest' command and the live reload, so
 # they never rewrite the same IP list or set at once. The lock is a symlink to the
-# owner's PID, which ln creates atomically; the lock of an owner that is gone is taken over
+# owner's PID, which ln creates atomically. The lock of an owner that is gone is taken
+# over by one waiter only: mkdir of a claim named after that owner is atomic, and only
+# the claim holder removes a lock of that owner, so no waiter deletes a newer lock
 acquire_sets_lock() {
-    local owner waited=0
+    local owner claim took_over waited=0
     mkdir -p "$GEOMATE_TMP_DIR"
     until ln -snT "$$" "$SETS_LOCK" 2>/dev/null; do
         owner=$(readlink "$SETS_LOCK" 2>/dev/null)
-        if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
-            log_and_print "Taking over stale lock $SETS_LOCK of PID $owner" 1
-            rm -f "$SETS_LOCK"
+        claim="${SETS_LOCK}.stale.${owner}"
+        if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null && mkdir "$claim" 2>/dev/null; then
+            took_over=0
+            if [ "$(readlink "$SETS_LOCK" 2>/dev/null)" = "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+                rm -f "$SETS_LOCK"
+                took_over=1
+            fi
+            rmdir "$claim"
+            [ "$took_over" -eq 1 ] && log_and_print "Took over stale lock $SETS_LOCK of PID $owner" 1
             continue
         fi
         [ "$waited" -eq 0 ] && log_and_print "Waiting for lock $SETS_LOCK held by PID ${owner:-?}" 2
@@ -486,8 +494,8 @@ create_dynamic_set() {
 # Merge the public IPs of a filter's _dynamic set into its ip_list. Shared by the loop
 # (process_dynamic_set) and the 'harvest' command; the caller holds the sets lock.
 # List lines are "IP", or "IP,<unix time>" with ip_expiry_days > 0: then a known IP
-# gets the current time once its time is harvest_refresh_age seconds old. New IPs are
-# appended. Sets harvest_added to their number
+# gets the current time once its time is ip_expiry_days * harvest_refresh_per_day
+# seconds old, at most a day. New IPs are appended. Sets harvest_added to their number
 harvest_dynamic_set() {
     local name ip_list expiry_days set_name elements
     harvest_added=0
@@ -527,13 +535,13 @@ harvest_dynamic_set() {
         rm -f "$set_file" "$public_file"
         return 0
     fi
-    log_and_print "New IPs found in dynamic set for $name:" 2
 
     # One pass over the list: refresh the timestamps of known IPs (expiry enabled),
     # append the new IPs in sorted order, count both
     [ -f "$ip_list" ] || old_list=/dev/null
-    awk -F, -v now="$(date +%s)" -v expiry="$expiry_days" -v min_age="$harvest_refresh_age" \
+    awk -F, -v now="$(date +%s)" -v expiry="$expiry_days" -v per_day="$harvest_refresh_per_day" \
         -v counts="$counts_file" -v new_file="$new_file" '
+        BEGIN { min_age = expiry * per_day; if (min_age > 86400) min_age = 86400 }
         FILENAME == ARGV[1] { harvested[$0] = 1; order[++n] = $0; next }
         $0 == "" { next }
         ($1 in harvested) {
@@ -558,6 +566,11 @@ harvest_dynamic_set() {
     }
     read -r harvest_added updated_count < "$counts_file"
 
+    if [ "$harvest_added" -gt 0 ]; then
+        log_and_print "New IPs found in dynamic set for $name:" 2
+    else
+        log_and_print "No new IPs in dynamic set for $name" 2
+    fi
     while IFS= read -r ip; do
         log_and_print "  Will add new IP: $ip" 2
     done < "$new_file"
@@ -612,9 +625,11 @@ update_dynamic_ips() {
 harvest_all() {
     local UCI_CONFIG_DIR="$UCI_CONFIG_DIR"
     [ -f "$BUILT_CONFIG_DIR/geomate" ] && UCI_CONFIG_DIR="$BUILT_CONFIG_DIR"
-    # The loop refreshes timestamps every 30 minutes and expiry counts in days: a stop
-    # writes the list to flash for new IPs and for timestamps older than a day only
-    harvest_refresh_age=86400
+    # The loop refreshes timestamps every 30 minutes. A stop refreshes only timestamps
+    # one hour old per expiry day (at most a day): it rarely writes the list to flash
+    # for known IPs, and a timestamp it leaves is far younger than the expiry window,
+    # so the cleanup at the next start never drops an IP of the _dynamic set (1 h timeout)
+    harvest_refresh_per_day=3600
     acquire_sets_lock || return 1
     config_load 'geomate'
     config_foreach harvest_dynamic_set 'geo_filter'
