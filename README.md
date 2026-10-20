@@ -181,7 +181,7 @@ After installing Geomate and the LuCI interface:
    - Enable and IP Expiry (Days) can stay at their defaults
 
 4. **Save & Let Geomate Learn**
-   - Click "Save & Apply". Until then, the circle is only staged in your LuCI session (see [Staged Changes and Save & Apply](#staged-changes-and-save--apply))
+   - Click "Save" in the dialog, then "Save & Apply" in the page footer or on the pending-changes button above the map. Until Save & Apply, the circle is only staged in your LuCI session (see [Staged Changes and Save & Apply](#staged-changes-and-save--apply))
    - Start with Dynamic or Monitor Mode to begin collecting server IPs
    - Play several matches to allow Geomate to collect and geolocate server IPs
    - The map will populate as IPs are discovered and geolocated
@@ -202,7 +202,7 @@ Every change on the map (a new, moved, resized or deleted circle, a new filter, 
 - A change takes effect after **Save & Apply**. Geomate then reloads and rebuilds its nftables rules.
 - Staged changes are lost when you log out or your LuCI session expires. Save & Apply before you leave the page.
 - The button above the map shows how many changes are pending ("2 changes pending · Save & Apply") and does the same as Save & Apply in the page footer.
-- The footer has no **Save** button on the map page, because the map stages each change itself. **Reset** opens a dialog that reverts all staged changes of your session (like Revert in the "Unsaved Changes" dialog of LuCI) and reloads the page.
+- The footer has no **Save** button on the map page, because the map stages each change itself. **Reset** opens a dialog when Geomate has staged changes: Revert then discards all staged changes of your session (like Revert in the "Unsaved Changes" dialog of LuCI) and reloads the page. Without staged Geomate changes, Reset only shows a notice.
 - Exception: **Upload IP List** in the new-filter dialog writes the list file to the router at once (it asks before it replaces an existing file). Cancel, Reset and a logout do not undo the upload. **Create Empty List** only fills in the path; the service creates the empty file at its next start, i.e. after Save & Apply.
 
 ### Drawing a Circle
@@ -210,7 +210,7 @@ Every change on the map (a new, moved, resized or deleted circle, a new filter, 
 1. Pick a filter in the **Filter** list above the map. Disabled filters are marked "(disabled)". Pick **New filter…** to create a filter together with its first circle.
 2. Click **Draw circle**, then click on the map and drag. The radius shows next to the cursor while you drag. **Esc** cancels.
 3. Existing filter: the circle is added at once, without a dialog, and a message confirms that it is staged. If the filter is disabled, the circle filters nothing yet; use **Enable filter** (above the map, or in the message) to stage the enable flag.
-4. New filter: a dialog asks for the filter name and the filter options (Enable, Protocol, Source IP, Source Port, Destination Port, Allowed IPs, IP Expiry, IP List File). The name may contain letters, digits, spaces, `_`, `.` and `-`. **Cancel** removes the circle. The **Geo Filters** page (link in the dialog) has the same options plus the region list.
+4. New filter: a dialog asks for the filter name and the filter options (Enable, Protocol, Source IP, Source Port, Destination Port, Allowed IPs, IP Expiry (Days), IP List File). The name may contain letters, digits, spaces, `_`, `.` and `-`. **Cancel** removes the circle. The **Geo Filters** page (link in the dialog) has the same options plus the region list.
 
 Each filter has its own color. Circles carry a label such as "BF6 · 683 km". A disabled filter is drawn dashed and faded and labelled "(disabled)". After a change, all circles of that filter are dashed and marked "pending" until Save & Apply; a newly drawn circle is marked "new" until the page has staged it.
 
@@ -239,7 +239,7 @@ The legend is closed by default on phones and when the map is narrower than 900 
 
 The table lists every tracked game server connection with IP, filter, status, country, city and ISP. Click a column header to sort. The data refreshes every 5 seconds while the tab is visible and pauses in a background tab. Status is Allowed, Allowed (Whitelist), Blocked, Untracked (not geolocated) or Unknown. The service status above the map refreshes every 10 seconds.
 
-Country, city and ISP come from the geolocation data of the filter. They show "–" when no data is known for an IP yet. Markers on the map use the same status colors. Click a marker for the details.
+Country, city and ISP come from the geolocation data of the filter. They show "–" when no data is known for an IP yet, and after an update from an older version until the next service start or geolocation batch refreshes the lookup cache. Markers on the map use the same status colors. Click a marker for the details.
 
 ## Detailed Configuration
 
