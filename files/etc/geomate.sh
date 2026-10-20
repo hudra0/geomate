@@ -18,6 +18,7 @@ GEOMATE_TMP_DIR="/tmp/geomate"
 NFT_ERROR_LOG="/tmp/geomate_nft_errors.log"
 NFT_SET_PREFIX="geomate_"
 SETS_LOCK_DIR="${GEOMATE_TMP_DIR}/sets.lock"            # Held while IP lists or sets are rewritten
+CONFIG_SNAPSHOT="${GEOMATE_TMP_DIR}/config.snapshot"   # Configuration the running sets were built from
 CHECK_INTERVAL=1800  # Interval in seconds (30 minutes) - used for geolocation status
 debug_level=0
 
@@ -53,8 +54,8 @@ log_and_print() {
     fi
 }
 
-# Lock shared by the loop's harvest and the 'harvest' command, so they never
-# rewrite the same IP list at once. mkdir is atomic; the directory
+# Lock shared by the loop's harvest, the 'harvest' command and the live reload, so
+# they never rewrite the same IP list or set at once. mkdir is atomic; the directory
 # holds the owner's PID, and the lock of an owner that is gone is taken over
 acquire_sets_lock() {
     local owner waited=0
@@ -79,6 +80,11 @@ acquire_sets_lock() {
 
 release_sets_lock() {
     rm -rf "$SETS_LOCK_DIR"
+}
+
+# Configuration as 'uci show' lines, with the section IDs that config_load uses
+show_config() {
+    uci ${UCI_CONFIG_DIR:+-c "$UCI_CONFIG_DIR"} -q -X show geomate
 }
 
 # Check if an IP is a valid public IP (not private/reserved)
@@ -579,7 +585,8 @@ process_dynamic_set() {
     process_geo_data "$name" "${set_name}_allowed" "${set_name}_blocked" "$allowed_region"
 }
 
-# Update dynamic IPs based on configuration
+# Update dynamic IPs based on configuration. The config is read on every run, so a
+# live reload of the regions reaches the next harvest
 update_dynamic_ips() {
     if acquire_sets_lock; then
         config_load 'geomate'
@@ -701,27 +708,16 @@ append_allowed_ip() {
     allowed_ips="${allowed_ips}${1},"
 }
 
-# Process geo data from the JSON file
-process_geo_data() {
-    local name="$1"
-    local allowed_set="$2"
-    local blocked_set="$3"
-    shift 3
-    local allowed_regions="$*"
-    local geo_data_file="${GEOMATE_DATA_DIR}/${name}_geo_data.json"
-
-    [ ! -f "$geo_data_file" ] && { log_and_print "Geo data file not found: $geo_data_file" 0; return; }
-    [ -z "$allowed_regions" ] && { log_and_print "No allowed regions specified for $name" 0; return; }
-
-    log_and_print "Processing geo data for $name with allowed regions: $allowed_regions" 2
-
-    # PERFORMANCE OPTIMIZATION: Process ALL IPs in a SINGLE awk process
-    # Instead of spawning a new awk process for each IP (11000+ processes),
-    # we do everything in one pass: parse regions, calculate haversine, categorize IPs
-    # Output format: First line = comma-separated allowed IPs, Second line = comma-separated blocked IPs
-    local result
-    result=$(jq -r '. | [.query, .lat, .lon] | @tsv' "$geo_data_file" 2>/dev/null | \
-        awk -v regions="$allowed_regions" '
+# Split the geolocated IPs of a filter by its regions (Haversine, R = 6371000 m).
+# Shared by the start, the loop harvest and the live reload.
+# $1 = geo data file, $2 = regions ("circle:lat:lon:radius_m ...")
+# PERFORMANCE OPTIMIZATION: Process ALL IPs in a SINGLE awk process
+# Instead of spawning a new awk process for each IP (11000+ processes),
+# we do everything in one pass: parse regions, calculate haversine, categorize IPs
+# Output format: First line = comma-separated allowed IPs, Second line = comma-separated blocked IPs
+split_geo_data() {
+    jq -r '. | [.query, .lat, .lon] | @tsv' "$1" 2>/dev/null | \
+        awk -v regions="$2" '
         function haversine(lat1, lon1, lat2, lon2) {
             # Convert degrees to radians
             lat1 = lat1 * 3.14159265359 / 180
@@ -785,7 +781,25 @@ process_geo_data() {
             # Output two lines: allowed IPs, then blocked IPs
             print allowed_list
             print blocked_list
-        }')
+        }'
+}
+
+# Process geo data from the JSON file
+process_geo_data() {
+    local name="$1"
+    local allowed_set="$2"
+    local blocked_set="$3"
+    shift 3
+    local allowed_regions="$*"
+    local geo_data_file="${GEOMATE_DATA_DIR}/${name}_geo_data.json"
+
+    [ ! -f "$geo_data_file" ] && { log_and_print "Geo data file not found: $geo_data_file" 0; return; }
+    [ -z "$allowed_regions" ] && { log_and_print "No allowed regions specified for $name" 0; return; }
+
+    log_and_print "Processing geo data for $name with allowed regions: $allowed_regions" 2
+
+    local result
+    result=$(split_geo_data "$geo_data_file" "$allowed_regions")
 
     # Parse the two-line result
     local allowed_ips blocked_ips
@@ -845,6 +859,117 @@ process_geo_data() {
     [ -n "$blocked_ips" ] && add_ips_to_set "$blocked_set" "$blocked_ips"
 
     log_and_print "Finished processing geo data for $name" 2
+}
+
+# Print 'add element' commands for a comma-separated IP list, 1000 IPs per command
+print_set_elements() {
+    [ -n "$2" ] || return 0
+    printf '%s\n' "$2" | tr ',' '\n' | awk -v set="$1" '
+        { chunk = chunk (n++ % 1000 ? "," : "") $0 }
+        n % 1000 == 0 { print "add element inet geomate " set " { " chunk " }"; chunk = "" }
+        END { if (chunk != "") print "add element inet geomate " set " { " chunk " }" }'
+}
+
+# config_foreach callback of reload_regions: for a changed, enabled filter append the
+# commands that refill its _allowed and _blocked sets to $reload_batch, with the same
+# content as at start (allowed_ip, blocked_ips, geolocated IPs split by region)
+reload_filter_sets() {
+    local name enabled blocked_ips set_name result geo_data_file
+    local allowed_ips="" allowed_regions="" geo_allowed="" geo_blocked=""
+    local allowed_count=0 blocked_count=0
+
+    case "$reload_sections" in *" $1 "*) ;; *) return 0 ;; esac
+    config_get enabled "$1" 'enabled' '0'
+    [ "$enabled" = "0" ] && return 0
+
+    config_get name "$1" 'name'
+    config_get blocked_ips "$1" 'blocked_ips'
+    config_list_foreach "$1" 'allowed_ip' append_allowed_ip
+    config_list_foreach "$1" 'allowed_region' append_allowed_region
+    set_name="${NFT_SET_PREFIX}$(echo "$name" | tr ' ' '_')"
+    geo_data_file="${GEOMATE_DATA_DIR}/${name}_geo_data.json"
+
+    if [ -n "$allowed_regions" ] && [ -f "$geo_data_file" ]; then
+        result=$(split_geo_data "$geo_data_file" "$allowed_regions")
+        geo_allowed=$(echo "$result" | sed -n '1p')
+        geo_blocked=$(echo "$result" | sed -n '2p')
+    fi
+    [ -n "$geo_allowed" ] && allowed_count=$(echo "$geo_allowed" | tr ',' '\n' | wc -l)
+    [ -n "$geo_blocked" ] && blocked_count=$(echo "$geo_blocked" | tr ',' '\n' | wc -l)
+
+    {
+        printf 'flush set inet geomate %s\n' "${set_name}_allowed" "${set_name}_blocked"
+        [ -n "$allowed_ips" ] && printf 'add element inet geomate %s { %s }\n' "${set_name}_allowed" "${allowed_ips%,}"
+        [ -n "$blocked_ips" ] && printf 'add element inet geomate %s { %s }\n' "${set_name}_blocked" "$blocked_ips"
+        print_set_elements "${set_name}_allowed" "$geo_allowed"
+        print_set_elements "${set_name}_blocked" "$geo_blocked"
+    } >> "$reload_batch"
+    echo "Live reload of $name: $allowed_count allowed, $blocked_count blocked geolocated IPs" >> "${reload_batch}.log"
+}
+
+# Live reload (reload_service): when only allowed_region lists changed since the
+# configuration snapshot of the last start, refill the _allowed and _blocked sets of
+# the changed, enabled filters in one nft transaction. Rules, counters, _dynamic and
+# _ui_dynamic stay, so the collected IPs and the harvest timer survive.
+# Returns 1 when the service has to be restarted instead
+reload_regions() {
+    local config_new="${GEOMATE_TMP_DIR}/config.new" changed line
+    reload_batch="${GEOMATE_TMP_DIR}/reload.nft"
+    reload_sections=""
+
+    if [ ! -f "$CONFIG_SNAPSHOT" ] || [ -f /tmp/geomate_loading ]; then
+        log_and_print "Live reload: no finished start to compare with, restarting" 1
+        return 1
+    fi
+    if ! nft list chain inet geomate prerouting >/dev/null 2>&1; then
+        log_and_print "Live reload: table inet geomate is missing, restarting" 1
+        return 1
+    fi
+    if [ -s "$NFT_ERROR_LOG" ]; then
+        log_and_print "Live reload: the last start had nft errors, restarting" 1
+        return 1
+    fi
+    show_config > "$config_new" || { log_and_print "Error: failed to read the configuration" 0; return 1; }
+
+    # Lines that differ between the snapshot and the current configuration
+    changed=$(awk 'FILENAME == ARGV[1] { old[$0] = 1; next }
+        ($0 in old) { delete old[$0]; next }
+        { print }
+        END { for (line in old) print line }' "$CONFIG_SNAPSHOT" "$config_new")
+    if [ -z "$changed" ]; then
+        log_and_print "Live reload: configuration unchanged, restarting" 1
+        return 1
+    fi
+
+    # Section IDs of the changed allowed_region lists; any other change needs a restart
+    reload_sections=$(printf '%s\n' "$changed" | awk '
+        { key = substr($0, 1, index($0, "=") - 1) }
+        key !~ /^geomate\.[A-Za-z0-9_]+\.allowed_region$/ { bad = 1; exit }
+        { split(key, part, "."); if (!(part[2] in seen)) { seen[part[2]] = 1; printf " %s", part[2] } }
+        END { if (bad) exit 1; print " " }') || {
+        log_and_print "Live reload: options other than allowed_region changed, restarting" 1
+        return 1
+    }
+
+    : > "$reload_batch"
+    : > "${reload_batch}.log"
+    config_load 'geomate'
+    config_foreach reload_filter_sets 'geo_filter'
+
+    if [ -s "$reload_batch" ]; then
+        if ! nft -f "$reload_batch" 2> "${reload_batch}.err"; then
+            log_and_print "Error: live reload failed, restarting: $(head -n 1 "${reload_batch}.err" | cut -c 1-200)" 0
+            return 1
+        fi
+        while IFS= read -r line; do
+            log_and_print "$line" 1
+        done < "${reload_batch}.log"
+    else
+        log_and_print "Live reload: only regions of disabled filters changed" 1
+    fi
+
+    mv "$config_new" "$CONFIG_SNAPSHOT"
+    rm -f "$reload_batch" "${reload_batch}.log" "${reload_batch}.err"
 }
 
 # Verify the nftables rules to ensure they are set up correctly
@@ -915,6 +1040,11 @@ run_geomate_trigger() {
 
 # Main function to run the service
 run() {
+    # The configuration the sets are built from; the live reload compares against it
+    local config_text
+    rm -f "$CONFIG_SNAPSHOT"
+    config_text=$(show_config)
+
     load_config
     setup_geomate_d
 
@@ -926,6 +1056,8 @@ run() {
     touch /tmp/geomate_loading
 
     setup_nftables_and_filters
+    printf '%s
+' "$config_text" > "$CONFIG_SNAPSHOT"
 
     # Remove loading flag file
     log_and_print "Removing loading flag file at /tmp/geomate_loading" 1
@@ -984,6 +1116,7 @@ run() {
 cleanup_nftables() {
     log_and_print "Cleaning up nftables rules..." 1
     nft delete table inet geomate 2>/dev/null
+    rm -f "$CONFIG_SNAPSHOT"
     log_and_print "nftables rules cleaned up" 1
 }
 
@@ -997,11 +1130,20 @@ case "$1" in
         load_config
         harvest_all || exit 1
         ;;
+    reload)
+        # Called by reload_service; exit 1 means a restart is needed
+        load_config
+        acquire_sets_lock || exit 1
+        reload_regions
+        reload_status=$?
+        release_sets_lock
+        exit "$reload_status"
+        ;;
     run)
         run
         ;;
     *)
-        echo "Usage: $0 {run|cleanup|harvest}"
+        echo "Usage: $0 {run|cleanup|harvest|reload}"
         exit 1
 esac
 

@@ -501,6 +501,7 @@ Example: If you want to play COD with friends from both Europe and USA:
 ### Matchmaking and Region Changes
 - Longer matchmaking times are normal with restricted regions
 - Game restart may be required after region changes
+- A change of circles only does not restart the service: Geomate updates the allowed and blocked IPs of the changed filters in place. Any other change restarts it
 - Consider expanding allowed regions if matchmaking is too slow
 
 ### Additional Tips
