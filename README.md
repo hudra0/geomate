@@ -36,7 +36,7 @@ Geomate is under active development. Feedback on functionality, usability, and a
 
 ## Prerequisites
 
-1. OpenWrt 23.05 or newer (the map works with LuCI 23.05 and newer; tested on LuCI 26.036)
+1. OpenWrt 23.05 or newer (the map is written for LuCI 23.05 and newer; it has been tested on LuCI 26.036 only)
 2. 5MB free disk space
    - Note: Geomate's operations (monitoring, geolocation queries, filtering) can be resource-intensive
    - Multiple active filters require more system resources
@@ -172,12 +172,13 @@ After installing Geomate and the LuCI interface:
    - A dialog opens: name your filter (e.g., "Call of Duty"). More circles, editing and deleting are described in [Using the Map](#using-the-map)
 
 3. **Configure Your Filter**
-   - The dialog after drawing has the options below; the "Geo Filters" page has all of them later
+   - The dialog after drawing has the same options as the "Geo Filters" page, except the region list. The most important ones:
    - Protocol: Usually UDP for games
-   - Gaming Device IP: Your console/PC IP (e.g., 192.168.1.208)
-   - Ports: Use known values (e.g., 3074 for CoD) or see [Finding Game Ports and Protocols](#finding-game-ports-and-protocols)
-   - Whitelist: Add essential IPs for matchmaking/authentication (see [Allowed IPs Explained](#allowed-ips-explained))
-   - IP List: Either use an existing list or create an empty one (see [Understanding IP Lists](#understanding-ip-lists-and-allowed-ips))
+   - Source IP: Your console/PC IP (e.g., 192.168.1.208)
+   - Source Port / Destination Port: Use known values (e.g., 3074 for CoD) or see [Finding Game Ports and Protocols](#finding-game-ports-and-protocols)
+   - Allowed IPs: Essential IPs for matchmaking/authentication, the whitelist (see [Allowed IPs Explained](#allowed-ips-explained))
+   - IP List File: Either use an existing list or create an empty one (see [Understanding IP Lists](#understanding-ip-lists-and-allowed-ips))
+   - Enable and IP Expiry (Days) can stay at their defaults
 
 4. **Save & Let Geomate Learn**
    - Click "Save & Apply". Until then, the circle is only staged in your LuCI session (see [Staged Changes and Save & Apply](#staged-changes-and-save--apply))
@@ -188,9 +189,11 @@ After installing Geomate and the LuCI interface:
 
 ![GeomateAdd](https://github.com/user-attachments/assets/ffdd5da0-d8d6-4b88-af53-5da055d57138)
 
+*The animation shows an older version of the map; the steps above describe the current one.*
+
 ## Using the Map
 
-The **View** tab (Services > Geomate) shows the map, the filter picker and the table of active connections. Regions are circles. The map works with LuCI 23.05 and newer; it was tested on LuCI 26.036.
+The **View** tab (Services > Geomate) shows the map, the filter picker and the table of active connections. Regions are circles.
 
 ### Staged Changes and Save & Apply
 
@@ -200,15 +203,16 @@ Every change on the map (a new, moved, resized or deleted circle, a new filter, 
 - Staged changes are lost when you log out or your LuCI session expires. Save & Apply before you leave the page.
 - The button above the map shows how many changes are pending ("2 changes pending · Save & Apply") and does the same as Save & Apply in the page footer.
 - The footer has no **Save** button on the map page, because the map stages each change itself. **Reset** opens a dialog that reverts all staged changes of your session (like Revert in the "Unsaved Changes" dialog of LuCI) and reloads the page.
+- Exception: **Upload IP List** in the new-filter dialog writes the list file to the router at once (it asks before it replaces an existing file). Cancel, Reset and a logout do not undo the upload. **Create Empty List** only fills in the path; the service creates the empty file at its next start, i.e. after Save & Apply.
 
 ### Drawing a Circle
 
 1. Pick a filter in the **Filter** list above the map. Disabled filters are marked "(disabled)". Pick **New filter…** to create a filter together with its first circle.
 2. Click **Draw circle**, then click on the map and drag. The radius shows next to the cursor while you drag. **Esc** cancels.
 3. Existing filter: the circle is added at once, without a dialog, and a message confirms that it is staged. If the filter is disabled, the circle filters nothing yet; use **Enable filter** (above the map, or in the message) to stage the enable flag.
-4. New filter: a dialog asks for the filter name, protocol, ports, allowed IPs and IP list file. The name may contain letters, digits, spaces, `_`, `.` and `-`. **Cancel** removes the circle. All other options are on the **Geo Filters** page (link in the dialog).
+4. New filter: a dialog asks for the filter name and the filter options (Enable, Protocol, Source IP, Source Port, Destination Port, Allowed IPs, IP Expiry, IP List File). The name may contain letters, digits, spaces, `_`, `.` and `-`. **Cancel** removes the circle. The **Geo Filters** page (link in the dialog) has the same options plus the region list.
 
-Each filter has its own color. Circles carry a label such as "BF6 · 683 km". A disabled filter is drawn dashed and faded and labelled "(disabled)". A circle that is staged but not applied is dashed and marked "pending".
+Each filter has its own color. Circles carry a label such as "BF6 · 683 km". A disabled filter is drawn dashed and faded and labelled "(disabled)". After a change, all circles of that filter are dashed and marked "pending" until Save & Apply; a newly drawn circle is marked "new" until the page has staged it.
 
 ### Editing and Deleting a Circle
 
@@ -217,7 +221,7 @@ Each filter has its own color. Circles carry a label such as "BF6 · 683 km". A 
 - Or type the radius in km in the bar below the map. The circle follows at once.
 - **Done** (or a click on the empty map) stages the change. **Cancel** or **Esc** restores the circle as it was.
 - **Delete** asks once more ("Delete 'BF6 · 683 km'?"); only the **Yes** that follows stages the removal. Deleting one circle never deletes the filter.
-- The last circle of a filter opens a dialog. For an enabled filter, **Delete and disable filter** is preselected; the other choices are **Delete, keep filter enabled** and **Cancel**. A filter without a region puts no geolocated IP into its allowed or blocked set. For a disabled filter, the dialog only asks to confirm.
+- The last circle of a filter opens a dialog. For an enabled filter, **Delete and disable filter** is preselected; the other choices are **Delete, keep filter enabled** and **Cancel**. A filter without a region puts no geolocated IP into its allowed or blocked set. With Strict Mode on (and not in Monitor Mode), an enabled filter without a region therefore blocks all its traffic except its allowed IPs; the dialog says which case applies. For a disabled filter, the dialog only asks to confirm.
 
 ### Map Controls
 
@@ -229,7 +233,7 @@ Each filter has its own color. Circles carry a label such as "BF6 · 683 km". A 
 | Legend | Explains circles and connection markers and lists the filters with their circle count. The eye hides or shows the circles of a filter, the magnifier zooms to them. The switch **Dark map tiles** dims the map; it is off by default |
 | Active connections | Shows or hides the connections table below the map |
 
-The legend is closed by default on small screens. The legend state, the dark tiles switch and the home view are stored in your browser, not on the router. The map follows the light or dark theme of LuCI. On a phone the buttons are larger and the map takes 60% of the screen height.
+The legend is closed by default on phones and when the map is narrower than 900 px, until you open or close it yourself. The legend state, the dark tiles switch and the home view are stored in your browser, not on the router. The map follows the light or dark theme of LuCI. On a phone the buttons are larger and the map takes 60% of the screen height.
 
 ### Active Connections
 
@@ -316,7 +320,7 @@ There are two ways to obtain these lists:
 
 1. **Dynamic Learning (Recommended for New Games)**
    - Create a new geofilter with an empty IP list
-   - Use the "Create empty list" button in the dialog
+   - Click "Create Empty List" in the dialog: it fills in the list path, and the service creates the empty file at its next start (after Save & Apply)
    - Set operational mode to Dynamic
    - Geomate will automatically collect server IPs while you play
 
@@ -324,7 +328,7 @@ There are two ways to obtain these lists:
    - Download pre-collected IP lists (e.g., Call of Duty servers)
    - Place files in `/etc/geomate.d/`
    - Either:
-     - Upload via the "Upload List" function in the geofilter dialog
+     - Upload via "Upload List" in the Geo Filters dialog or "Upload IP List" in the map's new-filter dialog (both write the file at once)
      - Manually move the file to `/etc/geomate.d/` and set the path in the config or UI
    - Run "Manual Geolocation" for immediate use
 
@@ -354,7 +358,7 @@ Finding the correct allowed IPs for games can involve some trial and error. Here
 #### Method 1: Using Monitor Mode (Recommended)
 1. Set Geomate to **Monitor Mode** in the LuCI interface
 2. Play your game normally - all connections will be tracked but not blocked
-3. Watch the Active connections table (or click a marker on the map) to see which servers your game connects to. The table is sortable and shows IP, status, country, city and ISP. To stop it from updating while you read, switch off Auto Refresh in the LuCI header.
+3. Watch the Active connections table (or click a marker on the map) to see which servers your game connects to. The table is sortable and shows IP, status, country, city and ISP. To stop it from updating while you read, click the "Refreshing" indicator in the LuCI header (it changes to "Paused"); click it again to resume.
 4. The map will populate with server locations as they're discovered and geolocated
 5. Play multiple matches to build a comprehensive IP database
 6. Pay attention to patterns - which servers are used for matchmaking vs. actual gameplay
