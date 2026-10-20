@@ -248,6 +248,8 @@ start_service() {
 }
 
 stop_service() {
+    # Save the IPs collected since the last harvest; the run loop is still alive here
+    nft -t list table inet geomate >/dev/null 2>&1 && $cmd harvest
     $cmd cleanup
     log_and_print "Service stopped"
 }

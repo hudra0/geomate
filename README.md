@@ -192,7 +192,7 @@ After installing Geomate and the LuCI interface:
 
 #### Dynamic Mode
 - Automatically learns server IPs during gameplay
-- Builds IP lists over time
+- Builds IP lists over time: new IPs are saved to the IP list every 30 minutes and when the service stops or restarts
 - Recommended for most users
 
 #### Static Mode
@@ -541,7 +541,7 @@ A: This varies by game and how you play. Most games' essential servers are disco
 A: When properly configured, Geomate should not noticeably impact game performance. The filtering happens at the network level and is optimized for minimal latency.
 
 **Q: What happens if I restart Geomate during gameplay?**
-A: There might be a brief period where filtering is temporarily bypassed while firewall rules are rebuilt. This typically takes a few seconds to minutes.
+A: There might be a brief period where filtering is temporarily bypassed while firewall rules are rebuilt. This typically takes a few seconds to minutes. Server IPs collected since the last save are written to the IP lists before the service stops.
 
 **Q: Will Geomate make my games easier or improve my gameplay?**
 A: No, Geomate is a connection management tool that helps you control which game servers you connect to. It doesn't affect gameplay mechanics or matchmaking algorithms.

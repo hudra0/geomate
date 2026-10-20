@@ -17,6 +17,7 @@ GEOMATE_RUNTIME_DIR="${GEOMATE_DATA_DIR}/runtime"
 GEOMATE_TMP_DIR="/tmp/geomate"
 NFT_ERROR_LOG="/tmp/geomate_nft_errors.log"
 NFT_SET_PREFIX="geomate_"
+SETS_LOCK_DIR="${GEOMATE_TMP_DIR}/sets.lock"            # Held while IP lists or sets are rewritten
 CHECK_INTERVAL=1800  # Interval in seconds (30 minutes) - used for geolocation status
 debug_level=0
 
@@ -50,6 +51,34 @@ log_and_print() {
         logger -t geomate "$message"
         echo "geomate: $message"
     fi
+}
+
+# Lock shared by the loop's harvest and the 'harvest' command, so they never
+# rewrite the same IP list at once. mkdir is atomic; the directory
+# holds the owner's PID, and the lock of an owner that is gone is taken over
+acquire_sets_lock() {
+    local owner waited=0
+    mkdir -p "$GEOMATE_TMP_DIR"
+    until mkdir "$SETS_LOCK_DIR" 2>/dev/null; do
+        owner=$(cat "$SETS_LOCK_DIR/pid" 2>/dev/null)
+        if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+            log_and_print "Taking over stale lock $SETS_LOCK_DIR of PID $owner" 1
+            rm -rf "$SETS_LOCK_DIR"
+            continue
+        fi
+        [ "$waited" -eq 0 ] && log_and_print "Waiting for lock $SETS_LOCK_DIR held by PID ${owner:-?}" 2
+        if [ "$waited" -ge 60 ]; then
+            log_and_print "Error: lock $SETS_LOCK_DIR still held by PID ${owner:-?} after 60 s" 0
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    echo "$$" > "$SETS_LOCK_DIR/pid"
+}
+
+release_sets_lock() {
+    rm -rf "$SETS_LOCK_DIR"
 }
 
 # Check if an IP is a valid public IP (not private/reserved)
@@ -441,124 +470,134 @@ create_dynamic_set() {
     log_and_print "Sets for $name set up successfully" 1
 }
 
-# Process dynamic sets for a given configuration
-process_dynamic_set() {
-    local name ip_list expiry_days
+# Merge the public IPs of a filter's _dynamic set into its ip_list. Shared by the loop
+# (process_dynamic_set) and the 'harvest' command; the caller holds the sets lock.
+# List lines are "IP", or "IP,<unix time>" with ip_expiry_days > 0: then a known IP
+# gets the current time. New IPs are appended. Sets harvest_added to their number
+harvest_dynamic_set() {
+    local name ip_list expiry_days set_name elements
+    harvest_added=0
     config_get name "$1" 'name'
     config_get ip_list "$1" 'ip_list'
     config_get expiry_days "$1" 'ip_expiry_days' '0'
     [ -n "$ip_list" ] || { log_and_print "Filter $name has no ip_list configured, skipping harvest" 2; return 0; }
-    local set_name="${NFT_SET_PREFIX}$(echo "$name" | tr ' ' '_')"
+    set_name="${NFT_SET_PREFIX}$(echo "$name" | tr ' ' '_')"
+
+    # Only filters that were enabled outside static mode at the last start have this set
+    elements=$(nft list set inet geomate "${set_name}_dynamic" 2>/dev/null) || return 0
 
     log_and_print "Processing dynamic set for $name" 2
 
-    local temp_file="/tmp/geomate_${set_name}_temp.txt"
-    local ip_list_tmp="${ip_list}.tmp"
+    local set_file="${GEOMATE_TMP_DIR}/${set_name}_harvest.txt"
+    local public_file="${GEOMATE_TMP_DIR}/${set_name}_public.txt"
+    local new_file="${GEOMATE_TMP_DIR}/${set_name}_new.txt"
+    local counts_file="${GEOMATE_TMP_DIR}/${set_name}_counts.txt"
+    local list_tmp="${GEOMATE_TMP_DIR}/${set_name}_list.tmp"
+    local ip old_list="$ip_list" skipped_private=0 updated_count=0
 
-    # Retrieve IPs from the dynamic set
-    nft list set inet geomate "${set_name}_dynamic" | sed -n '/elements = {/,/}/p' | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | sort -u > "$temp_file"
+    printf '%s\n' "$elements" | sed -n '/elements = {/,/}/p' | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | sort -u > "$set_file"
 
-    if [ -s "$temp_file" ]; then
-        log_and_print "New IPs found in dynamic set for $name:" 2
-        
-        local added_count=0 skipped_private=0 updated_count=0
-        local current_time=$(date +%s)
-        
-        # Build list of new IPs to add and IPs to update timestamps for
-        local new_ips_file="/tmp/geomate_${set_name}_new.txt"
-        local update_ips_file="/tmp/geomate_${set_name}_update.txt"
-        : > "$new_ips_file"
-        : > "$update_ips_file"
-        
-        while IFS= read -r ip; do
-            # Skip private/invalid IPs
-            if ! is_valid_public_ip "$ip"; then
-                skipped_private=$((skipped_private + 1))
-                log_and_print "  Skipped private/invalid IP: $ip" 3
-                continue
-            fi
-            
-            # Check if IP already exists (with or without timestamp)
-            if grep -q "^${ip}\(,\|$\)" "$ip_list" 2>/dev/null; then
-                # IP exists - mark for timestamp update if expiry enabled
-                if [ "$expiry_days" != "0" ]; then
-                    echo "$ip" >> "$update_ips_file"
-                    updated_count=$((updated_count + 1))
-                    log_and_print "  Will update timestamp for IP: $ip" 3
-                fi
-            else
-                # New IP - add to new IPs list
-                echo "$ip" >> "$new_ips_file"
-                added_count=$((added_count + 1))
-                log_and_print "  Will add new IP: $ip" 2
-            fi
-        done < "$temp_file"
-
-        [ "$skipped_private" -gt 0 ] && log_and_print "Skipped $skipped_private private/invalid IPs for $name" 2
-
-        # Only write to flash if there are changes
-        if [ "$added_count" -gt 0 ] || [ "$updated_count" -gt 0 ]; then
-            {
-                # Process existing IPs - update timestamps where needed
-                if [ -f "$ip_list" ]; then
-                    while IFS= read -r line || [ -n "$line" ]; do
-                        [ -z "$line" ] && continue
-                        local existing_ip="${line%%,*}"
-                        
-                        # Check if this IP needs timestamp update
-                        if grep -q "^${existing_ip}$" "$update_ips_file" 2>/dev/null; then
-                            # Update timestamp
-                            echo "${existing_ip},${current_time}"
-                        else
-                            # Keep as-is
-                            echo "$line"
-                        fi
-                    done < "$ip_list"
-                fi
-                
-                # Add new IPs
-                while IFS= read -r new_ip || [ -n "$new_ip" ]; do
-                    [ -z "$new_ip" ] && continue
-                    if [ "$expiry_days" != "0" ]; then
-                        echo "${new_ip},${current_time}"
-                    else
-                        echo "$new_ip"
-                    fi
-                done < "$new_ips_file"
-            } > "$ip_list_tmp"
-            
-            # Atomic move to replace original
-            mv "$ip_list_tmp" "$ip_list"
-            log_and_print "Updated IP list for $name: $added_count added, $updated_count timestamps updated" 2
+    : > "$public_file"
+    while IFS= read -r ip; do
+        if is_valid_public_ip "$ip"; then
+            echo "$ip" >> "$public_file"
+        else
+            skipped_private=$((skipped_private + 1))
+            log_and_print "  Skipped private/invalid IP: $ip" 3
         fi
-        
-        # Cleanup temp files
-        rm -f "$new_ips_file" "$update_ips_file"
+    done < "$set_file"
+    [ "$skipped_private" -gt 0 ] && log_and_print "Skipped $skipped_private private/invalid IPs for $name" 2
 
-        # Trigger geolocation update only if new IPs were added
-        if [ "$added_count" -gt 0 ]; then
-            # Get the allowed regions
-            local allowed_region
-            config_get allowed_region "$1" 'allowed_region'
-            
-            # Process the geo data with correct parameter order:
-            # $1: name, $2: allowed_set, $3: blocked_set, $@: allowed_regions
-            process_geo_data "$name" "${set_name}_allowed" "${set_name}_blocked" "$allowed_region"
-        fi
-    else
+    if [ ! -s "$public_file" ]; then
         log_and_print "No new IPs in dynamic set for $name" 2
+        rm -f "$set_file" "$public_file"
+        return 0
+    fi
+    log_and_print "New IPs found in dynamic set for $name:" 2
+
+    # One pass over the list: refresh the timestamps of known IPs (expiry enabled),
+    # append the new IPs in sorted order, count both
+    [ -f "$ip_list" ] || old_list=/dev/null
+    awk -F, -v now="$(date +%s)" -v expiry="$expiry_days" -v counts="$counts_file" -v new_file="$new_file" '
+        FILENAME == ARGV[1] { harvested[$0] = 1; order[++n] = $0; next }
+        $0 == "" { next }
+        ($1 in harvested) {
+            known[$1] = 1
+            if (expiry != "0") { print $1 "," now; next }
+        }
+        { print }
+        END {
+            printf "" > new_file
+            for (i = 1; i <= n; i++) {
+                if (order[i] in known) { updated++; continue }
+                if (expiry != "0") print order[i] "," now
+                else print order[i]
+                print order[i] > new_file
+                added++
+            }
+            if (expiry == "0") updated = 0
+            print added + 0, updated + 0 > counts
+        }' "$public_file" "$old_list" > "$list_tmp" || {
+        log_and_print "Error: failed to merge the dynamic set of $name into $ip_list" 0
+        rm -f "$set_file" "$public_file" "$new_file" "$counts_file" "$list_tmp"
+        return 0
+    }
+    read -r harvest_added updated_count < "$counts_file"
+
+    while IFS= read -r ip; do
+        log_and_print "  Will add new IP: $ip" 2
+    done < "$new_file"
+
+    # Only write to flash if there are changes
+    if [ "$harvest_added" -gt 0 ] || [ "$updated_count" -gt 0 ]; then
+        if cmp -s "$list_tmp" "$ip_list"; then
+            rm -f "$list_tmp"
+        elif mv "$list_tmp" "$ip_list"; then
+            log_and_print "Updated IP list for $name: $harvest_added added, $updated_count timestamps updated" 2
+        else
+            log_and_print "Error: failed to update IP list $ip_list for $name" 0
+            harvest_added=0
+        fi
     fi
 
-    rm -f "$temp_file"  # Delete the temporary file after processing
+    rm -f "$set_file" "$public_file" "$new_file" "$counts_file" "$list_tmp"
+}
+
+# Loop harvest: merge the _dynamic set into the IP list, then add the geolocated IPs of
+# the list to the filter's sets when the list gained new IPs
+process_dynamic_set() {
+    local name allowed_region set_name
+    harvest_dynamic_set "$1"
+    [ "$harvest_added" -gt 0 ] || return 0
+
+    config_get name "$1" 'name'
+    config_get allowed_region "$1" 'allowed_region'
+    set_name="${NFT_SET_PREFIX}$(echo "$name" | tr ' ' '_')"
+
+    # Process the geo data with correct parameter order:
+    # $1: name, $2: allowed_set, $3: blocked_set, $@: allowed_regions
+    process_geo_data "$name" "${set_name}_allowed" "${set_name}_blocked" "$allowed_region"
 }
 
 # Update dynamic IPs based on configuration
 update_dynamic_ips() {
-    config_load 'geomate'
-    config_foreach process_dynamic_set 'geo_filter'
-    
+    if acquire_sets_lock; then
+        config_load 'geomate'
+        config_foreach process_dynamic_set 'geo_filter'
+        release_sets_lock
+    fi
+
     # Write geolocation status after processing
     write_geolocation_status
+}
+
+# Harvest before a stop: merge every _dynamic set into its IP list so a restart loses
+# no collected IP. Leaves the sets, the geo data and the status file alone
+harvest_all() {
+    acquire_sets_lock || return 1
+    config_load 'geomate'
+    config_foreach harvest_dynamic_set 'geo_filter'
+    release_sets_lock
 }
 
 # Write geolocation status to JSON file for UI/CLI consumption
@@ -953,11 +992,16 @@ case "$1" in
     cleanup)
         cleanup_nftables
         ;;
+    harvest)
+        # Called by stop_service while the table still exists
+        load_config
+        harvest_all || exit 1
+        ;;
     run)
         run
         ;;
     *)
-        echo "Usage: $0 {run|cleanup}"
+        echo "Usage: $0 {run|cleanup|harvest}"
         exit 1
 esac
 
