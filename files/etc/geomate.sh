@@ -17,9 +17,10 @@ GEOMATE_RUNTIME_DIR="${GEOMATE_DATA_DIR}/runtime"
 GEOMATE_TMP_DIR="/tmp/geomate"
 NFT_ERROR_LOG="/tmp/geomate_nft_errors.log"
 NFT_SET_PREFIX="geomate_"
-SETS_LOCK_DIR="${GEOMATE_TMP_DIR}/sets.lock"            # Held while IP lists or sets are rewritten
-CONFIG_SNAPSHOT="${GEOMATE_TMP_DIR}/config.snapshot"   # Configuration the running sets were built from
+SETS_LOCK="${GEOMATE_TMP_DIR}/sets.lock"           # Held while IP lists or sets are rewritten
+BUILT_CONFIG_DIR="${GEOMATE_TMP_DIR}/config"       # Copy of the configuration the running sets were built from
 CHECK_INTERVAL=1800  # Interval in seconds (30 minutes) - used for geolocation status
+harvest_refresh_age=0  # A harvest refreshes list timestamps at least this many seconds old
 debug_level=0
 
 # Wrapper for nft commands with error logging
@@ -55,36 +56,42 @@ log_and_print() {
 }
 
 # Lock shared by the loop's harvest, the 'harvest' command and the live reload, so
-# they never rewrite the same IP list or set at once. mkdir is atomic; the directory
-# holds the owner's PID, and the lock of an owner that is gone is taken over
+# they never rewrite the same IP list or set at once. The lock is a symlink to the
+# owner's PID, which ln creates atomically; the lock of an owner that is gone is taken over
 acquire_sets_lock() {
     local owner waited=0
     mkdir -p "$GEOMATE_TMP_DIR"
-    until mkdir "$SETS_LOCK_DIR" 2>/dev/null; do
-        owner=$(cat "$SETS_LOCK_DIR/pid" 2>/dev/null)
+    until ln -snT "$$" "$SETS_LOCK" 2>/dev/null; do
+        owner=$(readlink "$SETS_LOCK" 2>/dev/null)
         if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
-            log_and_print "Taking over stale lock $SETS_LOCK_DIR of PID $owner" 1
-            rm -rf "$SETS_LOCK_DIR"
+            log_and_print "Taking over stale lock $SETS_LOCK of PID $owner" 1
+            rm -f "$SETS_LOCK"
             continue
         fi
-        [ "$waited" -eq 0 ] && log_and_print "Waiting for lock $SETS_LOCK_DIR held by PID ${owner:-?}" 2
+        [ "$waited" -eq 0 ] && log_and_print "Waiting for lock $SETS_LOCK held by PID ${owner:-?}" 2
         if [ "$waited" -ge 60 ]; then
-            log_and_print "Error: lock $SETS_LOCK_DIR still held by PID ${owner:-?} after 60 s" 0
+            log_and_print "Error: lock $SETS_LOCK still held by PID ${owner:-?} after 60 s" 0
             return 1
         fi
         sleep 1
         waited=$((waited + 1))
     done
-    echo "$$" > "$SETS_LOCK_DIR/pid"
 }
 
 release_sets_lock() {
-    rm -rf "$SETS_LOCK_DIR"
+    rm -f "$SETS_LOCK"
 }
 
-# Configuration as 'uci show' lines, with the section IDs that config_load uses
+# Copy the live configuration file into directory $1
+copy_config() {
+    mkdir -p "$1" && cp "${UCI_CONFIG_DIR:-/etc/config}/geomate" "$1/geomate"
+}
+
+# Configuration as 'uci show' lines, with the section IDs that config_load uses.
+# $1: configuration directory, default the live one
 show_config() {
-    uci ${UCI_CONFIG_DIR:+-c "$UCI_CONFIG_DIR"} -q -X show geomate
+    local dir="${1:-$UCI_CONFIG_DIR}"
+    uci ${dir:+-c "$dir"} -q -X show geomate
 }
 
 # Check if an IP is a valid public IP (not private/reserved)
@@ -479,7 +486,8 @@ create_dynamic_set() {
 # Merge the public IPs of a filter's _dynamic set into its ip_list. Shared by the loop
 # (process_dynamic_set) and the 'harvest' command; the caller holds the sets lock.
 # List lines are "IP", or "IP,<unix time>" with ip_expiry_days > 0: then a known IP
-# gets the current time. New IPs are appended. Sets harvest_added to their number
+# gets the current time once its time is harvest_refresh_age seconds old. New IPs are
+# appended. Sets harvest_added to their number
 harvest_dynamic_set() {
     local name ip_list expiry_days set_name elements
     harvest_added=0
@@ -524,24 +532,24 @@ harvest_dynamic_set() {
     # One pass over the list: refresh the timestamps of known IPs (expiry enabled),
     # append the new IPs in sorted order, count both
     [ -f "$ip_list" ] || old_list=/dev/null
-    awk -F, -v now="$(date +%s)" -v expiry="$expiry_days" -v counts="$counts_file" -v new_file="$new_file" '
+    awk -F, -v now="$(date +%s)" -v expiry="$expiry_days" -v min_age="$harvest_refresh_age" \
+        -v counts="$counts_file" -v new_file="$new_file" '
         FILENAME == ARGV[1] { harvested[$0] = 1; order[++n] = $0; next }
         $0 == "" { next }
         ($1 in harvested) {
             known[$1] = 1
-            if (expiry != "0") { print $1 "," now; next }
+            if (expiry != "0" && (min_age == 0 || now - $2 >= min_age)) { print $1 "," now; updated++; next }
         }
         { print }
         END {
             printf "" > new_file
             for (i = 1; i <= n; i++) {
-                if (order[i] in known) { updated++; continue }
+                if (order[i] in known) continue
                 if (expiry != "0") print order[i] "," now
                 else print order[i]
                 print order[i] > new_file
                 added++
             }
-            if (expiry == "0") updated = 0
             print added + 0, updated + 0 > counts
         }' "$public_file" "$old_list" > "$list_tmp" || {
         log_and_print "Error: failed to merge the dynamic set of $name into $ip_list" 0
@@ -599,8 +607,14 @@ update_dynamic_ips() {
 }
 
 # Harvest before a stop: merge every _dynamic set into its IP list so a restart loses
-# no collected IP. Leaves the sets, the geo data and the status file alone
+# no collected IP. Reads the configuration the sets were built from, so a renamed filter
+# still finds its set. Leaves the sets, the geo data and the status file alone
 harvest_all() {
+    local UCI_CONFIG_DIR="$UCI_CONFIG_DIR"
+    [ -f "$BUILT_CONFIG_DIR/geomate" ] && UCI_CONFIG_DIR="$BUILT_CONFIG_DIR"
+    # The loop refreshes timestamps every 30 minutes and expiry counts in days: a stop
+    # writes the list to flash for new IPs and for timestamps older than a day only
+    harvest_refresh_age=86400
     acquire_sets_lock || return 1
     config_load 'geomate'
     config_foreach harvest_dynamic_set 'geo_filter'
@@ -907,17 +921,27 @@ reload_filter_sets() {
     echo "Live reload of $name: $allowed_count allowed, $blocked_count blocked geolocated IPs" >> "${reload_batch}.log"
 }
 
+# config_foreach callback: print the set name prefix of an enabled filter
+print_enabled_set_name() {
+    local name enabled
+    config_get enabled "$1" 'enabled' '0'
+    [ "$enabled" = "0" ] && return 0
+    config_get name "$1" 'name'
+    echo "${NFT_SET_PREFIX}$(echo "$name" | tr ' ' '_')"
+}
+
 # Live reload (reload_service): when only allowed_region lists changed since the
-# configuration snapshot of the last start, refill the _allowed and _blocked sets of
+# configuration copy of the last start, refill the _allowed and _blocked sets of
 # the changed, enabled filters in one nft transaction. Rules, counters, _dynamic and
-# _ui_dynamic stay, so the collected IPs and the harvest timer survive.
-# Returns 1 when the service has to be restarted instead
+# _ui_dynamic stay, so the collected IPs and the harvest timer survive. The caller
+# removes the work directory. Returns 1 when the service has to be restarted instead
 reload_regions() {
-    local config_new="${GEOMATE_TMP_DIR}/config.new" changed line
-    reload_batch="${GEOMATE_TMP_DIR}/reload.nft"
+    local work="${GEOMATE_TMP_DIR}/reload" changed line
+    local UCI_CONFIG_DIR="$UCI_CONFIG_DIR"
+    reload_batch="${work}/batch.nft"
     reload_sections=""
 
-    if [ ! -f "$CONFIG_SNAPSHOT" ] || [ -f /tmp/geomate_loading ]; then
+    if [ ! -f "$BUILT_CONFIG_DIR/geomate" ] || [ -f /tmp/geomate_loading ]; then
         log_and_print "Live reload: no finished start to compare with, restarting" 1
         return 1
     fi
@@ -929,16 +953,21 @@ reload_regions() {
         log_and_print "Live reload: the last start had nft errors, restarting" 1
         return 1
     fi
-    show_config > "$config_new" || { log_and_print "Error: failed to read the configuration" 0; return 1; }
+    rm -rf "$work"
+    if ! copy_config "$work/config" || ! show_config "$work/config" > "$work/new.txt" || \
+        ! show_config "$BUILT_CONFIG_DIR" > "$work/old.txt"; then
+        log_and_print "Error: failed to read the configuration" 0
+        return 1
+    fi
 
-    # Lines that differ between the snapshot and the current configuration
+    # Lines that differ between the copy of the last start and the current configuration
     changed=$(awk 'FILENAME == ARGV[1] { old[$0] = 1; next }
         ($0 in old) { delete old[$0]; next }
         { print }
-        END { for (line in old) print line }' "$CONFIG_SNAPSHOT" "$config_new")
+        END { for (line in old) print line }' "$work/old.txt" "$work/new.txt")
     if [ -z "$changed" ]; then
-        log_and_print "Live reload: configuration unchanged, restarting" 1
-        return 1
+        log_and_print "Live reload: configuration unchanged" 1
+        return 0
     fi
 
     # Section IDs of the changed allowed_region lists; any other change needs a restart
@@ -951,9 +980,17 @@ reload_regions() {
         return 1
     }
 
+    # Read the copy, so the sets and the next comparison see the same configuration
+    UCI_CONFIG_DIR="$work/config"
+    config_load 'geomate'
+    # Filters whose names give the same set name share their sets at start
+    if [ -n "$(config_foreach print_enabled_set_name 'geo_filter' | sort | uniq -d)" ]; then
+        log_and_print "Live reload: enabled filters share a set name, restarting" 1
+        return 1
+    fi
+
     : > "$reload_batch"
     : > "${reload_batch}.log"
-    config_load 'geomate'
     config_foreach reload_filter_sets 'geo_filter'
 
     if [ -s "$reload_batch" ]; then
@@ -968,8 +1005,7 @@ reload_regions() {
         log_and_print "Live reload: only regions of disabled filters changed" 1
     fi
 
-    mv "$config_new" "$CONFIG_SNAPSHOT"
-    rm -f "$reload_batch" "${reload_batch}.log" "${reload_batch}.err"
+    mv "$work/config/geomate" "$BUILT_CONFIG_DIR/geomate"
 }
 
 # Verify the nftables rules to ensure they are set up correctly
@@ -1040,10 +1076,10 @@ run_geomate_trigger() {
 
 # Main function to run the service
 run() {
-    # The configuration the sets are built from; the live reload compares against it
-    local config_text
-    rm -f "$CONFIG_SNAPSHOT"
-    config_text=$(show_config)
+    # Copy of the configuration the sets are built from: the live reload compares
+    # against it, the stop harvest takes the set names from it
+    rm -rf "$BUILT_CONFIG_DIR" "${BUILT_CONFIG_DIR}.new"
+    copy_config "${BUILT_CONFIG_DIR}.new" || log_and_print "Error: failed to copy the configuration" 0
 
     load_config
     setup_geomate_d
@@ -1056,8 +1092,7 @@ run() {
     touch /tmp/geomate_loading
 
     setup_nftables_and_filters
-    printf '%s
-' "$config_text" > "$CONFIG_SNAPSHOT"
+    [ -f "${BUILT_CONFIG_DIR}.new/geomate" ] && mv "${BUILT_CONFIG_DIR}.new" "$BUILT_CONFIG_DIR"
 
     # Remove loading flag file
     log_and_print "Removing loading flag file at /tmp/geomate_loading" 1
@@ -1116,7 +1151,7 @@ run() {
 cleanup_nftables() {
     log_and_print "Cleaning up nftables rules..." 1
     nft delete table inet geomate 2>/dev/null
-    rm -f "$CONFIG_SNAPSHOT"
+    rm -rf "$BUILT_CONFIG_DIR"
     log_and_print "nftables rules cleaned up" 1
 }
 
@@ -1136,6 +1171,7 @@ case "$1" in
         acquire_sets_lock || exit 1
         reload_regions
         reload_status=$?
+        rm -rf "${GEOMATE_TMP_DIR}/reload"
         release_sets_lock
         exit "$reload_status"
         ;;
