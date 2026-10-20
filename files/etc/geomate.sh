@@ -19,6 +19,7 @@ NFT_ERROR_LOG="/tmp/geomate_nft_errors.log"
 NFT_SET_PREFIX="geomate_"
 SETS_LOCK="${GEOMATE_TMP_DIR}/sets.lock"           # Held while IP lists or sets are rewritten
 BUILT_CONFIG_DIR="${GEOMATE_TMP_DIR}/config"       # Copy of the configuration the running sets were built from
+UCI_PENDING_CHANGES="/tmp/.uci/geomate"            # Changes of uci set without commit, applied by every uci read
 CHECK_INTERVAL=1800  # Interval in seconds (30 minutes) - used for geolocation status
 harvest_refresh_per_day=0  # A harvest refreshes list timestamps this many seconds old per expiry day (0: all)
 debug_level=0
@@ -59,7 +60,8 @@ log_and_print() {
 # they never rewrite the same IP list or set at once. The lock is a symlink to the
 # owner's PID, which ln creates atomically. The lock of an owner that is gone is taken
 # over by one waiter only: mkdir of a claim named after that owner is atomic, and only
-# the claim holder removes a lock of that owner, so no waiter deletes a newer lock
+# the claim holder removes a lock of that owner, so no waiter deletes a newer lock.
+# A claim left by a process killed inside it is removed at the next service start
 acquire_sets_lock() {
     local owner claim took_over waited=0
     mkdir -p "$GEOMATE_TMP_DIR"
@@ -90,9 +92,15 @@ release_sets_lock() {
     rm -f "$SETS_LOCK"
 }
 
-# Copy the live configuration file into directory $1
+# Copy the live configuration file into directory $1, plus the pending uci changes
+# (as file "pending"), which config_load and show_config apply on top of it
 copy_config() {
-    mkdir -p "$1" && cp "${UCI_CONFIG_DIR:-/etc/config}/geomate" "$1/geomate"
+    mkdir -p "$1" && cp "${UCI_CONFIG_DIR:-/etc/config}/geomate" "$1/geomate" || return 1
+    if [ -f "$UCI_PENDING_CHANGES" ]; then
+        cp "$UCI_PENDING_CHANGES" "$1/pending"
+    else
+        : > "$1/pending"
+    fi
 }
 
 # Configuration as 'uci show' lines, with the section IDs that config_load uses.
@@ -974,6 +982,12 @@ reload_regions() {
         log_and_print "Error: failed to read the configuration" 0
         return 1
     fi
+    # show_config applies the current pending changes to both copies, but the sets
+    # were built with those of the start
+    if ! cmp -s "$work/config/pending" "$BUILT_CONFIG_DIR/pending"; then
+        log_and_print "Live reload: pending uci changes differ from the last start, restarting" 1
+        return 1
+    fi
 
     # Lines that differ between the copy of the last start and the current configuration
     changed=$(awk 'FILENAME == ARGV[1] { old[$0] = 1; next }
@@ -1094,6 +1108,8 @@ run() {
     # Copy of the configuration the sets are built from: the live reload compares
     # against it, the stop harvest takes the set names from it
     rm -rf "$BUILT_CONFIG_DIR" "${BUILT_CONFIG_DIR}.new"
+    # Takeover claims of a process killed while taking over a stale sets lock
+    rm -rf "${SETS_LOCK}.stale."*
     copy_config "${BUILT_CONFIG_DIR}.new" || log_and_print "Error: failed to copy the configuration" 0
 
     load_config
