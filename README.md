@@ -167,7 +167,7 @@ After installing Geomate and the LuCI interface:
 
 2. **Draw Your Region**
    - Go to the "View" tab
-   - Choose "New filter…" in the filter list above the map and click "Draw circle"
+   - Click "Draw circle" in the map toolbar and choose "New filter…" in the menu
    - Click on the map and drag to draw where you want to allow game connections
    - A dialog opens: name your filter (e.g., "Call of Duty"). More circles, editing and deleting are described in [Using the Map](#using-the-map)
 
@@ -181,7 +181,7 @@ After installing Geomate and the LuCI interface:
    - Enable and IP Expiry (Days) can stay at their defaults
 
 4. **Save & Let Geomate Learn**
-   - Click "Save" in the dialog, then "Save & Apply" in the page footer or on the pending-changes button above the map. Until Save & Apply, the circle is only staged in your LuCI session (see [Staged Changes and Save & Apply](#staged-changes-and-save--apply))
+   - Click "Save" in the dialog, then "Save & Apply" in the page footer. Until then, the circle is an unsaved change in your LuCI session (see [Unsaved Changes and Save & Apply](#unsaved-changes-and-save--apply))
    - Start with Dynamic or Monitor Mode to begin collecting server IPs
    - Play several matches to allow Geomate to collect and geolocate server IPs
    - The map will populate as IPs are discovered and geolocated
@@ -193,35 +193,37 @@ After installing Geomate and the LuCI interface:
 
 ## Using the Map
 
-The **View** tab (Services > Geomate) shows the map, the filter picker and the table of active connections. Regions are circles.
+The **View** tab (Services > Geomate) shows the service status, the map and, below it, the table of active connections. Regions are circles. The **Geo Filters** tab lists all filters (see [Geo Filters Page](#geo-filters-page)).
 
-### Staged Changes and Save & Apply
+### Unsaved Changes and Save & Apply
 
-Every change on the map (a new, moved, resized or deleted circle, a new filter, Enable filter) is only **staged** in your LuCI login session. A staged change does not touch `/etc/config/geomate`, and the Geomate service does not see it.
+Every change on the map (a new, moved, resized or deleted circle, a new filter, Enable) stays an unsaved change in your LuCI login session until you click **Save & Apply**. `/etc/config/geomate` and the Geomate service do not see it before.
 
-- A change takes effect after **Save & Apply**. Geomate then reloads and rebuilds its nftables rules.
-- Staged changes are lost when you log out or your LuCI session expires. Save & Apply before you leave the page.
-- The button above the map shows how many changes are pending ("2 changes pending · Save & Apply") and does the same as Save & Apply in the page footer.
-- The footer has no **Save** button on the map page, because the map stages each change itself. **Reset** opens a dialog when Geomate has staged changes: Revert then discards all staged changes of your session (like Revert in the "Unsaved Changes" dialog of LuCI) and reloads the page. Without staged Geomate changes, Reset only shows a notice.
+- LuCI's **Unsaved Changes** indicator in the header counts the changes. Circles of a filter with unsaved changes are drawn dashed.
+- **Save & Apply** (page footer, or the Unsaved Changes dialog) saves the changes. Geomate then reloads and rebuilds its nftables rules.
+- Unsaved changes are lost when you log out or your LuCI session expires. Save & Apply before you leave the page.
+- The footer has no **Save** button on this page, because the map keeps each change as you make it. **Reset** asks "Discard all unsaved changes and reload the page?". It discards the unsaved changes of all configurations, like Revert in the Unsaved Changes dialog of LuCI. Without unsaved Geomate changes, Reset shows "Geomate has no unsaved changes."
+- Without write access to the Geomate configuration, the map only shows the circles: **Draw circle** is hidden and circles cannot be selected.
 - Exception: **Upload IP List** in the new-filter dialog writes the list file to the router at once (it asks before it replaces an existing file). Cancel, Reset and a logout do not undo the upload. **Create Empty List** only fills in the path; the service creates the empty file at its next start, i.e. after Save & Apply.
 
 ### Drawing a Circle
 
-1. Pick a filter in the **Filter** list above the map. Disabled filters are marked "(disabled)". Pick **New filter…** to create a filter together with its first circle.
-2. Click **Draw circle**, then click on the map and drag. The radius shows next to the cursor while you drag. **Esc** cancels.
-3. Existing filter: the circle is added at once, without a dialog, and a message confirms that it is staged. If the filter is disabled, the circle filters nothing yet; use **Enable filter** (above the map, or in the message) to stage the enable flag.
-4. New filter: a dialog asks for the filter name and the filter options (Enable, Protocol, Source IP, Source Port, Destination Port, Allowed IPs, IP Expiry (Days), IP List File). The name may contain letters, digits, spaces, `_`, `.` and `-`. **Cancel** removes the circle. The **Geo Filters** page (link in the dialog) has the same options plus the region list.
+1. Click **Draw circle** in the map toolbar. The menu **Draw a circle for** lists your filters, each with its color, and **New filter…**. Disabled filters are marked "Disabled".
+2. Pick an entry, then click on the map and drag. The radius shows next to the cursor and in the bar on top of the map. **Esc** or **Cancel** stops drawing. A click without a drag draws nothing: the map says "Drag to draw a circle." and you can drag again.
+3. Existing filter: the circle is added at once, without a dialog. For a disabled filter, a message in the map says "Filter … is disabled." with an **Enable** button. Drawing never enables a filter, and a disabled filter filters nothing.
+4. New filter: a dialog asks for the filter name and the filter options (Enable, Protocol, Source IP, Source Port, Destination Port, Allowed IPs, IP Expiry (Days), IP List File). The name may contain letters, digits, spaces, `_`, `.` and `-`. **Cancel** removes the circle. The **Geo Filters** link in the dialog opens the page with the same options plus the region list.
 
-Each filter has its own color. Circles carry a label such as "BF6 · 683 km". A disabled filter is drawn dashed and faded and labelled "(disabled)". After a change, all circles of that filter are dashed and marked "pending" until Save & Apply; a newly drawn circle is marked "new" until the page has staged it.
+Each filter has its own color. The label of a circle shows the filter name; it is hidden on small circles. A disabled filter is drawn faded. The circles of a filter with unsaved changes are dashed, also when the filter is disabled. The legend shows the four states: Enabled, Disabled, Unsaved and Selected.
 
 ### Editing and Deleting a Circle
 
-- Click a circle to select it. Only one circle is selected at a time. A small circle is zoomed in first so that the handles fit.
+- Click a circle to select it. Only one circle is selected at a time. Where circles overlap, the click selects the smallest one; click again at the same spot to select the next larger one. A small circle is zoomed in first so that the handles fit.
 - Drag the **centre handle** to move the circle and the **edge handle** to resize it. A thin dashed ghost shows the old size, and the radius shows live next to the edge handle.
 - Or type the radius in km in the bar below the map. The circle follows at once.
-- **Done** (or a click on the empty map) stages the change. **Cancel** or **Esc** restores the circle as it was.
-- **Delete** asks once more ("Delete 'BF6 · 683 km'?"); only the **Yes** that follows stages the removal. Deleting one circle never deletes the filter.
-- The last circle of a filter opens a dialog. For an enabled filter, **Delete and disable filter** is preselected; the other choices are **Delete, keep filter enabled** and **Cancel**. A filter without a region puts no geolocated IP into its allowed or blocked set. With Strict Mode on (and not in Monitor Mode), an enabled filter without a region therefore blocks all its traffic except its allowed IPs; the dialog says which case applies. For a disabled filter, the dialog only asks to confirm.
+- **Done** (or a click on the empty map) keeps the change. **Cancel** or **Esc** restores the circle as it was.
+- **Delete** asks "Delete circle?". **Yes** removes the circle, **No** keeps it. Deleting one circle never deletes the filter.
+- The last circle of a filter opens the dialog "Delete the last circle of …?". For an enabled filter, **Delete and disable** is preselected; the other choices are **Delete** (the filter stays enabled) and **Cancel**. A filter without a region puts no geolocated IP into its allowed or blocked set. With Strict Mode on (and not in Monitor Mode), an enabled filter without a region therefore blocks all its traffic except its allowed IPs; the dialog says which case applies. For a disabled filter, the dialog only asks to confirm.
+- While a changed circle is selected, **Draw circle** and **Set home** ask you to click Done or Cancel first.
 
 ### Map Controls
 
@@ -230,16 +232,34 @@ Each filter has its own color. Circles carry a label such as "BF6 · 683 km". A 
 | Fit all | Zoom to all circles |
 | Home / Set home | Go to your home view. Set home stores the next click on the map, at the current zoom, as the home view (Esc cancels) |
 | Fullscreen | Show the map in the whole window; Esc or the same button leaves it |
-| Legend | Explains circles and connection markers and lists the filters with their circle count. The eye hides or shows the circles of a filter, the magnifier zooms to them. The switch **Dark map tiles** dims the map; it is off by default |
-| Active connections | Shows or hides the connections table below the map |
+| Legend | Lists the filters with their circle count, then the circle states (Enabled, Disabled, Unsaved, Selected) and the connection markers (Allowed, Blocked, Whitelisted). The eye hides or shows the circles of a filter, the magnifier zooms to them. The switch **Dark map tiles** dims the map; it is off by default |
 
-The legend is closed by default on phones and when the map is narrower than 900 px, until you open or close it yourself. The legend state, the dark tiles switch and the home view are stored in your browser, not on the router. The map follows the light or dark theme of LuCI. On a phone the buttons are larger and the map takes 60% of the screen height.
+The legend is closed by default on phones and when the map is narrower than 900 px, until you open or close it yourself. It also closes while you draw or edit a circle. The legend state, the dark tiles switch and the home view are stored in your browser, not on the router. The map follows the light or dark theme of LuCI. On a map narrower than 640 px the toolbar shows icons only. On a phone the buttons are larger and the map takes 60% of the screen height.
 
 ### Active Connections
 
-The table lists every tracked game server connection with IP, filter, status, country, city and ISP. Click a column header to sort. The data refreshes every 5 seconds while the tab is visible and pauses in a background tab. Status is Allowed, Allowed (Whitelist), Blocked, Untracked (not geolocated) or Unknown. The service status above the map refreshes every 10 seconds.
+Below the map, **Active connections** has its own **Show** / **Hide** button. The table stays hidden until you click Show, and the map gets shorter while it is shown. It lists every tracked game server connection with IP, Filter, Status, Country, City and ISP. Click a column header to sort. The data refreshes every 5 seconds while the tab is visible and pauses in a background tab. If it fails several times in a row, the status row above the map says so. Status is Whitelisted, Allowed, Blocked, Untracked (not geolocated) or Unknown. The service status above the map refreshes every 10 seconds.
 
-Country, city and ISP come from the geolocation data of the filter. They show "–" when no data is known for an IP yet, and after an update from an older version until the next service start or geolocation batch refreshes the lookup cache. Markers on the map use the same status colors. Click a marker for the details.
+Country, city and ISP come from the geolocation data of the filter. They show "–" when no data is known for an IP yet, and after an update from an older version until the next service start or geolocation batch refreshes the lookup cache. A connection with a known position also gets a marker on the map: green for Allowed, red for Blocked, blue for Whitelisted. Markers close together form a cluster with a count. Click a marker for the details.
+
+### Geo Filters Page
+
+The **Geo Filters** tab lists every filter with Enable, Name, Status, IPs/Located and Regions. Regions shows the number and radii of the circles, for example "2 circles · 436 km, 683 km", and a **Show on map** link that opens the View tab at that filter. The edit dialog has all filter options. Allowed Regions is easier to edit on the map. IPs/Located shows the IPs in the list and how many are located: "120 ✓" for all, "120 (60%)" for part of them, "120 (stale)" when the geo data holds IPs that left the list.
+
+The Status column shows what the running service does with the filter:
+
+| Status | Meaning |
+|--------|---------|
+| Active | Enabled, with regions and an IP list, nothing unsaved and no error |
+| Disabled | The filter is off |
+| Unsaved | The filter has unsaved changes. An enabled filter also shows it while the global Enable switch has an unsaved change |
+| No regions | An enabled filter has no valid circle |
+| No IP list | An enabled filter has no IP List File |
+| nftables error | The service reported an nftables error for the filter. See `/tmp/geomate_nft_errors.log` on the router |
+| Service off | Geomate is disabled in the global settings |
+| Region not a list | An enabled filter has `option allowed_region` instead of `list allowed_region`. The service start skips it and the map cannot show it |
+
+Several words can show together, for example "Unsaved, No IP list".
 
 ## Detailed Configuration
 
@@ -358,7 +378,7 @@ Finding the correct allowed IPs for games can involve some trial and error. Here
 #### Method 1: Using Monitor Mode (Recommended)
 1. Set Geomate to **Monitor Mode** in the LuCI interface
 2. Play your game normally - all connections will be tracked but not blocked
-3. Watch the Active connections table (or click a marker on the map) to see which servers your game connects to. The table is sortable and shows IP, status, country, city and ISP. To stop it from updating while you read, click the "Refreshing" indicator in the LuCI header (it changes to "Paused"); click it again to resume.
+3. Click "Show" next to Active connections below the map (or click a marker on the map) to see which servers your game connects to. The table is sortable and shows IP, status, country, city and ISP. To stop it from updating while you read, click the "Refreshing" indicator in the LuCI header (it changes to "Paused"); click it again to resume.
 4. The map will populate with server locations as they're discovered and geolocated
 5. Play multiple matches to build a comprehensive IP database
 6. Pay attention to patterns - which servers are used for matchmaking vs. actual gameplay
@@ -471,24 +491,24 @@ There are several ways to identify the correct ports and protocols for your game
 You can allow game connections from multiple geographic areas by creating several circles for the same geofilter. Here's how:
 
 1. **Create Your First Circle**
-   - Choose "New filter…" above the map, click "Draw circle" and drag on the map
+   - Click "Draw circle" in the map toolbar, choose "New filter…" and drag on the map
    - Enter a name for your geofilter (e.g., "COD" or "Fortnite")
    - Configure your settings in the dialog box
    - Click Save
 
 2. **Add More Circles to the Same Filter**
-   - Choose the filter (e.g., "COD") in the filter list above the map
-   - Click "Draw circle" and drag on the map again
+   - Click "Draw circle" and choose the filter (e.g., "COD") in the menu "Draw a circle for"
+   - Drag on the map again
    - The circle is added to that filter at once, without a dialog
    - Adjust or delete circles later as described in [Using the Map](#using-the-map)
 
 3. **Activate Your Changes**
-   - After adding all desired circles, click "Save & Apply". Until then, the changes are only staged in your LuCI session and are lost on logout
+   - After adding all desired circles, click "Save & Apply". Until then, the changes are unsaved in your LuCI session and are lost on logout
    - Your game can now connect to servers in all circled regions
 
 Example: If you want to play COD with friends from both Europe and USA:
-1. Choose "New filter…", draw a circle over Europe, name it "COD"
-2. Choose "COD" in the filter list, draw another circle over USA
+1. Click "Draw circle", choose "New filter…", draw a circle over Europe, name it "COD"
+2. Click "Draw circle", choose "COD", draw another circle over USA
 3. Click "Save & Apply" - Done!
 
 ## Troubleshooting
@@ -524,6 +544,7 @@ Example: If you want to play COD with friends from both Europe and USA:
      - Firewall rules not applied
    - Solutions:
      - Verify geo-filter is enabled
+     - Check the Status column of the filter on the Geo Filters page
      - Check protocol and port settings
      - Ensure service is running
      - Wait for firewall rules to apply after restart
