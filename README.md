@@ -195,7 +195,11 @@ After installing Geomate and the LuCI interface:
 
 The **View** tab (Services > Geomate) shows the service status, the map and, below it, the table of active connections. Regions are circles. The **Geo Filters** tab lists all filters (see [Geo Filters Page](#geo-filters-page)).
 
-The status row above the map shows a green or red dot with "Running" or "Not Running" ("Status unknown" when the router does not answer), the health checks (Config, Files, Data, Autostart, nftables, each with a mark: ✓ ok, ○ note, ⚠ warning, ✗ error; hover for the message), "Loading GeoFilter data ..." while the service loads its data, the operational mode and the installed versions with a note when an update is available. The status refreshes every 10 seconds. The update check runs when the page opens and then every hour.
+The status row above the map is a single line with a **Running** / **Not running** pill ("Status unknown" when the router does not answer), a pill with the operational mode (Dynamic, Static or Monitor), a summary of the health checks ("All checks passed", or the names of the checks with a warning or an error), "Loading GeoFilter data ..." while the service loads its data, the installed backend and frontend versions and the update state ("Up to date", "Update available", "Update check failed"). On narrow screens the row leaves out the versions and the update state. The status refreshes every 10 seconds.
+
+**Details** opens a panel with the service (and its PID), the mode, each check with its message (Config, Files, Data, Autostart, nftables, nft errors; ✓ ok, ○ note, ⚠ warning, ✗ error), the versions, the update state and a **Check again** button. The panel opens by itself when a problem appears, that is when the service is stopped although it is enabled or a check shows a warning or an error on two status refreshes in a row. It does not close by itself.
+
+The update check runs when the page opens and then every hour. GitHub allows 60 unauthenticated requests per hour, so the browser keeps the result for an hour (10 minutes after a failure) and the page reuses it until then. **Check again** asks GitHub right away.
 
 ### How Changes Take Effect
 
