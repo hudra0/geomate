@@ -256,8 +256,13 @@ stop_service() {
 
 reload_service() {
     # Only allowed_region lists changed: refill those filters' sets in place, without
-    # a restart. Anything else rebuilds everything
-    $cmd reload && return 0
+    # a restart. Anything else rebuilds everything, and so does a run loop that procd
+    # gave up on (it leaves the table behind), so a reload revives the service
+    if service_running 2>/dev/null; then
+        $cmd reload && return 0
+    else
+        log_and_print "Live reload: the run loop is not running, restarting"
+    fi
     stop
     start
 }
