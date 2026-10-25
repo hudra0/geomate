@@ -944,6 +944,11 @@ reload_filter_sets() {
     echo "Live reload of $name: $allowed_count allowed, $blocked_count blocked geolocated IPs" >> "${reload_batch}.log"
 }
 
+# Print configuration file $1 without its 'list allowed_region' lines
+strip_region_lists() {
+    sed '/^[[:space:]]*list[[:space:]][[:space:]]*allowed_region[[:space:]]/d' "$1"
+}
+
 # config_foreach callback: print the set name prefix of an enabled filter
 print_enabled_set_name() {
     local name enabled
@@ -986,6 +991,15 @@ reload_regions() {
     # were built with those of the start
     if ! cmp -s "$work/config/pending" "$BUILT_CONFIG_DIR/pending"; then
         log_and_print "Live reload: pending uci changes differ from the last start, restarting" 1
+        return 1
+    fi
+    # uci show prints a one-element list like an option, but the sets read only lists.
+    # Both copies come from the same uci writer, so any file change besides 'list
+    # allowed_region' lines (such as an option turned into a list) needs a restart
+    strip_region_lists "$BUILT_CONFIG_DIR/geomate" > "$work/old.conf"
+    strip_region_lists "$work/config/geomate" > "$work/new.conf"
+    if ! cmp -s "$work/old.conf" "$work/new.conf"; then
+        log_and_print "Live reload: configuration lines other than allowed_region lists changed, restarting" 1
         return 1
     fi
 
