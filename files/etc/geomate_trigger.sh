@@ -151,13 +151,22 @@ collect_new_ips() {
 update_last_processed_file() {
     local game_name="$1"
     local ip_list last_processed_file list_copy="${COLLECTED_LIST_PREFIX}${game_name}"
+    local tmp_file="${COLLECTED_LIST_PREFIX%/*}/last_processed.${game_name}"
     config_load 'geomate'
     config_foreach get_ip_list_for_game 'geo_filter' "$game_name"
     if [ -n "$ip_list" ] && [ -f "$ip_list" ]; then
         last_processed_file="${GEOMATE_RUNTIME_DIR}/${game_name}_last_processed"
-        # The list as check_new_ips saw it: only those IPs were queued
-        [ -f "$list_copy" ] || list_copy="$ip_list"
-        cp "$list_copy" "$last_processed_file"
+        if [ -f "$list_copy" ]; then
+            # The list as check_new_ips saw it (only those IPs were queued), minus the IPs
+            # that left the list since, such as by the expiry cleanup of a restart: one
+            # that comes back is queued again
+            awk -F, 'FILENAME == ARGV[1] { live[$1]; next } ($1 in live)' \
+                "$ip_list" "$list_copy" > "$tmp_file" &&
+                mv "$tmp_file" "$last_processed_file"
+            rm -f "$tmp_file"
+        else
+            cp "$ip_list" "$last_processed_file"
+        fi
     fi
 }
 
