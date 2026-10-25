@@ -249,7 +249,7 @@ The legend is closed by default on phones and when the map is narrower than 900 
 
 ### Active Connections
 
-Below the map, **Active connections (n)** has its own **Show** / **Hide** button. The table stays hidden until you click Show, and on wide screens the map gets shorter while it is shown. It lists every tracked game server connection with IP, Filter, Status, Country, City and ISP. Click a column header to sort. The data refreshes every 5 seconds while the tab is visible and pauses in a background tab. If it fails several times in a row, the status row above the map says "Connections not updated since …" or "Connections unavailable". Status is Whitelisted, Allowed, Blocked, Untracked (not geolocated) or Unknown.
+Below the map, the **Active connections (n)** bar shows or hides the table. Click anywhere on the bar; its right end reads **Show** or **Hide**. The table stays hidden until you open it, and on wide screens the map gets shorter while it is shown. It lists every tracked game server connection with IP, Filter, Status, Country, City and ISP. Click a column header to sort. The data refreshes every 5 seconds while the tab is visible and pauses in a background tab. If it fails several times in a row, the status row above the map says "Connections not updated since …" or "Connections unavailable". Status is Whitelisted, Allowed, Blocked, Untracked (not geolocated) or Unknown.
 
 Country, city and ISP come from the geolocation data of the filter. They show "–" when no data is known for an IP yet, and after an update from an older version until the next service start or geolocation batch refreshes the lookup cache. A connection with a known position also gets a marker on the map: green for Allowed, red for Blocked, blue for Whitelisted. Markers close together form a cluster with a count: green if all are allowed, red if all are blocked, blue if all are whitelisted, orange if mixed. Click a marker for the IP, status, filter, country, city and ISP (and the organization, when it differs from the ISP).
 
@@ -409,7 +409,7 @@ Finding the correct allowed IPs for games can involve some trial and error. Here
 #### Method 1: Using Monitor Mode (Recommended)
 1. Set Geomate to **Monitor Mode** in the LuCI interface
 2. Play your game normally - all connections will be tracked but not blocked
-3. Click "Show" next to Active connections below the map (or click a marker on the map) to see which servers your game connects to. The table is sortable and shows IP, status, country, city and ISP. To stop it from updating while you read, click the "Refreshing" indicator in the LuCI header (it changes to "Paused"); click it again to resume.
+3. Click the Active connections bar below the map (or click a marker on the map) to see which servers your game connects to. The table is sortable and shows IP, status, country, city and ISP. To stop it from updating while you read, click the "Refreshing" indicator in the LuCI header (it changes to "Paused"); click it again to resume.
 4. The map will populate with server locations as they're discovered and geolocated
 5. Play multiple matches to build a comprehensive IP database
 6. Pay attention to patterns - which servers are used for matchmaking vs. actual gameplay
