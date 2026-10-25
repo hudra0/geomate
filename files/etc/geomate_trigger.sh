@@ -133,7 +133,8 @@ collect_new_ips() {
     # Compare a copy of the list and keep it for update_last_processed_file: IPs that
     # reach the list later in this run (the harvest of a restart) stay unprocessed
     mkdir -p "${COLLECTED_LIST_PREFIX%/*}"
-    cp "$ip_list" "$list_copy" || list_copy="$ip_list"
+    # A failed copy may be partial: remove it so update_last_processed_file uses the list too
+    cp "$ip_list" "$list_copy" || { rm -f "$list_copy"; list_copy="$ip_list"; }
 
     # Lines are "IP" or "IP,timestamp": compare and queue the IP part only, so a
     # refreshed timestamp does not queue a known IP again
