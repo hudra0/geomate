@@ -17,6 +17,7 @@ GEOMATE_DATA_DIR="/etc/geomate.d"
 GEOMATE_RUNTIME_DIR="${GEOMATE_DATA_DIR}/runtime"
 LAST_RUN_FILE="${GEOMATE_RUNTIME_DIR}/last_geolocate_run"
 NEW_IPS_FILE="${GEOMATE_RUNTIME_DIR}/new_ips.txt"
+COLLECTED_LIST_PREFIX="/tmp/geomate/collected_list."  # + filter name: list copies of check_new_ips for this run
 MIN_GEOLOCATE_INTERVAL=1800  # Minimum interval in seconds (30 minutes)
 MAX_GEOLOCATE_INTERVAL=3600  # Maximum interval in seconds (1 hour)
 RATE_LIMIT=15  # Maximum number of API calls per minute
@@ -118,21 +119,28 @@ check_new_ips() {
 
 # Collects new IPs from the configuration (only valid public IPs)
 collect_new_ips() {
-    local name ip_list last_processed_file
+    local name ip_list last_processed_file list_copy
     config_get name "$1" 'name'
     config_get ip_list "$1" 'ip_list'
     last_processed_file="${GEOMATE_RUNTIME_DIR}/${name}_last_processed"
+    list_copy="${COLLECTED_LIST_PREFIX}${name}"
 
+    rm -f "$list_copy"
     [ -f "$ip_list" ] || return 0
     # Without a last processed copy every IP in the list is new
     [ -f "$last_processed_file" ] || last_processed_file=/dev/null
+
+    # Compare a copy of the list and keep it for update_last_processed_file: IPs that
+    # reach the list later in this run (the harvest of a restart) stay unprocessed
+    mkdir -p "${COLLECTED_LIST_PREFIX%/*}"
+    cp "$ip_list" "$list_copy" || list_copy="$ip_list"
 
     # Lines are "IP" or "IP,timestamp": compare and queue the IP part only, so a
     # refreshed timestamp does not queue a known IP again
     awk -F, -v old="$last_processed_file" '
         FILENAME == old { seen[$1]; next }
         $1 != "" && !($1 in seen) { print $1 }
-    ' "$last_processed_file" "$ip_list" | while read -r ip; do
+    ' "$last_processed_file" "$list_copy" | while read -r ip; do
         # Skip private/invalid IPs
         is_valid_public_ip "$ip" && echo "$name|$ip" >> "$NEW_IPS_FILE"
     done
@@ -141,12 +149,14 @@ collect_new_ips() {
 # Updates the last processed file for a specific filter
 update_last_processed_file() {
     local game_name="$1"
-    local ip_list last_processed_file
+    local ip_list last_processed_file list_copy="${COLLECTED_LIST_PREFIX}${game_name}"
     config_load 'geomate'
     config_foreach get_ip_list_for_game 'geo_filter' "$game_name"
     if [ -n "$ip_list" ] && [ -f "$ip_list" ]; then
         last_processed_file="${GEOMATE_RUNTIME_DIR}/${game_name}_last_processed"
-        cp "$ip_list" "$last_processed_file"
+        # The list as check_new_ips saw it: only those IPs were queued
+        [ -f "$list_copy" ] || list_copy="$ip_list"
+        cp "$list_copy" "$last_processed_file"
     fi
 }
 
@@ -218,3 +228,4 @@ process_batch_specific_ips() {
 
 # Execute the main function
 check_and_run_geolocate
+rm -f "$COLLECTED_LIST_PREFIX"*
