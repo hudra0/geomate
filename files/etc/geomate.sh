@@ -944,9 +944,9 @@ reload_filter_sets() {
     echo "Live reload of $name: $allowed_count allowed, $blocked_count blocked geolocated IPs" >> "${reload_batch}.log"
 }
 
-# Print configuration file $1 without its 'list allowed_region' lines
-strip_region_lists() {
-    sed '/^[[:space:]]*list[[:space:]][[:space:]]*allowed_region[[:space:]]/d' "$1"
+# Print configuration file $1 without its 'list allowed_region' and 'list allowed_ip' lines
+strip_reloadable_lists() {
+    sed '/^[[:space:]]*list[[:space:]][[:space:]]*allowed_\(region\|ip\)[[:space:]]/d' "$1"
 }
 
 # config_foreach callback: print the set name prefix of an enabled filter
@@ -958,8 +958,8 @@ print_enabled_set_name() {
     echo "${NFT_SET_PREFIX}$(echo "$name" | tr ' ' '_')"
 }
 
-# Live reload (reload_service): when only allowed_region lists changed since the
-# configuration copy of the last start, refill the _allowed and _blocked sets of
+# Live reload (reload_service): when only allowed_region or allowed_ip lists changed since
+# the configuration copy of the last start, refill the _allowed and _blocked sets of
 # the changed, enabled filters in one nft transaction. Rules, counters, _dynamic and
 # _ui_dynamic stay, so the collected IPs and the harvest timer survive. The caller
 # removes the work directory. Returns 1 when the service has to be restarted instead
@@ -995,11 +995,12 @@ reload_regions() {
     fi
     # uci show prints a one-element list like an option, but the sets read only lists.
     # Both copies come from the same uci writer, so any file change besides 'list
-    # allowed_region' lines (such as an option turned into a list) needs a restart
-    strip_region_lists "$BUILT_CONFIG_DIR/geomate" > "$work/old.conf"
-    strip_region_lists "$work/config/geomate" > "$work/new.conf"
+    # allowed_region' and 'list allowed_ip' lines (such as an option turned into a list)
+    # needs a restart
+    strip_reloadable_lists "$BUILT_CONFIG_DIR/geomate" > "$work/old.conf"
+    strip_reloadable_lists "$work/config/geomate" > "$work/new.conf"
     if ! cmp -s "$work/old.conf" "$work/new.conf"; then
-        log_and_print "Live reload: configuration lines other than allowed_region lists changed, restarting" 1
+        log_and_print "Live reload: configuration lines other than allowed_region and allowed_ip lists changed, restarting" 1
         return 1
     fi
 
@@ -1013,13 +1014,14 @@ reload_regions() {
         return 0
     fi
 
-    # Section IDs of the changed allowed_region lists; any other change needs a restart
+    # Section IDs of the changed allowed_region and allowed_ip lists; any other change
+    # needs a restart
     reload_sections=$(printf '%s\n' "$changed" | awk '
         { key = substr($0, 1, index($0, "=") - 1) }
-        key !~ /^geomate\.[A-Za-z0-9_]+\.allowed_region$/ { bad = 1; exit }
+        key !~ /^geomate\.[A-Za-z0-9_]+\.allowed_(region|ip)$/ { bad = 1; exit }
         { split(key, part, "."); if (!(part[2] in seen)) { seen[part[2]] = 1; printf " %s", part[2] } }
         END { if (bad) exit 1; print " " }') || {
-        log_and_print "Live reload: options other than allowed_region changed, restarting" 1
+        log_and_print "Live reload: options other than allowed_region and allowed_ip changed, restarting" 1
         return 1
     }
 
@@ -1045,7 +1047,7 @@ reload_regions() {
             log_and_print "$line" 1
         done < "${reload_batch}.log"
     else
-        log_and_print "Live reload: only regions of disabled filters changed" 1
+        log_and_print "Live reload: only regions or allowed IPs of disabled filters changed" 1
     fi
 
     mv "$work/config/geomate" "$BUILT_CONFIG_DIR/geomate"
