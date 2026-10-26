@@ -190,6 +190,8 @@ create_empty_ip_list() {
     config_get name "$1" 'name'
     config_get ip_list "$1" 'ip_list'
 
+    [ -n "$ip_list" ] || { log_and_print "Filter $name has no ip_list configured, skipping IP list creation" 1; return 0; }
+
     if [ ! -f "$ip_list" ]; then
         log_and_print "Creating empty IP list file for $name: $ip_list" 2
         touch "$ip_list"
@@ -445,6 +447,7 @@ process_dynamic_set() {
     config_get name "$1" 'name'
     config_get ip_list "$1" 'ip_list'
     config_get expiry_days "$1" 'ip_expiry_days' '0'
+    [ -n "$ip_list" ] || { log_and_print "Filter $name has no ip_list configured, skipping harvest" 2; return 0; }
     local set_name="${NFT_SET_PREFIX}$(echo "$name" | tr ' ' '_')"
 
     log_and_print "Processing dynamic set for $name" 2
