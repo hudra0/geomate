@@ -157,8 +157,11 @@ After installing Geomate and the LuCI interface:
 
 | Option | Description | Values | Default |
 |--------|-------------|---------|---------|
+| src_ip | Source IP: the devices the filter applies to. One IPv4 address, a subnet (`192.168.1.0/24`) or a range (`192.168.1.10-192.168.1.20`), or several of them separated by spaces (a `list src_ip` works too). `!` or `!=` before an entry leaves it out: `192.168.1.0/24 !192.168.1.5`. Several entries and `!` need a backend whose `/etc/geomate.sh capabilities` prints `src_ip_multi`. If one entry is invalid, the filter gets no rules at all and shows "nftables error" | IPv4 entries | empty (all devices) |
 | ip_list | Path of the IP list file (e.g. `/etc/geomate.d/cod_servers.txt`). Required for geographic filtering: its entries are geolocated in every mode; dynamic and monitor mode also collect new server IPs into it, static mode only uses what it contains. Without it the filter geolocates no IPs and relies on `allowed_ip` entries | File path | none |
 | ip_expiry_days | Automatically remove IPs not seen for this many days | 0 (disabled), or number of days | 0 |
+
+Source IP with several entries or `!` is new. An older backend could not build rules from such a value: the filter did nothing and showed "nftables error". After the update the same value filters, and with Strict Mode on it also drops. A value with exceptions only, such as `!192.168.1.5`, applies to every other address, like an empty field: it also matches packets that come in from the internet. Geomate logs "Source IP of <filter> has exceptions only" at every start for such a filter. Going back to an older backend turns these filters off again, with an nftables error.
 
 ## Quick Start Guide
 
@@ -174,7 +177,7 @@ After installing Geomate and the LuCI interface:
 3. **Configure Your Filter**
    - The dialog after drawing has the same options as the "Geo Filters" page, except the region list. The most important ones:
    - Protocol: Usually UDP for games
-   - Source IP: Your console/PC IP (e.g., 192.168.1.208)
+   - Source IP: Your console/PC IP (e.g., 192.168.1.208). Several devices are separated by spaces, and `!` leaves one out (see `src_ip` in [Per-Filter Options](#per-filter-options))
    - Source Port / Destination Port: Use known values (e.g., 3074 for CoD) or see [Finding Game Ports and Protocols](#finding-game-ports-and-protocols)
    - Allowed IPs: Essential IPs for matchmaking/authentication, the whitelist (see [Allowed IPs Explained](#allowed-ips-explained))
    - IP List File: Either use an existing list or create an empty one (see [Understanding IP Lists](#understanding-ip-lists-and-allowed-ips))
@@ -208,7 +211,7 @@ The map applies every change at once: a new, moved, resized or deleted circle, a
 - After each change the map shows "Applied." with an **Undo** button for 10 seconds. Undo writes back the values the change replaced and applies that. It works for the last change only, and not when the filter was changed since. Undoing the creation of a filter deletes the filter.
 - A change of circles or allowed IPs only: Geomate refills the allowed and blocked sets of the changed filter in place, without a restart. The rules, the counters and the IPs collected since the last save stay. Changing the circles or allowed IPs of a disabled filter needs nothing at all.
 - Any other change (a new filter, Enable, any other option) restarts Geomate. It rebuilds all nftables rules, and filtering is bypassed for a short time. The IPs collected so far are saved to the IP lists before every stop.
-- A change of circles or allowed IPs restarts Geomate too when a start has not finished yet, when the last start had nftables errors, or when the names of two enabled filters differ only in spaces and underscores. If the run loop has stopped, for example after repeated crashes, every change restarts Geomate and so starts it again.
+- A change of circles or allowed IPs restarts Geomate too when a start has not finished yet, when the last start had nftables errors (an invalid Source IP counts as one), or when the names of two enabled filters differ only in spaces and underscores. If the run loop has stopped, for example after repeated crashes, every change restarts Geomate and so starts it again.
 - Geomate also compares the configuration file without its region and allowed IP lists with the file it started from. The first change of circles or allowed IPs after a hand edit of `/etc/config/geomate` therefore usually restarts Geomate once, because uci rewrites the whole file in its own format. The same happens on the first circle change of a filter whose regions are written as `option allowed_region` instead of `list allowed_region`, and on the first allowed IP change of a filter with `option allowed_ip` instead of `list allowed_ip`. Geomate reads regions only as `list allowed_region`: at start, on a live reload and when it collects new IPs, it ignores a hand-written `option allowed_region`. The first save of a filter's edit dialog on the Geo Filters page can also restart Geomate once, when it fills in a missing default such as IP Expiry (Days).
 - An older backend restarts Geomate for allowed IP changes too, and an even older one for every change, circles included. `/etc/init.d/geomate update` updates backend and web interface together.
 - If your LuCI session holds unsaved Geomate changes, for example from the Geo Filters page, the map refuses every change: a new circle disappears, an edit goes back, and the map says "Apply or revert the unsaved geomate changes first." Applying would also apply those changes unseen. The page shows the notice "Apply or revert the unsaved geomate changes before you change the map." with a **Show changes** button, which opens LuCI's Unsaved Changes dialog, where you apply or revert them. The notice also shows when you open the View tab with unsaved Geomate changes.
@@ -288,7 +291,7 @@ The Status column shows the state of each filter in the configuration:
 | Unsaved | The filter has unsaved changes. An enabled filter also shows it while the global Enable switch has an unsaved change |
 | No regions | An enabled filter has no valid circle |
 | No IP list | An enabled filter has no IP List File |
-| nftables error | The service reported an nftables error for the filter. See `/tmp/geomate_nft_errors.log` on the router |
+| nftables error | The service reported an nftables error for the filter, or its Source IP is invalid. See `/tmp/geomate_nft_errors.log` on the router |
 | Service off | Geomate is disabled in the global settings |
 | Region not a list | An enabled filter has `option allowed_region` instead of `list allowed_region`. The service start, the live reload and the collection of new IPs skip it, and the map cannot show it |
 
@@ -637,6 +640,11 @@ Example: If you want to play COD with friends from both Europe and USA:
 4. **Check nftables Rules**
    - Use 'nft list table inet geomate' to view current rules
    - Check for any unexpected rules or mislocated ips
+
+5. **Backend Capabilities**
+   - `/etc/geomate.sh capabilities` prints the features of the installed backend as one line of words and exits with 0. It reads no configuration and changes nothing
+   - Today it prints `src_ip_multi`: Source IP accepts several entries and exceptions with `!`
+   - Words are only added, never renamed or removed, so the web interface and scripts can rely on them. An older backend prints its usage and exits with 1, which means no capabilities
 
 ## FAQ
 

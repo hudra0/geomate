@@ -307,6 +307,91 @@ append_allowed_region() {
     allowed_regions="$allowed_regions $1"
 }
 
+# Return 0 when $1 is a dotted IPv4 address: four decimal octets 0-255, no leading zeros
+is_ipv4_addr() {
+    local IFS=. octet
+    case "$1" in
+        *[!0-9.]*|.*|*.|*..*) return 1 ;;
+    esac
+    set -- $1
+    [ $# -eq 4 ] || return 1
+    for octet in "$@"; do
+        case "$octet" in
+            [0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5]) ;;
+            *) return 1 ;;
+        esac
+    done
+}
+
+# Build the nft match for the Source IP of a filter into the global src_match, shared
+# by the forward and the prerouting rules. $1: the src_ip value, entries separated by
+# whitespace (config_get joins a 'list src_ip' with spaces).
+#   empty: src_match='' (all devices)
+#   one entry without '!': 'ip saddr <entry>', passed to nft unchecked as before
+#   otherwise every entry, after an optional '!=' or '!' (exception), must be an IPv4
+#   address, a.b.c.d/0-32 or a.b.c.d-e.f.g.h. Duplicates are dropped. Like qosmate's
+#   gen_rule: 'ip saddr != <exceptions>' first, then 'ip saddr <entries>'; one value
+#   without braces, several as '{ a, b }'
+# Sets src_exceptions_only to 1 when the value has exceptions only, else 0.
+# Returns 1 for an invalid value: the caller then adds no rules for the filter
+build_src_match() {
+    local entry addr pos="" neg="" glob_off=0
+    src_match=""
+    src_exceptions_only=0
+    [ -n "$1" ] || return 0
+
+    # Split at whitespace without expanding wildcards, then restore the -f state
+    case "$-" in *f*) glob_off=1 ;; esac
+    set -f
+    set -- $1
+    [ "$glob_off" -eq 1 ] || set +f
+
+    # Whitespace only: nft rejected it before, so it stays a filter without rules
+    [ $# -gt 0 ] || return 1
+    if [ $# -eq 1 ]; then
+        case "$1" in
+            '!'*) ;;
+            *) src_match="ip saddr $1"; return 0 ;;
+        esac
+    fi
+
+    for entry in "$@"; do
+        case "$entry" in
+            '!='*) addr="${entry#!=}" ;;
+            '!'*) addr="${entry#!}" ;;
+            *) addr="$entry" ;;
+        esac
+        case "$addr" in
+            */*)
+                is_ipv4_addr "${addr%/*}" || return 1
+                case "${addr#*/}" in
+                    [0-9]|[12][0-9]|3[0-2]) ;;
+                    *) return 1 ;;
+                esac
+                ;;
+            *-*) is_ipv4_addr "${addr%-*}" && is_ipv4_addr "${addr#*-}" || return 1 ;;
+            *) is_ipv4_addr "$addr" || return 1 ;;
+        esac
+        if [ "$addr" = "$entry" ]; then
+            case "$pos " in *" $addr "*) ;; *) pos="$pos $addr" ;; esac
+        else
+            case "$neg " in *" $addr "*) ;; *) neg="$neg $addr" ;; esac
+        fi
+    done
+
+    pos="${pos# }"
+    neg="${neg# }"
+    case "$neg" in *' '*) neg="{ ${neg// /, } }" ;; esac
+    case "$pos" in *' '*) pos="{ ${pos// /, } }" ;; esac
+    [ -n "$neg" ] && src_match="ip saddr != $neg"
+    if [ -n "$pos" ]; then
+        src_match="${src_match:+$src_match }ip saddr $pos"
+    else
+        src_exceptions_only=1
+    fi
+    return 0
+}
+
 # Set up a geo filter based on configuration
 setup_geo_filter() {
     local name protocol src_ip src_port dest_port enabled blocked_ips
@@ -354,9 +439,17 @@ setup_geo_filter() {
         process_geo_data "$name" "${set_name}_allowed" "${set_name}_blocked" "$allowed_regions"
     fi
 
-    # Add rules for allowed and blocked IPs
-    local base_rule=""
-    [ -n "$src_ip" ] && base_rule="ip saddr $src_ip"
+    # Add rules for allowed and blocked IPs. An invalid Source IP adds no rules, as nft
+    # rejected such values before: dropping only the bad entries could match more devices
+    if ! build_src_match "$src_ip"; then
+        log_and_print "Error: invalid Source IP '$src_ip' of filter $name: no rules added" 0
+        printf '[%s] Invalid Source IP '\''%s'\'' of filter %s: no rules for @%s_allowed\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S')" "$src_ip" "$name" "$set_name" >> "$NFT_ERROR_LOG"
+        return 0
+    fi
+    [ "$src_exceptions_only" -eq 1 ] && \
+        log_and_print "Source IP of $name has exceptions only: the filter applies to all other devices" 0
+    local base_rule="$src_match"
     [ -n "$protocol" ] && base_rule="$base_rule $protocol"
 
     # Include src_port in the rule if set
@@ -446,9 +539,9 @@ create_dynamic_set() {
         nft_exec add set inet geomate "${set_name}_dynamic" { type ipv4_addr\; flags dynamic,timeout\; timeout 1h\; }
     fi
 
-    # Create the base rule
-    local base_rule=""
-    [ -n "$src_ip" ] && base_rule="ip saddr $src_ip"
+    # Create the base rule. setup_geo_filter has reported an invalid Source IP already
+    build_src_match "$src_ip" || return 0
+    local base_rule="$src_match"
     [ -n "$protocol" ] && base_rule="$base_rule $protocol"
 
     # Include src_port in the rule if set
@@ -1224,11 +1317,19 @@ case "$1" in
         release_sets_lock
         exit "$reload_status"
         ;;
+    capabilities)
+        # Stable contract for the web interface: one line of space-separated feature
+        # tokens. Tokens are only added, never renamed or removed. Reads no
+        # configuration, takes no lock and writes nothing. An older geomate.sh prints
+        # the usage and exits 1, which means no capabilities.
+        # src_ip_multi: Source IP accepts several entries and exceptions with ! or !=
+        printf '%s\n' 'src_ip_multi'
+        ;;
     run)
         run
         ;;
     *)
-        echo "Usage: $0 {run|cleanup|harvest|reload}"
+        echo "Usage: $0 {run|cleanup|harvest|reload|capabilities}"
         exit 1
 esac
 
