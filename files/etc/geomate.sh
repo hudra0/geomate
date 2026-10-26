@@ -323,35 +323,51 @@ is_ipv4_addr() {
     done
 }
 
+# Return 0 when $1 is an IPv4 address, a.b.c.d/0-32 or a.b.c.d-e.f.g.h
+is_ipv4_entry() {
+    case "$1" in
+        */*)
+            case "${1#*/}" in
+                [0-9]|[12][0-9]|3[0-2]) is_ipv4_addr "${1%/*}" ;;
+                *) return 1 ;;
+            esac
+            ;;
+        *-*) is_ipv4_addr "${1%-*}" && is_ipv4_addr "${1#*-}" ;;
+        *) is_ipv4_addr "$1" ;;
+    esac
+}
+
 # Build the nft match for the Source IP of a filter into the global src_match, shared
 # by the forward and the prerouting rules. $1: the src_ip value, entries separated by
 # whitespace (config_get joins a 'list src_ip' with spaces).
 #   empty: src_match='' (all devices)
-#   one entry without '!': 'ip saddr <entry>', passed to nft unchecked as before
+#   one entry without '!', or whitespace only: 'ip saddr <value>', passed to nft
+#   unchecked as before
 #   otherwise every entry, after an optional '!=' or '!' (exception), must be an IPv4
 #   address, a.b.c.d/0-32 or a.b.c.d-e.f.g.h. Duplicates are dropped. Like qosmate's
 #   gen_rule: 'ip saddr != <exceptions>' first, then 'ip saddr <entries>'; one value
 #   without braces, several as '{ a, b }'
+#   any other value, such as nft's own '!= a.b.c.d' or '{ a, b }': 'ip saddr <value>'
+#   unchecked as before, so nft decides. Dropping only the bad entries could match
+#   more devices; a value nft rejects leaves the filter without rules
 # Sets src_exceptions_only to 1 when the value has exceptions only, else 0.
-# Returns 1 for an invalid value: the caller then adds no rules for the filter
+# Returns 1 when a value with several entries or '!' was passed to nft unchecked
 build_src_match() {
-    local entry addr pos="" neg="" glob_off=0
+    local value="$1" entry addr pos="" neg="" glob_off=0
     src_match=""
     src_exceptions_only=0
-    [ -n "$1" ] || return 0
+    [ -n "$value" ] || return 0
 
     # Split at whitespace without expanding wildcards, then restore the -f state
     case "$-" in *f*) glob_off=1 ;; esac
     set -f
-    set -- $1
+    set -- $value
     [ "$glob_off" -eq 1 ] || set +f
 
-    # Whitespace only: nft rejected it before, so it stays a filter without rules
-    [ $# -gt 0 ] || return 1
-    if [ $# -eq 1 ]; then
+    if [ $# -le 1 ]; then
         case "$1" in
             '!'*) ;;
-            *) src_match="ip saddr $1"; return 0 ;;
+            *) src_match="ip saddr $value"; return 0 ;;
         esac
     fi
 
@@ -361,17 +377,7 @@ build_src_match() {
             '!'*) addr="${entry#!}" ;;
             *) addr="$entry" ;;
         esac
-        case "$addr" in
-            */*)
-                is_ipv4_addr "${addr%/*}" || return 1
-                case "${addr#*/}" in
-                    [0-9]|[12][0-9]|3[0-2]) ;;
-                    *) return 1 ;;
-                esac
-                ;;
-            *-*) is_ipv4_addr "${addr%-*}" && is_ipv4_addr "${addr#*-}" || return 1 ;;
-            *) is_ipv4_addr "$addr" || return 1 ;;
-        esac
+        is_ipv4_entry "$addr" || { src_match="ip saddr $value"; return 1; }
         if [ "$addr" = "$entry" ]; then
             case "$pos " in *" $addr "*) ;; *) pos="$pos $addr" ;; esac
         else
@@ -439,14 +445,10 @@ setup_geo_filter() {
         process_geo_data "$name" "${set_name}_allowed" "${set_name}_blocked" "$allowed_regions"
     fi
 
-    # Add rules for allowed and blocked IPs. An invalid Source IP adds no rules, as nft
-    # rejected such values before: dropping only the bad entries could match more devices
-    if ! build_src_match "$src_ip"; then
-        log_and_print "Error: invalid Source IP '$src_ip' of filter $name: no rules added" 0
-        printf '[%s] Invalid Source IP '\''%s'\'' of filter %s: no rules for @%s_allowed\n' \
-            "$(date '+%Y-%m-%d %H:%M:%S')" "$src_ip" "$name" "$set_name" >> "$NFT_ERROR_LOG"
-        return 0
-    fi
+    # Add rules for allowed and blocked IPs. If nft rejects the Source IP, nft_exec logs
+    # it with @<set>_allowed and the filter gets no rules, as before
+    build_src_match "$src_ip" || \
+        log_and_print "Source IP '$src_ip' of filter $name is not a list of IPv4 entries: passed to nft unchanged" 1
     [ "$src_exceptions_only" -eq 1 ] && \
         log_and_print "Source IP of $name has exceptions only: the filter applies to all other devices" 0
     local base_rule="$src_match"
@@ -539,8 +541,8 @@ create_dynamic_set() {
         nft_exec add set inet geomate "${set_name}_dynamic" { type ipv4_addr\; flags dynamic,timeout\; timeout 1h\; }
     fi
 
-    # Create the base rule. setup_geo_filter has reported an invalid Source IP already
-    build_src_match "$src_ip" || return 0
+    # Create the base rule. setup_geo_filter has logged an unchecked Source IP already
+    build_src_match "$src_ip"
     local base_rule="$src_match"
     [ -n "$protocol" ] && base_rule="$base_rule $protocol"
 
