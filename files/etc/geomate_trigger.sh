@@ -110,22 +110,33 @@ check_and_run_geolocate() {
 
 # Checks for new IPs and logs the information
 check_new_ips() {
+    local enabled_filters="|"  # "|name|name|": set by collect_new_ips
     touch "$NEW_IPS_FILE"
     config_load 'geomate'
     config_foreach collect_new_ips 'geo_filter'
+    drop_queued_ips_of_skipped_filters "$enabled_filters"
     log_and_print "New IPs file content:" 2
     log_and_print "$(cat "$NEW_IPS_FILE")" 2
 }
 
 # Collects new IPs from the configuration (only valid public IPs)
 collect_new_ips() {
-    local name ip_list last_processed_file list_copy
+    local name ip_list last_processed_file list_copy enabled
     config_get name "$1" 'name'
     config_get ip_list "$1" 'ip_list'
+    config_get enabled "$1" 'enabled' '0'
     last_processed_file="${GEOMATE_RUNTIME_DIR}/${name}_last_processed"
     list_copy="${COLLECTED_LIST_PREFIX}${name}"
 
     rm -f "$list_copy"
+    # A disabled filter has no nft sets (geomate.sh builds them unless enabled is '0'):
+    # skip it and keep its last processed copy, so enabling it queues every IP the list
+    # gained meanwhile
+    if [ "$enabled" = "0" ]; then
+        log_and_print "Geomate_Trigger: Skipping disabled filter $name" 2
+        return 0
+    fi
+    enabled_filters="${enabled_filters}${name}|"
     [ -f "$ip_list" ] || return 0
     # Without a last processed copy every IP in the list is new
     [ -f "$last_processed_file" ] || last_processed_file=/dev/null
@@ -145,6 +156,26 @@ collect_new_ips() {
         # Skip private/invalid IPs
         is_valid_public_ip "$ip" && echo "$name|$ip" >> "$NEW_IPS_FILE"
     done
+}
+
+# Drops queued IPs of filters that are disabled or gone, so they neither use API budget
+# nor stay in the queue. A disabled filter's last processed copy stays as it was: enabling
+# the filter queues the IPs its list gained meanwhile, the daily full run covers the rest.
+# $1: the enabled filter names as "|name|name|" ("|" when none is enabled)
+drop_queued_ips_of_skipped_filters() {
+    local keep="$1" tmp_file="${COLLECTED_LIST_PREFIX%/*}/new_ips.txt"
+    [ -n "$keep" ] || return 0
+    mkdir -p "${tmp_file%/*}"
+    # awk exits 1 when it dropped nothing: then the queue on flash stays untouched
+    awk -F'|' -v keep="$keep" '
+        index(keep, "|" $1 "|") { print; next }
+        { dropped++ }
+        END { exit !dropped }
+    ' "$NEW_IPS_FILE" > "$tmp_file" && {
+        log_and_print "Geomate_Trigger: Dropped queued IPs of disabled or removed filters" 2
+        mv "$tmp_file" "$NEW_IPS_FILE"
+    }
+    rm -f "$tmp_file"
 }
 
 # Updates the last processed file for a specific filter
