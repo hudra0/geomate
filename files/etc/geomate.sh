@@ -410,8 +410,9 @@ ipv4_range_ordered() {
 }
 
 # awk functions for set elements, shared by merge_set_entries and split_geo_data.
-# ip2n(a): address a.b.c.d as a number. parse_entry(t): for an address, prefix or range
-# set e_lo and e_hi to its first and last address and return 1; 0 for a host name
+# ip2n(a): address a.b.c.d as a number. parse_entry(t): set e_lo and e_hi to the first
+# and last address of t; return 1 for an address, 2 for a prefix or range, 0 for a
+# host name. The addresses passed check_set_entries, so each has one spelling
 AWK_IPV4_ENTRY='
 function ip2n(a,    o) { split(a, o, "."); return ((o[1] * 256 + o[2]) * 256 + o[3]) * 256 + o[4] }
 function parse_entry(t,    q, size) {
@@ -421,9 +422,9 @@ function parse_entry(t,    q, size) {
         size = 2 ^ (32 - q[2])
         e_lo = int(ip2n(q[1]) / size) * size
         e_hi = e_lo + size - 1
-        return 1
+        return 2
     }
-    if (t ~ /^[0-9.]+-[0-9.]+$/) { split(t, q, "-"); e_lo = ip2n(q[1]); e_hi = ip2n(q[2]); return 1 }
+    if (t ~ /^[0-9.]+-[0-9.]+$/) { split(t, q, "-"); e_lo = ip2n(q[1]); e_hi = ip2n(q[2]); return 2 }
     return 0
 }'
 
@@ -431,25 +432,37 @@ function parse_entry(t,    q, size) {
 # Drop the entries of element list $3 (option $2 of filter $1) that lie inside another
 # entry (of two equal ones the later one) and merge partly overlapping entries into one
 # range at the place of the first. Host names stay. Prints a log line per change, then
-# the new list as the last line
+# the new list as the last line.
+# Only prefixes and ranges are compared pair by pair: an address lies inside an equal
+# address (first[] finds the first one) or a prefix or range, and an address that lies
+# inside no other entry overlaps none, so only prefixes and ranges are merged
 merge_set_entries() {
     awk -v filter="$1" -v option="$2" -v list="$3" "$AWK_IPV4_ENTRY"'
         function n2ip(n) { return int(n / 16777216) "." int(n / 65536) % 256 "." int(n / 256) % 256 "." n % 256 }
         BEGIN {
             n = split(list, tok, ",")
-            for (i = 1; i <= n; i++) if (parse_entry(tok[i])) { isip[i] = 1; lo[i] = e_lo; hi[i] = e_hi }
             for (i = 1; i <= n; i++) {
-                if (!isip[i]) continue
-                for (j = 1; j <= n; j++) {
-                    if (j == i || !isip[j] || lo[j] > lo[i] || hi[i] > hi[j]) continue
-                    if (j < i || lo[j] < lo[i] || hi[i] < hi[j]) break
+                kind[i] = parse_entry(tok[i]); lo[i] = e_lo; hi[i] = e_hi
+                if (kind[i] == 1 && !(tok[i] in first)) first[tok[i]] = i
+                else if (kind[i] == 2) rng[++r] = i
+            }
+            for (i = 1; i <= n; i++) {
+                if (!kind[i]) continue
+                # j: the first entry that contains entry i, n + 1 for none
+                j = n + 1
+                a = (kind[i] == 1 ? tok[i] : (lo[i] == hi[i] ? n2ip(lo[i]) : ""))
+                if ((a in first) && first[a] < i) j = first[a]
+                for (c = 1; c <= r && rng[c] < j; c++) {
+                    k = rng[c]
+                    if (k == i || lo[k] > lo[i] || hi[i] > hi[k]) continue
+                    if (k < i || lo[k] < lo[i] || hi[i] < hi[k]) j = k
                 }
                 if (j <= n) {
                     printf "Filter %s: %s entry %s lies inside %s, skipped\n", filter, option, tok[i], tok[j]
                     drop[i] = 1
-                } else kept[++m] = i
+                } else if (kind[i] == 2) kept[++m] = i
             }
-            # Sort the remaining entries by first address (insertion sort, the lists are short)
+            # Sort the remaining prefixes and ranges by first address (insertion sort)
             for (a = 2; a <= m; a++) {
                 k = kept[a]
                 for (b = a - 1; b >= 1 && lo[kept[b]] > lo[k]; b--) kept[b + 1] = kept[b]
@@ -1017,13 +1030,21 @@ append_allowed_ip() {
 split_geo_data() {
     jq -r '. | [.query, .lat, .lon] | @tsv' "$1" 2>/dev/null | \
         awk -v regions="$2" -v allowed_cover="$3" -v blocked_cover="$4" "$AWK_IPV4_ENTRY"'
-        # Load the addresses, prefixes and ranges of element list "list" into lo[] and hi[]
-        function load_cover(list, lo, hi,    t, n, i, k) {
+        # Load element list "list": its addresses as keys of ips[], its prefixes and ranges
+        # into lo[] and hi[]. Returns the number of prefixes and ranges
+        function load_cover(list, ips, lo, hi,    t, n, i, k, kind) {
             n = split(list, t, ",")
-            for (i = 1; i <= n; i++) if (parse_entry(t[i])) { k++; lo[k] = e_lo; hi[k] = e_hi }
+            for (i = 1; i <= n; i++) {
+                kind = parse_entry(t[i])
+                if (kind == 1) ips[t[i]] = 1
+                else if (kind == 2) { k++; lo[k] = e_lo; hi[k] = e_hi }
+            }
             return k + 0
         }
-        function covered(ip, n, lo, hi,    x, i) {
+        # One lookup for the addresses, a scan over the n prefixes and ranges
+        function covered(ip, ips, n, lo, hi,    x, i) {
+            if (ip in ips) return 1
+            if (!n) return 0
             x = ip2n(ip)
             for (i = 1; i <= n; i++) if (x >= lo[i] && x <= hi[i]) return 1
             return 0
@@ -1057,8 +1078,9 @@ split_geo_data() {
                     region_radius[i] = parts[4] + 0
                 }
             }
-            n_acover = load_cover(allowed_cover, acover_lo, acover_hi)
-            n_bcover = load_cover(blocked_cover, bcover_lo, bcover_hi)
+            split("", acover_ip); split("", bcover_ip)
+            n_acover = load_cover(allowed_cover, acover_ip, acover_lo, acover_hi)
+            n_bcover = load_cover(blocked_cover, bcover_ip, bcover_lo, bcover_hi)
         }
         {
             ip = $1
@@ -1082,11 +1104,11 @@ split_geo_data() {
             
             # Append to appropriate list
             if (allowed) {
-                if (n_acover && covered(ip, n_acover, acover_lo, acover_hi)) { left_allowed++; next }
+                if (allowed_cover != "" && covered(ip, acover_ip, n_acover, acover_lo, acover_hi)) { left_allowed++; next }
                 if (allowed_list != "") allowed_list = allowed_list ","
                 allowed_list = allowed_list ip
             } else {
-                if (n_bcover && covered(ip, n_bcover, bcover_lo, bcover_hi)) { left_blocked++; next }
+                if (blocked_cover != "" && covered(ip, bcover_ip, n_bcover, bcover_lo, bcover_hi)) { left_blocked++; next }
                 if (blocked_list != "") blocked_list = blocked_list ","
                 blocked_list = blocked_list ip
             }
