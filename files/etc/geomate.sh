@@ -265,8 +265,10 @@ setup_nftables_and_filters() {
         log_and_print "Running in MONITOR MODE - connections will be tracked but NOT blocked" 0
     fi
     
-    # Every rebuild starts with an empty nft error log (nft_exec appends to it)
+    # Every rebuild starts with an empty nft error log (nft_exec appends to it) and without
+    # the markers of rejected allowed_ip and blocked_ips lists (add_filter_entries)
     : > "$NFT_ERROR_LOG"
+    rm -f "$GEOMATE_TMP_DIR"/*.entries_failed
 
     # Delete existing table and recreate it
     nft delete table inet geomate 2>/dev/null
@@ -541,6 +543,17 @@ filter_set_entries() {
     blocked_entries="$set_entries"
 }
 
+# Add element list $2 (filter_set_entries) to set $1 at start; $3: allowed or blocked,
+# for the log. When nft rejects the list, write the marker that tells the loop harvest
+# the list is not in the set, and return 1
+add_filter_entries() {
+    [ -n "$2" ] || return 0
+    log_and_print "Manually adding $3 IPs: $2" 2
+    nft_exec add element inet geomate "$1" { "$2" } && return 0
+    : > "${GEOMATE_TMP_DIR}/${1}.entries_failed"
+    return 1
+}
+
 # Set up a geo filter based on configuration
 setup_geo_filter() {
     local name protocol src_ip src_port dest_port enabled
@@ -567,18 +580,12 @@ setup_geo_filter() {
     nft_exec add set inet geomate "${set_name}_allowed" { type ipv4_addr\; flags interval\; }
     nft_exec add set inet geomate "${set_name}_blocked" { type ipv4_addr\; flags interval\; }
 
-    # Add allowed IPs
+    # Add allowed and blocked IPs. A list nft rejects (such as a host name that does not
+    # resolve) is missing from its set, so it covers no geolocated IPs: they go to the
+    # set themselves, here and in the loop harvest
     filter_set_entries "$1" "$name" "$set_name" 1
-    if [ -n "$allowed_entries" ]; then
-        log_and_print "Manually adding allowed IPs: $allowed_entries" 2
-        nft_exec add element inet geomate "${set_name}_allowed" { "$allowed_entries" }
-    fi
-
-    # Add blocked IPs
-    if [ -n "$blocked_entries" ]; then
-        log_and_print "Manually adding blocked IPs: $blocked_entries" 2
-        nft_exec add element inet geomate "${set_name}_blocked" { "$blocked_entries" }
-    fi
+    add_filter_entries "${set_name}_allowed" "$allowed_entries" allowed || allowed_entries=""
+    add_filter_entries "${set_name}_blocked" "$blocked_entries" blocked || blocked_entries=""
 
     # Process all allowed regions together
     if [ -n "$allowed_regions" ]; then
@@ -849,6 +856,10 @@ process_dynamic_set() {
     set_name="${NFT_SET_PREFIX}$(echo "$name" | tr ' ' '_')"
     # The start has reported skipped entries already
     filter_set_entries "$1" "$name" "$set_name" 0
+    # A list nft rejected at start covers nothing (add_filter_entries). A live reload
+    # never runs after such a start: its nft error makes the reload restart instead
+    [ -f "${GEOMATE_TMP_DIR}/${set_name}_allowed.entries_failed" ] && allowed_entries=""
+    [ -f "${GEOMATE_TMP_DIR}/${set_name}_blocked.entries_failed" ] && blocked_entries=""
 
     process_geo_data "$name" "${set_name}_allowed" "${set_name}_blocked" "$allowed_regions" \
         "$allowed_entries" "$blocked_entries"
