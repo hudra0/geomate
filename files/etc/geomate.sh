@@ -544,12 +544,19 @@ filter_set_entries() {
 }
 
 # Add element list $2 (filter_set_entries) to set $1 at start; $3: allowed or blocked,
-# for the log. When nft rejects the list, write the marker that tells the loop harvest
-# the list is not in the set, and return 1
+# for the log. When nft rejects the list (such as a host name that does not resolve),
+# log it with the set reference that marks the filter in the status, write the marker
+# that tells the loop harvest the list is not in the set, and return 1
 add_filter_entries() {
+    local error_output nl='
+'
     [ -n "$2" ] || return 0
     log_and_print "Manually adding $3 IPs: $2" 2
-    nft_exec add element inet geomate "$1" { "$2" } && return 0
+    error_output=$(nft add element inet geomate "$1" { "$2" } 2>&1) && return 0
+    log_and_print "Error: nft rejected the $3 IPs of set $1: $error_output" 0
+    # First line only: nft repeats the whole command after it
+    printf '[%s] nft add element inet geomate %s { %s } -> Error: %s (@%s)\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" "${error_output%%"$nl"*}" "$1" >> "$NFT_ERROR_LOG"
     : > "${GEOMATE_TMP_DIR}/${1}.entries_failed"
     return 1
 }
