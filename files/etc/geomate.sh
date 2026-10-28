@@ -448,16 +448,43 @@ report_nft_input_error() {
 
 # Build the nft match of a filter's traffic into the global base_rule, shared by the
 # forward and the prerouting rules: Source IP (build_src_match), protocol and ports.
-# $1: protocol, $2: src_ip, $3: src_port, $4: dest_port. Returns the status of
-# build_src_match, which also sets src_exceptions_only
+# $1: protocol, $2: src_ip, $3: src_port, $4: dest_port; a port 'any' is no port.
+#   one protocol and ports: '<protocol> sport <ports> <protocol> dport <ports>'
+#   protocols without ports: 'meta l4proto udp', or for several separated by spaces
+#   ('tcp udp') 'meta l4proto { tcp, udp }'. nft has no match by a bare protocol name
+#   ports without a protocol or with several protocols: 'meta l4proto { tcp, udp } th
+#   sport <ports> th dport <ports>', with the given protocols if any. nft has no port
+#   match without a protocol
+#   neither: the Source IP only (all traffic)
+# Returns the status of build_src_match, which also sets src_exceptions_only
 build_base_rule() {
     local protocol="$1" src_port="$3" dest_port="$4" has_sport=0 rv=0
+    local port_proto="$1" l4proto glob_off=0
     build_src_match "$2" || rv=1
     base_rule="$src_match"
-    [ -n "$protocol" ] && base_rule="$base_rule $protocol"
+    [ "$src_port" = "any" ] && src_port=""
+    [ "$dest_port" = "any" ] && dest_port=""
+
+    # Split the protocol at whitespace without expanding wildcards (as build_src_match)
+    case "$-" in *f*) glob_off=1 ;; esac
+    set -f
+    set -- $protocol
+    [ "$glob_off" -eq 1 ] || set +f
+    l4proto="$*"
+    [ $# -gt 1 ] && l4proto="{ ${l4proto// /, } }"
+
+    if [ $# -eq 1 ] && [ -n "$src_port$dest_port" ]; then
+        base_rule="$base_rule $protocol"
+    elif [ -n "$src_port$dest_port" ]; then
+        [ -n "$l4proto" ] || l4proto="{ tcp, udp }"
+        base_rule="$base_rule meta l4proto $l4proto th"
+        port_proto="th"
+    elif [ -n "$l4proto" ]; then
+        base_rule="$base_rule meta l4proto $l4proto"
+    fi
 
     # Include src_port in the rule if set
-    if [ -n "$src_port" ] && [ "$src_port" != "any" ]; then
+    if [ -n "$src_port" ]; then
         has_sport=1
         # Check if multiple values (separated by space) - need braces
         if echo "$src_port" | grep -q ' '; then
@@ -470,8 +497,8 @@ build_base_rule() {
     fi
 
     # Include dest_port in the rule if set
-    if [ -n "$dest_port" ] && [ "$dest_port" != "any" ]; then
-        [ "$has_sport" = "1" ] && [ -n "$protocol" ] && base_rule="$base_rule $protocol"
+    if [ -n "$dest_port" ]; then
+        [ "$has_sport" = "1" ] && base_rule="$base_rule $port_proto"
         # Check if multiple values (separated by space) - need braces
         if echo "$dest_port" | grep -q ' '; then
             dest_port=$(echo "$dest_port" | tr ' ' ',')
