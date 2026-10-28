@@ -601,17 +601,19 @@ harvest_dynamic_set() {
 # Loop harvest: merge the _dynamic set into the IP list, then add the geolocated IPs of
 # the list to the filter's sets when the list gained new IPs
 process_dynamic_set() {
-    local name allowed_region set_name
+    local name set_name allowed_regions=""
     harvest_dynamic_set "$1"
     [ "$harvest_added" -gt 0 ] || return 0
 
     config_get name "$1" 'name'
-    config_get allowed_region "$1" 'allowed_region'
+    # Read the regions as a list, like the start and the live reload do
+    config_list_foreach "$1" 'allowed_region' append_allowed_region
+    [ -n "$allowed_regions" ] || return 0
     set_name="${NFT_SET_PREFIX}$(echo "$name" | tr ' ' '_')"
 
     # Process the geo data with correct parameter order:
     # $1: name, $2: allowed_set, $3: blocked_set, $@: allowed_regions
-    process_geo_data "$name" "${set_name}_allowed" "${set_name}_blocked" "$allowed_region"
+    process_geo_data "$name" "${set_name}_allowed" "${set_name}_blocked" "$allowed_regions"
 }
 
 # Update dynamic IPs based on configuration. The config is read on every run, so a
