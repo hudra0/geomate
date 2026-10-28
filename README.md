@@ -377,7 +377,8 @@ Several words can show together, for example "Unsaved, No IP list".
 #### Dynamic Mode
 - Automatically learns server IPs during gameplay
 - Builds IP lists over time: new IPs are saved to the IP list every 30 minutes and when the service stops or restarts
-- Counts the packets and bytes sent to each collected server, from its first packet until it has been idle for an hour or the service restarts (`nft list set inet geomate geomate_<filter>_dynamic`, spaces in the filter name as `_`)
+- Counts the packets and bytes sent to each collected server (`nft list set inet geomate geomate_<filter>_dynamic`, spaces in the filter name as `_`). A count starts with the server's first packet and ends when the server has been idle for an hour or Geomate restarts. Geomate also restarts on its own after it has geolocated new servers, usually right after it saved new IPs to the list
+- With software or hardware flow offloading on (Network > Firewall > General Settings), the count stops after the first packets of each connection: offloaded packets bypass Geomate's rules
 - Recommended for most users
 
 #### Static Mode
@@ -717,7 +718,7 @@ Example: If you want to play COD with friends from both Europe and USA:
 
 5. **Backend Capabilities**
    - `/etc/geomate.sh capabilities` prints the features of the installed backend as one line of words and exits with 0. It reads no configuration and changes nothing
-   - Today it prints `src_ip_multi set_counters`. `src_ip_multi`: Source IP accepts several entries and exceptions with `!`. `set_counters`: each server in a filter's collected set (`geomate_<filter>_dynamic`, dynamic and monitor mode) carries `counter packets N bytes M`
+   - Today it prints `src_ip_multi set_counters`. `src_ip_multi`: Source IP accepts several entries and exceptions with `!`. `set_counters`: each server in a filter's collected set (`geomate_<filter>_dynamic`, dynamic and monitor mode) carries `counter packets N bytes M`. Every restart of Geomate empties the set, so a server can disappear or start again from 0 between two reads
    - Words are only added, never renamed or removed, so the web interface and scripts can rely on them. An older backend prints its usage and exits with 1, which means no capabilities
 
 ## FAQ
