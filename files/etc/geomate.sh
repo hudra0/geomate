@@ -265,8 +265,10 @@ setup_nftables_and_filters() {
         log_and_print "Running in MONITOR MODE - connections will be tracked but NOT blocked" 0
     fi
     
-    # Every rebuild starts with an empty nft error log (nft_exec appends to it)
+    # Every rebuild starts with an empty nft error log (nft_exec appends to it) and without
+    # the markers of rejected allowed_ip and blocked_ips lists (add_filter_entries)
     : > "$NFT_ERROR_LOG"
+    rm -f "$GEOMATE_TMP_DIR"/*.entries_failed
 
     # Delete existing table and recreate it
     nft delete table inet geomate 2>/dev/null
@@ -398,10 +400,184 @@ build_src_match() {
     return 0
 }
 
+# Return 1 when $1, which passed is_ipv4_entry, is a range a.b.c.d-e.f.g.h whose first
+# address is above its last one: nft rejects it with the whole element list
+ipv4_range_ordered() {
+    case "$1" in *-*) ;; *) return 0 ;; esac
+    local IFS=.
+    set -- ${1%-*} ${1#*-}
+    [ $(( ($1 << 24) + ($2 << 16) + ($3 << 8) + $4 )) -le $(( ($5 << 24) + ($6 << 16) + ($7 << 8) + $8 )) ]
+}
+
+# awk functions for set elements, shared by merge_set_entries and split_geo_data.
+# ip2n(a): address a.b.c.d as a number. parse_entry(t): set e_lo and e_hi to the first
+# and last address of t; return 1 for an address, 2 for a prefix or range, 0 for a
+# host name. The addresses passed check_set_entries, so each has one spelling
+AWK_IPV4_ENTRY='
+function ip2n(a,    o) { split(a, o, "."); return ((o[1] * 256 + o[2]) * 256 + o[3]) * 256 + o[4] }
+function parse_entry(t,    q, size) {
+    if (t ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) { e_lo = e_hi = ip2n(t); return 1 }
+    if (t ~ /^[0-9.]+\/[0-9]+$/) {
+        split(t, q, "/")
+        size = 2 ^ (32 - q[2])
+        e_lo = int(ip2n(q[1]) / size) * size
+        e_hi = e_lo + size - 1
+        return 2
+    }
+    if (t ~ /^[0-9.]+-[0-9.]+$/) { split(t, q, "-"); e_lo = ip2n(q[1]); e_hi = ip2n(q[2]); return 2 }
+    return 0
+}'
+
+# The _allowed and _blocked sets have no auto-merge, so nft rejects overlapping elements.
+# Drop the entries of element list $3 (option $2 of filter $1) that lie inside another
+# entry (of two equal ones the later one) and merge partly overlapping entries into one
+# range at the place of the first. Host names stay. Prints a log line per change, then
+# the new list as the last line.
+# Only prefixes and ranges are compared pair by pair: an address lies inside an equal
+# address (first[] finds the first one) or a prefix or range, and an address that lies
+# inside no other entry overlaps none, so only prefixes and ranges are merged
+merge_set_entries() {
+    awk -v filter="$1" -v option="$2" -v list="$3" "$AWK_IPV4_ENTRY"'
+        function n2ip(n) { return int(n / 16777216) "." int(n / 65536) % 256 "." int(n / 256) % 256 "." n % 256 }
+        BEGIN {
+            n = split(list, tok, ",")
+            for (i = 1; i <= n; i++) {
+                kind[i] = parse_entry(tok[i]); lo[i] = e_lo; hi[i] = e_hi
+                if (kind[i] == 1 && !(tok[i] in first)) first[tok[i]] = i
+                else if (kind[i] == 2) rng[++r] = i
+            }
+            for (i = 1; i <= n; i++) {
+                if (!kind[i]) continue
+                # j: the first entry that contains entry i, n + 1 for none
+                j = n + 1
+                a = (kind[i] == 1 ? tok[i] : (lo[i] == hi[i] ? n2ip(lo[i]) : ""))
+                if ((a in first) && first[a] < i) j = first[a]
+                for (c = 1; c <= r && rng[c] < j; c++) {
+                    k = rng[c]
+                    if (k == i || lo[k] > lo[i] || hi[i] > hi[k]) continue
+                    if (k < i || lo[k] < lo[i] || hi[i] < hi[k]) j = k
+                }
+                if (j <= n) {
+                    printf "Filter %s: %s entry %s lies inside %s, skipped\n", filter, option, tok[i], tok[j]
+                    drop[i] = 1
+                } else if (kind[i] == 2) kept[++m] = i
+            }
+            # Sort the remaining prefixes and ranges by first address (insertion sort)
+            for (a = 2; a <= m; a++) {
+                k = kept[a]
+                for (b = a - 1; b >= 1 && lo[kept[b]] > lo[k]; b--) kept[b + 1] = kept[b]
+                kept[b + 1] = k
+            }
+            for (a = 1; a <= m; a = b) {
+                lead = kept[a]; top = hi[lead]; names = tok[lead]
+                for (b = a + 1; b <= m && lo[kept[b]] <= top; b++) {
+                    k = kept[b]
+                    names = names ", " tok[k]
+                    if (hi[k] > top) top = hi[k]
+                    if (k < lead) { drop[lead] = 1; lead = k } else drop[k] = 1
+                }
+                if (b > a + 1) {
+                    tok[lead] = n2ip(lo[kept[a]]) "-" n2ip(top)
+                    printf "Filter %s: %s entries %s overlap, merged into %s\n", filter, option, names, tok[lead]
+                }
+            }
+            for (i = 1; i <= n; i++) if (!drop[i]) out = out (out == "" ? "" : ",") tok[i]
+            print out
+        }'
+}
+
+# Turn the value of a set option into an element list nft accepts. Sets set_entries to
+# the kept tokens, comma-separated. $1: filter name, $2: option name, $3: set name,
+# $4: value, entries separated by commas, tokens of an entry by whitespace, $5: 1 to log
+# skipped and merged entries and add skipped ones to $NFT_ERROR_LOG, 0 to stay quiet.
+# A token is kept when it is an IPv4 address, a.b.c.d/0-32 or an ordered range
+# a.b.c.d-e.f.g.h, or a host name, which nft resolves when it loads the set: letters,
+# digits, '.' and '-', with a letter, and with a dot unless it is its entry's only token,
+# so the nft keywords of a broken entry such as '1.1.1.1; flush ruleset' never reach nft.
+# Any other token would make nft reject the whole list or inject nft commands
+check_set_entries() {
+    local name="$1" option="$2" set="$3" value="$4" report="$5"
+    local part token count line result kept="" glob_off=0 IFS nl='
+'
+    case "$-" in *f*) glob_off=1 ;; esac
+    set -f
+    IFS=,
+    for part in $value; do
+        unset IFS  # split at whitespace; the local IFS ends with the function
+        count=0
+        for token in $part; do count=$((count + 1)); done
+        for token in $part; do
+            if is_ipv4_entry "$token" && ipv4_range_ordered "$token"; then
+                kept="$kept,$token"
+                continue
+            fi
+            case "$token" in
+                *[!A-Za-z0-9.-]*|[.-]*|*[.-]) ;;
+                *[A-Za-z]*.*|*.*[A-Za-z]*) kept="$kept,$token"; continue ;;
+                *[A-Za-z]*) [ "$count" -eq 1 ] && { kept="$kept,$token"; continue; } ;;
+            esac
+            [ "$report" -eq 1 ] || continue
+            log_and_print "Error: filter $name, $option: skipped '$token', not an IPv4 address, prefix, range or host name" 0
+            printf '[%s] %s of filter %s: %s -> Error: not an IPv4 address, prefix, range or host name, skipped (@%s)\n' \
+                "$(date '+%Y-%m-%d %H:%M:%S')" "$option" "$name" "$token" "$set" >> "$NFT_ERROR_LOG"
+        done
+    done
+    kept="${kept#,}"
+
+    # Overlaps are only possible with several entries or a range
+    case "$kept" in
+        *[,-]*)
+            if result=$(merge_set_entries "$name" "$option" "$kept"); then
+                kept="${result##*"$nl"}"
+                IFS="$nl"
+                if [ "$report" -eq 1 ] && [ "$result" != "$kept" ]; then
+                    for line in ${result%"$nl"*}; do log_and_print "$line" 1; done
+                fi
+            else
+                log_and_print "Error: failed to check the $option entries of $name for overlaps" 0
+            fi
+            ;;
+    esac
+    [ "$glob_off" -eq 1 ] || set +f
+    set_entries="$kept"
+}
+
+# Element lists of filter section $1 for its sets, shared by the start, the live reload
+# and the loop harvest (check_set_entries): sets allowed_entries from the allowed_ip list
+# and blocked_entries from the comma-separated blocked_ips option. $2: filter name,
+# $3: set name prefix, $4: 1 to report skipped and merged entries, 0 to stay quiet
+filter_set_entries() {
+    local allowed_ips="" blocked_ips set_entries
+    config_list_foreach "$1" 'allowed_ip' append_allowed_ip
+    check_set_entries "$2" allowed_ip "${3}_allowed" "$allowed_ips" "$4"
+    allowed_entries="$set_entries"
+    config_get blocked_ips "$1" 'blocked_ips'
+    check_set_entries "$2" blocked_ips "${3}_blocked" "$blocked_ips" "$4"
+    blocked_entries="$set_entries"
+}
+
+# Add element list $2 (filter_set_entries) to set $1 at start; $3: allowed or blocked,
+# for the log. When nft rejects the list (such as a host name that does not resolve),
+# log it with the set reference that marks the filter in the status, write the marker
+# that tells the loop harvest the list is not in the set, and return 1
+add_filter_entries() {
+    local error_output nl='
+'
+    [ -n "$2" ] || return 0
+    log_and_print "Manually adding $3 IPs: $2" 2
+    error_output=$(nft add element inet geomate "$1" { "$2" } 2>&1) && return 0
+    log_and_print "Error: nft rejected the $3 IPs of set $1: $error_output" 0
+    # First line only: nft repeats the whole command after it
+    printf '[%s] nft add element inet geomate %s { %s } -> Error: %s (@%s)\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" "${error_output%%"$nl"*}" "$1" >> "$NFT_ERROR_LOG"
+    : > "${GEOMATE_TMP_DIR}/${1}.entries_failed"
+    return 1
+}
+
 # Set up a geo filter based on configuration
 setup_geo_filter() {
-    local name protocol src_ip src_port dest_port enabled blocked_ips
-    local allowed_ips=""
+    local name protocol src_ip src_port dest_port enabled
+    local allowed_entries blocked_entries
     local allowed_regions=""
     
     config_get name "$1" 'name'
@@ -410,7 +586,6 @@ setup_geo_filter() {
     config_get src_port "$1" 'src_port'
     config_get dest_port "$1" 'dest_port'
     config_get enabled "$1" 'enabled' '0'
-    config_get blocked_ips "$1" 'blocked_ips'
 
     # Collect allowed_region entries
     config_list_foreach "$1" 'allowed_region' append_allowed_region
@@ -425,24 +600,18 @@ setup_geo_filter() {
     nft_exec add set inet geomate "${set_name}_allowed" { type ipv4_addr\; flags interval\; }
     nft_exec add set inet geomate "${set_name}_blocked" { type ipv4_addr\; flags interval\; }
 
-    # Add allowed IPs
-    config_list_foreach "$1" 'allowed_ip' append_allowed_ip
-    if [ -n "$allowed_ips" ]; then
-        allowed_ips=${allowed_ips%,}
-        log_and_print "Manually adding allowed IPs: $allowed_ips" 2
-        nft_exec add element inet geomate "${set_name}_allowed" { "$allowed_ips" }
-    fi
-
-    # Add blocked IPs
-    if [ -n "$blocked_ips" ]; then
-        log_and_print "Manually adding blocked IPs: $blocked_ips" 2
-        nft_exec add element inet geomate "${set_name}_blocked" { "$blocked_ips" }
-    fi
+    # Add allowed and blocked IPs. A list nft rejects (such as a host name that does not
+    # resolve) is missing from its set, so it covers no geolocated IPs: they go to the
+    # set themselves, here and in the loop harvest
+    filter_set_entries "$1" "$name" "$set_name" 1
+    add_filter_entries "${set_name}_allowed" "$allowed_entries" allowed || allowed_entries=""
+    add_filter_entries "${set_name}_blocked" "$blocked_entries" blocked || blocked_entries=""
 
     # Process all allowed regions together
     if [ -n "$allowed_regions" ]; then
         log_and_print "Processing geo data for $name with allowed regions: $allowed_regions" 2
-        process_geo_data "$name" "${set_name}_allowed" "${set_name}_blocked" "$allowed_regions"
+        process_geo_data "$name" "${set_name}_allowed" "${set_name}_blocked" "$allowed_regions" \
+            "$allowed_entries" "$blocked_entries"
     fi
 
     # Add rules for allowed and blocked IPs. If nft rejects the Source IP, nft_exec logs
@@ -512,8 +681,8 @@ setup_geo_filter() {
     fi
 
     log_and_print "Geo filter for $name set up successfully" 1
-    log_and_print "Added allowed IPs from config: $allowed_ips" 2
-    log_and_print "Added blocked IPs: $blocked_ips" 2
+    log_and_print "Added allowed IPs from config: $allowed_entries" 2
+    log_and_print "Added blocked IPs: $blocked_entries" 2
 }
 
 # Create dynamic sets based on configuration
@@ -696,7 +865,7 @@ harvest_dynamic_set() {
 # Loop harvest: merge the _dynamic set into the IP list, then add the geolocated IPs of
 # the list to the filter's sets when the list gained new IPs
 process_dynamic_set() {
-    local name set_name allowed_regions=""
+    local name set_name allowed_regions="" allowed_entries blocked_entries
     harvest_dynamic_set "$1"
     [ "$harvest_added" -gt 0 ] || return 0
 
@@ -705,10 +874,15 @@ process_dynamic_set() {
     config_list_foreach "$1" 'allowed_region' append_allowed_region
     [ -n "$allowed_regions" ] || return 0
     set_name="${NFT_SET_PREFIX}$(echo "$name" | tr ' ' '_')"
+    # The start has reported skipped entries already
+    filter_set_entries "$1" "$name" "$set_name" 0
+    # A list nft rejected at start covers nothing (add_filter_entries). A live reload
+    # never runs after such a start: its nft error makes the reload restart instead
+    [ -f "${GEOMATE_TMP_DIR}/${set_name}_allowed.entries_failed" ] && allowed_entries=""
+    [ -f "${GEOMATE_TMP_DIR}/${set_name}_blocked.entries_failed" ] && blocked_entries=""
 
-    # Process the geo data with correct parameter order:
-    # $1: name, $2: allowed_set, $3: blocked_set, $@: allowed_regions
-    process_geo_data "$name" "${set_name}_allowed" "${set_name}_blocked" "$allowed_regions"
+    process_geo_data "$name" "${set_name}_allowed" "${set_name}_blocked" "$allowed_regions" \
+        "$allowed_entries" "$blocked_entries"
 }
 
 # Update dynamic IPs based on configuration. The config is read on every run, so a
@@ -844,14 +1018,37 @@ append_allowed_ip() {
 
 # Split the geolocated IPs of a filter by its regions (Haversine, R = 6371000 m).
 # Shared by the start, the loop harvest and the live reload.
-# $1 = geo data file, $2 = regions ("circle:lat:lon:radius_m ...")
+# $1 = geo data file, $2 = regions ("circle:lat:lon:radius_m ..."), $3 and $4 = element
+# lists of allowed_ip and blocked_ips (filter_set_entries). An in-region IP inside an
+# entry of $3 is left out of the allowed IPs, an out-of-region IP inside an entry of $4
+# out of the blocked IPs: the entry matches it already, and the sets reject overlaps
 # PERFORMANCE OPTIMIZATION: Process ALL IPs in a SINGLE awk process
 # Instead of spawning a new awk process for each IP (11000+ processes),
 # we do everything in one pass: parse regions, calculate haversine, categorize IPs
-# Output format: First line = comma-separated allowed IPs, Second line = comma-separated blocked IPs
+# Output format: First line = comma-separated allowed IPs, Second line = comma-separated blocked IPs,
+# third line = the numbers of allowed and blocked IPs left out
 split_geo_data() {
     jq -r '. | [.query, .lat, .lon] | @tsv' "$1" 2>/dev/null | \
-        awk -v regions="$2" '
+        awk -v regions="$2" -v allowed_cover="$3" -v blocked_cover="$4" "$AWK_IPV4_ENTRY"'
+        # Load element list "list": its addresses as keys of ips[], its prefixes and ranges
+        # into lo[] and hi[]. Returns the number of prefixes and ranges
+        function load_cover(list, ips, lo, hi,    t, n, i, k, kind) {
+            n = split(list, t, ",")
+            for (i = 1; i <= n; i++) {
+                kind = parse_entry(t[i])
+                if (kind == 1) ips[t[i]] = 1
+                else if (kind == 2) { k++; lo[k] = e_lo; hi[k] = e_hi }
+            }
+            return k + 0
+        }
+        # One lookup for the addresses, a scan over the n prefixes and ranges
+        function covered(ip, ips, n, lo, hi,    x, i) {
+            if (ip in ips) return 1
+            if (!n) return 0
+            x = ip2n(ip)
+            for (i = 1; i <= n; i++) if (x >= lo[i] && x <= hi[i]) return 1
+            return 0
+        }
         function haversine(lat1, lon1, lat2, lon2) {
             # Convert degrees to radians
             lat1 = lat1 * 3.14159265359 / 180
@@ -881,6 +1078,9 @@ split_geo_data() {
                     region_radius[i] = parts[4] + 0
                 }
             }
+            split("", acover_ip); split("", bcover_ip)
+            n_acover = load_cover(allowed_cover, acover_ip, acover_lo, acover_hi)
+            n_bcover = load_cover(blocked_cover, bcover_ip, bcover_lo, bcover_hi)
         }
         {
             ip = $1
@@ -904,27 +1104,31 @@ split_geo_data() {
             
             # Append to appropriate list
             if (allowed) {
+                if (allowed_cover != "" && covered(ip, acover_ip, n_acover, acover_lo, acover_hi)) { left_allowed++; next }
                 if (allowed_list != "") allowed_list = allowed_list ","
                 allowed_list = allowed_list ip
             } else {
+                if (blocked_cover != "" && covered(ip, bcover_ip, n_bcover, bcover_lo, bcover_hi)) { left_blocked++; next }
                 if (blocked_list != "") blocked_list = blocked_list ","
                 blocked_list = blocked_list ip
             }
         }
         END {
-            # Output two lines: allowed IPs, then blocked IPs
+            # Output three lines: allowed IPs, blocked IPs, the numbers left out
             print allowed_list
             print blocked_list
+            print left_allowed + 0, left_blocked + 0
         }'
 }
 
 # Process geo data from the JSON file
+# $1: name, $2: allowed set, $3: blocked set, $4: allowed regions, $5 and $6: element
+# lists of allowed_ip and blocked_ips (filter_set_entries)
 process_geo_data() {
     local name="$1"
     local allowed_set="$2"
     local blocked_set="$3"
-    shift 3
-    local allowed_regions="$*"
+    local allowed_regions="$4"
     local geo_data_file="${GEOMATE_DATA_DIR}/${name}_geo_data.json"
 
     [ ! -f "$geo_data_file" ] && { log_and_print "Geo data file not found: $geo_data_file" 0; return; }
@@ -933,18 +1137,21 @@ process_geo_data() {
     log_and_print "Processing geo data for $name with allowed regions: $allowed_regions" 2
 
     local result
-    result=$(split_geo_data "$geo_data_file" "$allowed_regions")
+    result=$(split_geo_data "$geo_data_file" "$allowed_regions" "$5" "$6")
 
-    # Parse the two-line result
-    local allowed_ips blocked_ips
+    # Parse the result: allowed IPs, blocked IPs, the numbers left out
+    local allowed_ips blocked_ips left_out
     allowed_ips=$(echo "$result" | sed -n '1p')
     blocked_ips=$(echo "$result" | sed -n '2p')
+    left_out=$(echo "$result" | sed -n '3p')
 
     # Count IPs for logging
     local allowed_count=0 blocked_count=0
     [ -n "$allowed_ips" ] && allowed_count=$(echo "$allowed_ips" | tr ',' '\n' | wc -l)
     [ -n "$blocked_ips" ] && blocked_count=$(echo "$blocked_ips" | tr ',' '\n' | wc -l)
     log_and_print "Geo processing for $name: $allowed_count allowed, $blocked_count blocked IPs" 1
+    [ "${left_out:-0 0}" = "0 0" ] || \
+        log_and_print "Geo processing for $name: left out ${left_out% *} allowed IPs inside allowed_ip entries, ${left_out#* } blocked IPs inside blocked_ips entries" 2
 
     # Batch update the sets - handling potential large IP lists
     add_ips_to_set() {
@@ -954,7 +1161,8 @@ process_geo_data() {
         local total_ips
         local start=1
         local success=1
-        local end chunk error_output ret
+        local end chunk error_output ret nl='
+'
         
         [ -z "$ip_list" ] && return 0
         
@@ -977,6 +1185,11 @@ process_geo_data() {
             
             if [ "$ret" -ne 0 ]; then
                 log_and_print "ERROR: Failed to add IPs (chunk $start-$end) to set $set_name: $error_output" 0
+                # First line only: nft repeats the whole command after it. The set
+                # reference marks the filter in the status like an nft_exec error
+                printf '[%s] nft add element inet geomate %s { IPs %s-%s of %s } -> Error: %s (@%s)\n' \
+                    "$(date '+%Y-%m-%d %H:%M:%S')" "$set_name" "$start" "$end" "$total_ips" \
+                    "${error_output%%"$nl"*}" "$set_name" >> "$NFT_ERROR_LOG"
                 success=0
             fi
             
@@ -1008,8 +1221,8 @@ print_set_elements() {
 # commands that refill its _allowed and _blocked sets to $reload_batch, with the same
 # content as at start (allowed_ip, blocked_ips, geolocated IPs split by region)
 reload_filter_sets() {
-    local name enabled blocked_ips set_name result geo_data_file
-    local allowed_ips="" allowed_regions="" geo_allowed="" geo_blocked=""
+    local name enabled set_name result geo_data_file allowed_entries blocked_entries
+    local allowed_regions="" geo_allowed="" geo_blocked=""
     local allowed_count=0 blocked_count=0
 
     case "$reload_sections" in *" $1 "*) ;; *) return 0 ;; esac
@@ -1017,14 +1230,13 @@ reload_filter_sets() {
     [ "$enabled" = "0" ] && return 0
 
     config_get name "$1" 'name'
-    config_get blocked_ips "$1" 'blocked_ips'
-    config_list_foreach "$1" 'allowed_ip' append_allowed_ip
     config_list_foreach "$1" 'allowed_region' append_allowed_region
     set_name="${NFT_SET_PREFIX}$(echo "$name" | tr ' ' '_')"
+    filter_set_entries "$1" "$name" "$set_name" 1
     geo_data_file="${GEOMATE_DATA_DIR}/${name}_geo_data.json"
 
     if [ -n "$allowed_regions" ] && [ -f "$geo_data_file" ]; then
-        result=$(split_geo_data "$geo_data_file" "$allowed_regions")
+        result=$(split_geo_data "$geo_data_file" "$allowed_regions" "$allowed_entries" "$blocked_entries")
         geo_allowed=$(echo "$result" | sed -n '1p')
         geo_blocked=$(echo "$result" | sed -n '2p')
     fi
@@ -1033,8 +1245,8 @@ reload_filter_sets() {
 
     {
         printf 'flush set inet geomate %s\n' "${set_name}_allowed" "${set_name}_blocked"
-        [ -n "$allowed_ips" ] && printf 'add element inet geomate %s { %s }\n' "${set_name}_allowed" "${allowed_ips%,}"
-        [ -n "$blocked_ips" ] && printf 'add element inet geomate %s { %s }\n' "${set_name}_blocked" "$blocked_ips"
+        [ -n "$allowed_entries" ] && printf 'add element inet geomate %s { %s }\n' "${set_name}_allowed" "$allowed_entries"
+        [ -n "$blocked_entries" ] && printf 'add element inet geomate %s { %s }\n' "${set_name}_blocked" "$blocked_entries"
         print_set_elements "${set_name}_allowed" "$geo_allowed"
         print_set_elements "${set_name}_blocked" "$geo_blocked"
     } >> "$reload_batch"
