@@ -275,6 +275,15 @@ geolocate() {
     /etc/geolocate.sh
 }
 
+# Return 0 when filter name $1 may reach nft: not empty, only letters, digits, spaces, '_',
+# '.' and '-' (filter_set_name in geomate.sh and luci.geomate). geomate.sh skips a filter
+# with any other name, and the name could end the nft command that lists its sets
+valid_filter_name() {
+    case "$1" in
+        ''|*[!A-Za-z0-9_\ .-]*) return 1 ;;
+    esac
+}
+
 status_service() {
     local pid running=0 loading=0
 
@@ -341,7 +350,7 @@ status_service() {
             local allowed_count=0 blocked_count=0
 
             # Count IPs in nftables sets
-            if nft list table inet geomate >/dev/null 2>&1; then
+            if valid_filter_name "$filter_name" && nft list table inet geomate >/dev/null 2>&1; then
                 allowed_count=$(nft list set inet geomate "geomate_${set_name}_allowed" 2>/dev/null | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | wc -l)
                 blocked_count=$(nft list set inet geomate "geomate_${set_name}_blocked" 2>/dev/null | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | wc -l)
             fi
@@ -575,6 +584,8 @@ health_check() {
             config_get filter_name "$1" name
 
             if [ "$filter_enabled" = "1" ]; then
+                # geomate.sh builds no sets for a filter with an invalid name
+                valid_filter_name "$filter_name" || { sets_ok=0; return 0; }
                 local set_name
                 set_name=$(echo "$filter_name" | tr ' ' '_')
                 # Check if allowed and blocked sets exist
