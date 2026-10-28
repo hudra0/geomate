@@ -841,8 +841,10 @@ create_dynamic_set() {
 
     # Only create main dynamic set in dynamic mode
     if [ "$operational_mode" != "static" ]; then
-        # Create existing dynamic set with 1-hour timeout
-        nft_exec add set inet geomate "${set_name}_dynamic" { type ipv4_addr\; flags dynamic,timeout\; timeout 1h\; }
+        # Create existing dynamic set with 1-hour timeout. counter: the kernel counts the
+        # packets and bytes of each element from its first packet until it expires
+        # (capability set_counters); 'nft list set' prints 'counter packets N bytes M'
+        nft_exec add set inet geomate "${set_name}_dynamic" { type ipv4_addr\; flags dynamic,timeout\; timeout 1h\; counter\; }
     fi
 
     # Create the base rule. setup_geo_filter has logged an unchecked Source IP already
@@ -1651,7 +1653,9 @@ case "$1" in
         # configuration, takes no lock and writes nothing. An older geomate.sh prints
         # the usage and exits 1, which means no capabilities.
         # src_ip_multi: Source IP accepts several entries and exceptions with ! or !=
-        printf '%s\n' 'src_ip_multi'
+        # set_counters: each element of a filter's _dynamic set carries 'counter packets N
+        # bytes M' (static mode has no _dynamic set)
+        printf '%s\n' 'src_ip_multi set_counters'
         ;;
     run)
         run
