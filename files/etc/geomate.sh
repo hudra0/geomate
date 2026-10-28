@@ -400,6 +400,44 @@ build_src_match() {
     return 0
 }
 
+# Build the nft match of a filter's traffic into the global base_rule, shared by the
+# forward and the prerouting rules: Source IP (build_src_match), protocol and ports.
+# $1: protocol, $2: src_ip, $3: src_port, $4: dest_port. Returns the status of
+# build_src_match, which also sets src_exceptions_only
+build_base_rule() {
+    local protocol="$1" src_port="$3" dest_port="$4" has_sport=0 rv=0
+    build_src_match "$2" || rv=1
+    base_rule="$src_match"
+    [ -n "$protocol" ] && base_rule="$base_rule $protocol"
+
+    # Include src_port in the rule if set
+    if [ -n "$src_port" ] && [ "$src_port" != "any" ]; then
+        has_sport=1
+        # Check if multiple values (separated by space) - need braces
+        if echo "$src_port" | grep -q ' '; then
+            src_port=$(echo "$src_port" | tr ' ' ',')
+            base_rule="$base_rule sport { $src_port }"
+        else
+            # Single value (port or range) - no braces needed
+            base_rule="$base_rule sport $src_port"
+        fi
+    fi
+
+    # Include dest_port in the rule if set
+    if [ -n "$dest_port" ] && [ "$dest_port" != "any" ]; then
+        [ "$has_sport" = "1" ] && [ -n "$protocol" ] && base_rule="$base_rule $protocol"
+        # Check if multiple values (separated by space) - need braces
+        if echo "$dest_port" | grep -q ' '; then
+            dest_port=$(echo "$dest_port" | tr ' ' ',')
+            base_rule="$base_rule dport { $dest_port }"
+        else
+            # Single value (port or range) - no braces needed
+            base_rule="$base_rule dport $dest_port"
+        fi
+    fi
+    return "$rv"
+}
+
 # Return 1 when $1, which passed is_ipv4_entry, is a range a.b.c.d-e.f.g.h whose first
 # address is above its last one: nft rejects it with the whole element list
 ipv4_range_ordered() {
@@ -616,39 +654,11 @@ setup_geo_filter() {
 
     # Add rules for allowed and blocked IPs. If nft rejects the Source IP, nft_exec logs
     # it with @<set>_allowed and the filter gets no rules, as before
-    build_src_match "$src_ip" || \
+    local base_rule
+    build_base_rule "$protocol" "$src_ip" "$src_port" "$dest_port" || \
         log_and_print "Source IP '$src_ip' of filter $name is not a list of IPv4 entries: passed to nft unchanged" 1
     [ "$src_exceptions_only" -eq 1 ] && \
         log_and_print "Source IP of $name has exceptions only: the filter applies to all other devices" 0
-    local base_rule="$src_match"
-    [ -n "$protocol" ] && base_rule="$base_rule $protocol"
-
-    # Include src_port in the rule if set
-    local has_sport=0
-    if [ -n "$src_port" ] && [ "$src_port" != "any" ]; then
-        has_sport=1
-        # Check if multiple values (separated by space) - need braces
-        if echo "$src_port" | grep -q ' '; then
-            src_port=$(echo "$src_port" | tr ' ' ',')
-            base_rule="$base_rule sport { $src_port }"
-        else
-            # Single value (port or range) - no braces needed
-            base_rule="$base_rule sport $src_port"
-        fi
-    fi
-
-    # Include dest_port in the rule if set
-    if [ -n "$dest_port" ] && [ "$dest_port" != "any" ]; then
-        [ "$has_sport" = "1" ] && [ -n "$protocol" ] && base_rule="$base_rule $protocol"
-        # Check if multiple values (separated by space) - need braces
-        if echo "$dest_port" | grep -q ' '; then
-            dest_port=$(echo "$dest_port" | tr ' ' ',')
-            base_rule="$base_rule dport { $dest_port }"
-        else
-            # Single value (port or range) - no braces needed
-            base_rule="$base_rule dport $dest_port"
-        fi
-    fi
 
     # Add forward rule for allowed IPs with error checking
     log_and_print "Adding forward rule: $base_rule ip daddr @${set_name}_allowed counter accept" 2
@@ -711,36 +721,8 @@ create_dynamic_set() {
     fi
 
     # Create the base rule. setup_geo_filter has logged an unchecked Source IP already
-    build_src_match "$src_ip"
-    local base_rule="$src_match"
-    [ -n "$protocol" ] && base_rule="$base_rule $protocol"
-
-    # Include src_port in the rule if set
-    local has_sport=0
-    if [ -n "$src_port" ] && [ "$src_port" != "any" ]; then
-        has_sport=1
-        # Check if multiple values (separated by space) - need braces
-        if echo "$src_port" | grep -q ' '; then
-            src_port=$(echo "$src_port" | tr ' ' ',')
-            base_rule="$base_rule sport { $src_port }"
-        else
-            # Single value (port or range) - no braces needed
-            base_rule="$base_rule sport $src_port"
-        fi
-    fi
-
-    # Include dest_port in the rule if set
-    if [ -n "$dest_port" ] && [ "$dest_port" != "any" ]; then
-        [ "$has_sport" = "1" ] && [ -n "$protocol" ] && base_rule="$base_rule $protocol"
-        # Check if multiple values (separated by space) - need braces
-        if echo "$dest_port" | grep -q ' '; then
-            dest_port=$(echo "$dest_port" | tr ' ' ',')
-            base_rule="$base_rule dport { $dest_port }"
-        else
-            # Single value (port or range) - no braces needed
-            base_rule="$base_rule dport $dest_port"
-        fi
-    fi
+    local base_rule
+    build_base_rule "$protocol" "$src_ip" "$src_port" "$dest_port"
 
     # Add rule for the ui dynamic set (always needed) with error checking
     log_and_print "Adding prerouting rule for UI: $base_rule update @${set_name}_ui_dynamic { ip daddr }" 2
