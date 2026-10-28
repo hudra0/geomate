@@ -178,7 +178,7 @@ Source IP: several entries separated by spaces and `!` directly before an entry 
 3. **Configure Your Filter**
    - The dialog after drawing has the same options as the "Geo Filters" page, except the region list. The most important ones:
    - Protocol: Usually UDP for games
-   - Source IP: Your console/PC IP (e.g., 192.168.1.208). Several devices are separated by spaces, and `!` leaves one out (see `src_ip` in [Per-Filter Options](#per-filter-options))
+   - Source IP: Your console/PC IP (e.g., 192.168.1.208). Pick it from the suggested devices or type it, and give the device a static lease so the address stays the same. Several devices are separated by spaces, and `!` leaves one out (see `src_ip` in [Per-Filter Options](#per-filter-options) and [Geo Filters Page](#geo-filters-page))
    - Source Port / Destination Port: Use known values (e.g., 3074 for CoD) or see [Finding Game Ports and Protocols](#finding-game-ports-and-protocols)
    - Allowed IPs: Essential IPs for matchmaking/authentication, the whitelist (see [Allowed IPs Explained](#allowed-ips-explained))
    - IP List File: Either use an existing list or create an empty one (see [Understanding IP Lists](#understanding-ip-lists-and-allowed-ips))
@@ -189,6 +189,7 @@ Source IP: several entries separated by spaces and `!` directly before an entry 
    - Start with Dynamic or Monitor Mode to begin collecting server IPs
    - Play several matches to allow Geomate to collect and geolocate server IPs
    - The map will populate as IPs are discovered and geolocated
+   - Started in Monitor Mode? Check your circles against the markers and the connections table. When they fit, switch to Dynamic Mode with the mode pill in the status row above the map (see [Changing the Mode](#changing-the-mode))
    - Keep Strict Mode disabled until you've built a comprehensive IP list
 
 ![GeomateAdd](https://github.com/user-attachments/assets/ffdd5da0-d8d6-4b88-af53-5da055d57138)
@@ -199,26 +200,38 @@ Source IP: several entries separated by spaces and `!` directly before an entry 
 
 The **View** tab (Services > Geomate) shows the service status, the map and, below it, the table of active connections. Regions are circles. The **Geo Filters** tab lists all filters (see [Geo Filters Page](#geo-filters-page)).
 
-The status row above the map shows a **Running** / **Not running** pill ("Status unknown" when the router does not answer), a pill with the operational mode (Dynamic, Static or Monitor), a summary of the health checks ("All checks passed", or the names of the checks with an error, else those with a warning), "Loading GeoFilter data ..." while the service loads its data, the installed backend and frontend versions and the update state ("Up to date", "Update available", "Backend update available", "Frontend update available" or "Update check failed"). On narrow screens the row wraps and leaves out the versions and the update state. The status refreshes every 10 seconds.
+The status row above the map shows a **Running** / **Not running** pill ("Status unknown" when the router does not answer), a pill with the operational mode (Dynamic mode, Static mode or Monitor mode; with write access it is a menu, see [Changing the Mode](#changing-the-mode)), a summary of the health checks ("All checks passed", or the names of the checks with an error, else those with a warning), "Loading GeoFilter data ..." while the service loads its data, the installed backend and frontend versions and the update state ("Up to date", "Update available", "Backend update available", "Frontend update available" or "Update check failed"). On narrow screens the row wraps and leaves out the versions and the update state. The status refreshes every 10 seconds.
 
 **Details** opens a panel with the service state and its PID, what the mode does, each check with its message (Config, Files, Data, Autostart, nftables, nft errors; ✓ ok, ○ note, ⚠ warning, ✗ error), both versions with their update channel, the update state and a **Check again** button. The panel opens by itself when a problem shows on two status refreshes in a row. A problem is a stopped service while Geomate is enabled, or a check with a warning or an error. If you close the panel, it stays closed until a new problem appears. It never closes by itself.
 
 The update check runs when the page opens and then every hour. GitHub allows 60 unauthenticated requests per hour and IP address, so the browser keeps the result for an hour (10 minutes after a failure) and the page reuses it until then. **Check again** asks GitHub right away and also skips the router's own 10-minute cache.
 
+### Changing the Mode
+
+With write access, the mode pill in the status row is a button with a ▾. It opens a menu with **Dynamic mode**, **Static mode** and **Monitor mode**, each with a one-line description. A check mark shows the mode of the saved configuration, which Geomate runs in once it has restarted. Pick an entry with the mouse, or use the arrow keys, Home, End and Enter. **Esc**, **Tab** or a click outside closes the menu. Without write access the pill is plain text.
+
+The usual path: set up the circles in Monitor mode, check them against the markers and the Status column of the connections table, then switch to Dynamic mode here.
+
+- The switch is applied at once, without Save & Apply: the map writes `operational_mode` to `/etc/config/geomate` and shows "Switched to Dynamic mode. Geomate restarts." with an **Undo** button for 10 seconds. A mode change restarts Geomate like any option other than circles and allowed IPs (see [How Changes Take Effect](#how-changes-take-effect)). Until it has restarted, for 60 seconds at most, the status row shows "Loading GeoFilter data ...".
+- Switching from Monitor mode to Dynamic or Static mode asks first, because Geomate then starts to block. The dialog says "Geomate will block servers outside your regions." With Strict Mode on it adds "Strict mode also blocks servers that are not geolocated yet." The buttons are **Cancel** and **Switch to Dynamic mode** (or **Switch to Static mode**). Every other switch asks nothing.
+- Undo writes the previous mode back and restarts Geomate again. Like every map change, it undoes the last change only.
+- If Geomate is disabled in the global settings, the mode is saved and the map says "Saved. Geomate is not running." The switch does not start it. If Geomate is enabled but not running, the map says only "Switched to Dynamic mode.": the reload may start it or not.
+- With unsaved Geomate changes in your LuCI session, the switch is refused, as described in [How Changes Take Effect](#how-changes-take-effect).
+
 ### How Changes Take Effect
 
-The map applies every change at once: a new, moved, resized or deleted circle, a new filter, and the Enable button in the message after drawing. The View tab has no Save & Apply and no buttons in its footer. Each change is written to `/etc/config/geomate`, and Geomate picks it up right away. Only the Geomate configuration is committed. Unsaved changes of other configurations stay as they are.
+The map applies every change at once: a new, moved, resized or deleted circle, a new filter, the Enable button in the message after drawing, the Allow and Remove buttons of the connections table and the mode menu of the status row. The View tab has no Save & Apply and no buttons in its footer. Each change is written to `/etc/config/geomate`, and Geomate picks it up right away. Only the Geomate configuration is committed. Unsaved changes of other configurations stay as they are.
 
-- After each change the map shows "Applied." with an **Undo** button for 10 seconds. Undo writes back the values the change replaced and applies that. It works for the last change only, and not when the filter was changed since. Undoing the creation of a filter deletes the filter.
+- After each change the map shows "Applied." with an **Undo** button for 10 seconds. Allow and Remove show "Added … to the allowed IPs of …" or "Removed … from the allowed IPs of …" instead, and the mode menu "Switched to …". Undo writes back the values the change replaced and applies that. It works for the last change only, and not when the filter (for a mode switch: the mode) was changed since. Undoing the creation of a filter deletes the filter.
 - A change of circles or allowed IPs only: Geomate refills the allowed and blocked sets of the changed filter in place, without a restart. The rules, the counters and the IPs collected since the last save stay. Changing the circles or allowed IPs of a disabled filter needs nothing at all.
 - Any other change (a new filter, Enable, any other option) restarts Geomate. It rebuilds all nftables rules, and filtering is bypassed for a short time. The IPs collected so far are saved to the IP lists before every stop.
 - A change of circles or allowed IPs restarts Geomate too when a start has not finished yet, when the last start had nftables errors (an invalid Source IP counts as one), or when the names of two enabled filters differ only in spaces and underscores. If the run loop has stopped, for example after repeated crashes, every change restarts Geomate and so starts it again.
 - An allowed IP entry that is not an IPv4 address, subnet, range or host name is skipped, on a live reload and at start; the other entries apply. The filter shows "nftables error" until the entry is fixed, so the next change of circles or allowed IPs restarts Geomate. Allowed IP subnets and ranges may contain geolocated servers. An older backend failed on such an overlap: up to 1000 geolocated servers were missing from the filter's sets, without an nftables error, and every live reload restarted Geomate.
 - Geomate also compares the configuration file without its region and allowed IP lists with the file it started from. The first change of circles or allowed IPs after a hand edit of `/etc/config/geomate` therefore usually restarts Geomate once, because uci rewrites the whole file in its own format. The same happens on the first circle change of a filter whose regions are written as `option allowed_region` instead of `list allowed_region`, and on the first allowed IP change of a filter with `option allowed_ip` instead of `list allowed_ip`. Geomate reads regions only as `list allowed_region`: at start, on a live reload and when it collects new IPs, it ignores a hand-written `option allowed_region`. The first save of a filter's edit dialog on the Geo Filters page can also restart Geomate once, when it fills in a missing default such as IP Expiry (Days).
 - An older backend restarts Geomate for allowed IP changes too, and an even older one for every change, circles included. `/etc/init.d/geomate update` updates backend and web interface together.
-- If your LuCI session holds unsaved Geomate changes, for example from the Geo Filters page, the map refuses every change: a new circle disappears, an edit goes back, and the map says "Apply or revert the unsaved geomate changes first." Applying would also apply those changes unseen. The page shows the notice "Apply or revert the unsaved geomate changes before you change the map." with a **Show changes** button, which opens LuCI's Unsaved Changes dialog, where you apply or revert them. The notice also shows when you open the View tab with unsaved Geomate changes.
+- If your LuCI session holds unsaved Geomate changes, for example from the Geo Filters page, the map refuses every change: a new circle disappears, an edit goes back, and the map says "Apply or revert the unsaved geomate changes first." Applying would also apply those changes unseen. The page shows the notice "Apply or revert the unsaved geomate changes before you change the map." with a **Show changes** button, which opens LuCI's Unsaved Changes dialog, where you apply or revert them. The notice also shows when you open the View tab with unsaved Geomate changes. Allow, Remove and the mode menu are refused the same way and show the same notice (the mode menu's ends "before you change the mode.").
 - If a change cannot be applied, for example because the filters were changed in another browser tab, the map says so and shows the stored configuration again.
-- Without write access to the Geomate configuration, the map only shows the circles: **Draw circle** is hidden and circles cannot be selected.
+- Without write access to the Geomate configuration, the map only shows the circles: **Draw circle** is hidden and circles cannot be selected. The mode pill is plain text, and the connections table has no Allow and Remove buttons. The server button of the legend still works.
 - Exception: **Upload IP List** in the new-filter dialog writes the list file to the router at once, before you click Save (it asks before it replaces an existing file). Cancel and Undo do not remove an uploaded file. **Create Empty List** only fills in the path. Geomate creates a missing file when it starts, and a new filter restarts it.
 
 ### Drawing a Circle
@@ -240,6 +253,21 @@ Each filter has a color of its own; with more than eight filters the colors repe
 - The last circle of a filter opens the dialog "Delete the last circle of …?". For an enabled filter, **Delete and disable** is preselected; the other choices are **Delete** (the filter stays enabled) and **Cancel**. A filter without a region puts no geolocated IP into its allowed or blocked set. With Strict Mode on (and not in Monitor Mode), an enabled filter without a region therefore blocks every server except its allowed IPs; the dialog says which case applies. For a disabled filter, the dialog only asks to confirm.
 - While a changed circle is selected, **Draw circle** asks you to click Done or Cancel first.
 
+### Known Servers
+
+Each filter in the legend has a server button, next to the eye and the magnifier. Its tooltip reads "Show known servers of …" or "Hide known servers of …". It draws the servers from the filter's geo data file (`/etc/geomate.d/<filter name>_geo_data.json`) as dots in the filter's color, so you see where the servers of a game are while you draw a circle. The legend lists the dot as "Known servers (bigger: more)".
+
+- A dot is one position. Its size follows the number of servers there: a radius of 3 px for one server, 2 px more for every factor of 10, 12 px at most.
+- The dots take no clicks and lie below the circles. A click goes through them to the circle or the map below.
+- The button works without a circle and without write access. The first click loads the positions from the router, and the map keeps them for 5 minutes. While the dots are shown, the legend adds the number of servers to the filter's line, for example "2 circles · 12,843 servers".
+- A filter without geolocated servers gets the note "No known servers for … yet." and the dots go off. If the positions cannot be loaded, a notification above the map says so once per filter, with the error: "Could not load the known servers of …: …". Later clicks show "Could not load the known servers of …." in the map. The legend line says "servers unknown". The map never turns a failure into "0 servers".
+- Positions come from the rpcd method `getKnownServers` of the web interface. It only reads the geo data file and keeps a cache in `/tmp`. After an update of the web interface, an open LuCI session may not be allowed to call it yet: the notification then ends "Log in again after an update of the web interface." Log in to LuCI again.
+- When the web interface does not answer within 60 seconds, the map shows "Could not load the known servers. Reload the page."
+
+While a circle is selected, the bar at the bottom of the map shows a counter, "1,284 in circle · 9,876 / 12,843 in this filter". The first number counts the known servers inside the selected circle. The second counts those inside any circle of the filter, which is what the filter allows by position, and the third is all known servers of the filter. Allowed IPs are not part of it. The counter follows while you drag, resize or type a radius, and it loads the positions itself when the dots are off. Before the numbers are there, it says "Counting known servers…", "No known servers yet" or "Known servers unknown". Distances use the Haversine formula with the Earth radius of 6371000 m, like the backend.
+
+With more than 3000 different positions, the positions are merged and rounded: first to 2 decimals of a degree, then to 1 and 0 while there are still more than 3000. The counter then has a tooltip, "Positions rounded to about 1 km" (10 km or 100 km for the coarser steps), and a server near the edge of a circle can be counted on the wrong side.
+
 ### Map Controls
 
 | Control | What it does |
@@ -248,7 +276,7 @@ Each filter has a color of its own; with more than eight filters the colors repe
 | Home | Go to your home view. Without a saved home view, zoom to all circles |
 | Set home | Save the current view (centre and zoom) as the home view. The map says "Home view saved." |
 | Fullscreen | Show the map in the whole window; Esc or the same button leaves it |
-| Legend | Lists the filters with their circle count, then the circle states (Enabled, Disabled, Selected) and the connection markers (Allowed, Blocked, Whitelisted, and the clusters Several allowed, Several blocked, Several whitelisted and Mixed). The eye hides or shows the circles of a filter, the magnifier zooms to them. The switch **Dark map tiles** dims the map; it is off by default |
+| Legend | Lists the filters with their circle count, then the circle states (Enabled, Disabled, Selected) and the connection markers (Allowed, Blocked, Whitelisted, and the clusters Several allowed, Several blocked, Several whitelisted and Mixed). The eye hides or shows the circles of a filter, the magnifier zooms to them, the server button shows its known servers (see [Known Servers](#known-servers)). The switch **Dark map tiles** dims the map; it is off by default |
 
 The map opens at your home view if you saved one, otherwise it shows all circles. The link **Show on map** on the Geo Filters page opens it at the circles of that filter instead. Without circles and without a home view the map shows a default view over Europe.
 
@@ -256,9 +284,34 @@ The legend is closed by default on phones and when the map is narrower than 900 
 
 ### Active Connections
 
-Below the map, the **Active connections (n)** bar shows or hides the table. Click anywhere on the bar; its right end reads **Show** or **Hide**. The table stays hidden until you open it, and on wide screens the map gets shorter while it is shown. It lists every tracked game server connection with IP, Filter, Status, Country, City and ISP. Click a column header to sort. The data refreshes every 5 seconds while the tab is visible and pauses in a background tab. If it fails several times in a row, the status row above the map says "Connections not updated since …" or "Connections unavailable". Status is Whitelisted, Allowed, Blocked, Untracked (not geolocated) or Unknown.
+Below the map, the **Active connections (n)** bar shows or hides the table. Click anywhere on the bar; its right end reads **Show** or **Hide**. The table stays hidden until you open it, and on wide screens the map gets shorter while it is shown. It lists every server that an enabled filter has seen traffic to in the last 10 seconds, and for 30 minutes after that (see **Last seen** below), whether Geomate knows its position or not. The columns are IP, Filter, Status, Country, City, ISP and Last seen, and with write access a last one without a title for the Allow and Remove buttons. Private addresses and the router's own addresses are left out. The n in the bar counts the servers of the last refresh. Click a column header to sort. The data refreshes every 5 seconds while the tab is visible and pauses in a background tab. If it fails several times in a row, the status row above the map says "Connections not updated since …" or "Connections unavailable".
 
-Country, city and ISP come from the geolocation data of the filter. They show "–" when no data is known for an IP yet, and after an update from an older version until the next service start or geolocation batch refreshes the lookup cache. A connection with a known position also gets a marker on the map: green for Allowed, red for Blocked, blue for Whitelisted. Markers close together form a cluster with a count: green if all are allowed, red if all are blocked, blue if all are whitelisted, orange if mixed. Click a marker for the IP, status, filter, country, city and ISP (and the organization, when it differs from the ISP).
+The Status column shows what the filter's nftables sets say about the server:
+
+| Status | Meaning |
+|--------|---------|
+| Whitelisted | The server is in the Allowed IPs of the filter in the Filter column, as an address of its own or inside a subnet or range. Allowed IPs of another filter do not count |
+| Allowed | The server was geolocated inside a circle of the filter |
+| Blocked | The server was geolocated outside every circle of the filter. In Monitor mode nothing is blocked: the status shows what the filter would do |
+| Untracked | The server is in neither set: it is not geolocated yet, or the filter has no circle. Strict Mode (outside Monitor mode) blocks it, otherwise it passes. The tooltip says which case applies and when the next geolocation update can place it, for example "Not geolocated yet. Strict mode blocks it. Geolocated with one of the next automatic updates." See [Geolocation Updates](#geolocation-updates). Static mode adds no new servers to the IP list |
+| Unknown | The row has no verdict: it was restored after you left the page ("Seen before the page was loaded."), or you removed the address from the Allowed IPs after the server was last seen ("Removed from the allowed IPs since last seen.") |
+
+A Whitelisted, Allowed or Blocked server without a known position, for example one that only the Allowed IPs cover, has the tooltip "Not on the map until geolocated." In Static mode it reads "Not on the map: static mode does not geolocate new servers."
+
+Country, city and ISP come from the geolocation data of the filter. They show "–" when no data is known for an IP yet, and after an update from an older version until the next service start or geolocation batch refreshes the lookup cache. A connection with a known position also gets a marker on the map: green for Allowed, red for Blocked, blue for Whitelisted. Markers close together form a cluster with a count: green if all are allowed, red if all are blocked, blue if all are whitelisted, orange if mixed. Click a marker for the IP, status, filter, country, city and ISP (and the organization, when it differs from the ISP). An untracked server has no marker.
+
+**Last seen** shows "Now" for a server of the last refresh. For any other server it shows the time since the last refresh that had it, as "3 min ago" and from 60 minutes on as "1 h ago". A server stays in the table for 30 minutes after its last refresh, 300 servers at most, so a server does not vanish 10 seconds after its last packet. These past rows are dimmed and keep the status of their last refresh. A row goes away when its filter is disabled or deleted. The markers on the map and the n in the bar only count the servers of the last refresh. While the status row says "Connections not updated since …", no row says "Now" and each shows the age of the last refresh.
+
+The page notes a server only while it is open and visible: the refresh pauses in a background tab. When you leave the View tab and come back in the same browser tab, the table starts with the servers of the last 30 minutes again. The browser keeps them in its session storage (IP, filter, time, country and country code, city, ISP and organization, nothing on the router). These restored rows show **Unknown**, because the status is not stored, with their real age. The next refresh that has the server replaces the row.
+
+**Allow** and **Remove** are in the last column, with write access only. Allow adds the server to the Allowed IPs of the filter in the row's Filter column. A row whose server the filter's Allowed IPs list as an entry of its own has **Remove** instead. A server that only a subnet, a range or a longer entry such as `1.2.3.4 5.6.7.8` covers has no button: the cell shows "–", and its tooltip says to edit the entry on the Geo Filters page. The buttons also work on past rows.
+
+- A click is applied at once, without Save & Apply: Geomate writes `list allowed_ip` of that filter to `/etc/config/geomate`. The map shows "Added 1.2.3.4 to the allowed IPs of Call of Duty." or "Removed …" with an **Undo** button (see [How Changes Take Effect](#how-changes-take-effect)). Without a loaded map, a notification shows the text. The row then shows Whitelisted, or the status the sets give it after a Remove.
+- The server goes into the filter's allowed set, which wins over the blocked set. With a backend that reloads live, the filter's sets are refilled without a restart. An older backend restarts Geomate. The restart clears the list of servers the filters have seen: the n in the bar stays 0 until the game sends traffic to the servers again (seconds in a running match, longer in the menu), and the rows stay as past rows until then.
+- In Monitor mode Allow changes the status only. Nothing is blocked.
+- A click is refused with a notification when the filter name is not unique ("Not applied: several filters are named …"), when the filter has a hand-written `option allowed_ip` ("Edit it on the Geo Filters page."), or when the address is listed already. Unsaved Geomate changes in your session refuse it too.
+
+The table uses compact rows: cell padding of 5 px by 10 px and small buttons, so more servers fit on the screen. When the table has 900 px or less of room, each server is a card of two lines instead of a row, whatever the theme does. The first line has the IP in bold, the status and the button. Below, in smaller dimmed text, come "Filter · Country · ISP" (a long name ends in "…") and Last seen on the right. The city and the column titles are left out, and the cards cannot be sorted. Phones and narrow windows get cards. A wider table is a real table in every theme, also in those that stack table rows on narrow windows. A browser without container queries shows cards only in windows up to 600 px.
 
 ### Geo Filters Page
 
@@ -275,7 +328,7 @@ The table has these columns:
 | Enable | A switch for the filter |
 | Name | The filter name |
 | Status | The state of the filter in the configuration, see below |
-| Match | The traffic the filter looks at, built from Protocol, Source IP, Source Port and Destination Port. Examples: "UDP from 192.168.2.208 port 3074", "UDP from 192.168.2.208 to port 9000-9100". Without any of them only the protocol shows ("UDP traffic"), and without a protocol either "Any traffic". Entries show as configured |
+| Match | The traffic the filter looks at, built from Protocol, Source IP, Source Port and Destination Port. Examples: "UDP from 192.168.2.208 port 3074", "UDP from 192.168.2.208 to port 9000-9100". Without any of them only the protocol shows ("UDP traffic"), and without a protocol either "Any traffic". Entries show as configured, with two additions. A Source IP address for which the router knows a host name shows it in brackets ("UDP from 192.168.2.208 (PS5) port 3074"). Exceptions follow the other entries as "except 192.168.2.10", or as "any except 192.168.2.10" when there is nothing else ("UDP from any except 192.168.2.10 to port 9000-9100"). Without host names, for example when the session may not read them, the column shows addresses only |
 | IPs/Located | The IPs in the list and how many are located: "120 ✓" for all, "120 (60%)" for part of them, "120 (stale)" when the geo data holds IPs that left the list, "No data" when there is no information for the filter yet |
 | Regions | The number and radii of the circles, for example "2 circles · 436 km, 683 km", and a **Show on map** link that opens the View tab at that filter. Invalid entries are counted ("1 invalid"), and "Not a list" marks a hand-written `option allowed_region` |
 
@@ -283,6 +336,11 @@ The edit dialog (titled "Filter <name>", or "New filter" for a new one) has ever
 
 - **Create Empty List** fills in the path `/etc/geomate.d/<name>_servers.txt` (the name in lowercase, other characters replaced by `_`). Geomate creates a missing file when it starts.
 - **Upload List** writes the chosen file to the path in IP List File, or to that suggested path when the field is empty, at once and before you save the dialog. The file must lie directly in `/etc/geomate.d` and must not end in `.json` or `.md5`. If the file exists, the dialog asks "… already exists. Replace it with …?" and waits for **Replace** or **Cancel**.
+- **Source IP** is the device the filter applies to. The field suggests the devices of your LAN as "192.168.2.208 (PS5)", or as "IP (MAC)" when the router knows no name. The suggestions come from the host hints that LuCI's Static Leases page uses, in numeric order, without the router's own addresses. You can type any entry as well. The field stores the address, not the name, so give the device a static lease: otherwise DHCP can change its address and the filter hits another device or none. An empty field means all devices.
+  - With a backend that reports `src_ip_multi` (see [Debug and Monitoring Tools](#debug-and-monitoring-tools)), the field is a list. Each entry is an IPv4 address, a subnet (`192.168.2.0/24`) or a range (`192.168.2.10-192.168.2.20`). `!` before an entry leaves it out. A pasted "a b" becomes two entries. The entries are saved in one `option src_ip`, separated by spaces, as in earlier versions. For the rules this builds, see `src_ip` in [Per-Filter Options](#per-filter-options).
+  - With an older backend, or when the backend does not answer, the field takes one address, with the same suggestions. Several entries and `!` are rejected there ("This Geomate backend supports one address only.", "This Geomate backend supports no exceptions.").
+  - A new entry must be one of the three forms: "Expecting: IPv4 address, address/prefix or address range". A saved value that you do not change stays valid, so a filter with an old value can still be saved.
+  - The new-filter dialog of the map has the same field.
 
 The Status column shows the state of each filter in the configuration:
 
@@ -414,15 +472,15 @@ Without proper Allowed IPs:
 Finding the correct allowed IPs for games can involve some trial and error. Here's a systematic approach:
 
 #### Method 1: Using Monitor Mode (Recommended)
-1. Set Geomate to **Monitor Mode** in the LuCI interface
+1. Set Geomate to **Monitor Mode** in the LuCI interface (the mode pill in the status row of the View tab, see [Changing the Mode](#changing-the-mode))
 2. Play your game normally - all connections will be tracked but not blocked
-3. Click the Active connections bar below the map (or click a marker on the map) to see which servers your game connects to. The table is sortable and shows IP, status, country, city and ISP. To stop it from updating while you read, click the "Refreshing" indicator in the LuCI header (it changes to "Paused"); click it again to resume.
+3. Click the Active connections bar below the map (or click a marker on the map) to see which servers your game connects to. The table is sortable and shows IP, status, country, city, ISP and when each server was last seen. To stop it from updating while you read, click the "Refreshing" indicator in the LuCI header (it changes to "Paused"); click it again to resume.
 4. The map will populate with server locations as they're discovered and geolocated
 5. Play multiple matches to build a comprehensive IP database
 6. Pay attention to patterns - which servers are used for matchmaking vs. actual gameplay
-7. Make note of essential servers (like authentication and matchmaking) for whitelisting
+7. Make note of essential servers (like authentication and matchmaking) for whitelisting, or click **Allow** in the connections table to add a server to the Allowed IPs of its filter at once
 8. Once you've identified all necessary servers, decide on your filtering approach:
-   - Use Dynamic Mode for automatic filtering
+   - Use Dynamic Mode for automatic filtering (switch with the same mode pill; it asks before Geomate starts to block)
    - Use Static Mode if you want to manually manage IP lists
    - Enable Strict Mode when you're confident in your IP database
 
@@ -560,7 +618,7 @@ Example: If you want to play COD with friends from both Europe and USA:
      - Incorrect port configurations
      - No game servers are within your allowed regions
    - Solutions:
-     - Add necessary IPs to "Allowed IPs" list
+     - Add necessary IPs to "Allowed IPs" list, for example with **Allow** in the connections table (blocked and untracked servers show there)
      - Verify whitelist for matchmaking/relay servers
      - Confirm port configurations are correct
      - Disable Strict Mode during initial setup
@@ -784,6 +842,8 @@ This command will:
 - Restart the service automatically if required
 
 Geomate will preserve your existing configuration settings during updates.
+
+After an update of the web interface, log in to LuCI again if a notification on the View tab says "Log in again after an update of the web interface." (see [Known Servers](#known-servers)). The update restarts rpcd, but an open session does not get the new method `getKnownServers` until you log in again.
 
 #### Advanced Update Options
 
