@@ -346,7 +346,7 @@ status_service() {
         if [ "$filter_enabled" = "1" ]; then
             filter_count=$((filter_count + 1))
             local set_name
-            set_name=$(echo "$filter_name" | tr ' ' '_')
+            set_name="${filter_name// /_}"
             local allowed_count=0 blocked_count=0
 
             # Count IPs in nftables sets
@@ -587,7 +587,7 @@ health_check() {
                 # geomate.sh builds no sets for a filter with an invalid name
                 valid_filter_name "$filter_name" || { sets_ok=0; return 0; }
                 local set_name
-                set_name=$(echo "$filter_name" | tr ' ' '_')
+                set_name="${filter_name// /_}"
                 # Check if allowed and blocked sets exist
                 if ! nft list set inet geomate "geomate_${set_name}_allowed" >/dev/null 2>&1; then
                     sets_ok=0
