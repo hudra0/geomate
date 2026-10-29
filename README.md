@@ -215,6 +215,10 @@ The status row above the map shows a **Running** / **Not running** pill ("Status
 
 The update check runs when the page opens and then every hour. GitHub allows 60 unauthenticated requests per hour and IP address, so the browser keeps the result for an hour (10 minutes after a failure) and the page reuses it until then. **Check again** asks GitHub right away and also skips the router's own 10-minute cache.
 
+After an update of the backend or the web interface, the status row checks for updates once more, so the update state does not keep showing the old result. If the page still runs an older version of the web interface, the status row shows "The web interface was updated. Reload the page." Click **Reload the page** to load the new version past the browser cache.
+
+A LuCI login with read-only access to Geomate still sees the status and the update state. It can no longer start or stop Geomate or run the init script. Those actions need write access.
+
 ### Changing the Mode
 
 With write access, the mode pill in the status row is a button with a ▾. It opens a menu with **Dynamic mode**, **Static mode** and **Monitor mode**, each with a one-line description. A check mark shows the mode of the saved configuration, which Geomate runs in once it has restarted. Pick an entry with the mouse, or use the arrow keys, Home, End and Enter. **Esc**, **Tab** or a click outside closes the menu. Without write access the pill is plain text.
