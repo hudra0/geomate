@@ -400,6 +400,90 @@ build_src_match() {
     return 0
 }
 
+# Return 0 when filter name $1 is not empty and has only letters, digits, spaces, '_',
+# '.' and '-' (filter_set_name in luci.geomate), and set set_name to the nft set name
+# prefix of the filter, with '_' for each space. Any other character could end the nft
+# command that carries a set name (';', a line break) or lead the geo data file name out
+# of $GEOMATE_DATA_DIR ('/'). Otherwise set set_name to '' and return 1
+filter_set_name() {
+    set_name=""
+    case "$1" in
+        ''|*[!A-Za-z0-9_\ .-]*) return 1 ;;
+    esac
+    set_name="${NFT_SET_PREFIX}${1// /_}"
+}
+
+# Return 0 when $1, the value of a rule option (protocol, src_ip, src_port, dest_port),
+# has only characters of the forms nft accepts there: letters, digits, spaces and
+# . , : / _ - ! = < > & | ^ { } @. nft joins its arguments into one command line, where
+# ';' or a line break starts another command (such as 'flush ruleset', which would also
+# hit fw4 and qosmate) and '#' cuts off the rest of the rule
+is_nft_rule_value() {
+    case "$1" in
+        *[!A-Za-z0-9\ .,:/_!=\<\>\&\|^{}@-]*) return 1 ;;
+    esac
+}
+
+# Return 1 when a rule option of filter section $1 fails is_nft_rule_value; the option
+# is then in bad_option, its value in bad_value
+check_rule_options() {
+    for bad_option in protocol src_ip src_port dest_port; do
+        config_get bad_value "$1" "$bad_option"
+        is_nft_rule_value "$bad_value" || return 1
+    done
+}
+
+# Log a value that must not reach nft on level 0 and add it to $NFT_ERROR_LOG as
+# '<subject>: <value> -> Error: <error>'. $1: subject, $2: value, $3: error, $4: the set
+# whose reference marks the filter in the status ("nftables error"), empty for none.
+# Characters outside printable ASCII show as '?', so each entry stays one line
+report_nft_input_error() {
+    local subject value
+    subject=$(printf '%s' "$1" | tr -c ' -~' '?')
+    value=$(printf '%s' "$2" | tr -c ' -~' '?')
+    log_and_print "Error: $subject '$value': $3" 0
+    printf '[%s] %s: %s -> Error: %s%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" \
+        "$subject" "$value" "$3" "${4:+ (@$4)}" >> "$NFT_ERROR_LOG"
+}
+
+# Build the nft match of a filter's traffic into the global base_rule, shared by the
+# forward and the prerouting rules: Source IP (build_src_match), protocol and ports.
+# $1: protocol, $2: src_ip, $3: src_port, $4: dest_port. Returns the status of
+# build_src_match, which also sets src_exceptions_only
+build_base_rule() {
+    local protocol="$1" src_port="$3" dest_port="$4" has_sport=0 rv=0
+    build_src_match "$2" || rv=1
+    base_rule="$src_match"
+    [ -n "$protocol" ] && base_rule="$base_rule $protocol"
+
+    # Include src_port in the rule if set
+    if [ -n "$src_port" ] && [ "$src_port" != "any" ]; then
+        has_sport=1
+        # Check if multiple values (separated by space) - need braces
+        if echo "$src_port" | grep -q ' '; then
+            src_port=$(echo "$src_port" | tr ' ' ',')
+            base_rule="$base_rule sport { $src_port }"
+        else
+            # Single value (port or range) - no braces needed
+            base_rule="$base_rule sport $src_port"
+        fi
+    fi
+
+    # Include dest_port in the rule if set
+    if [ -n "$dest_port" ] && [ "$dest_port" != "any" ]; then
+        [ "$has_sport" = "1" ] && [ -n "$protocol" ] && base_rule="$base_rule $protocol"
+        # Check if multiple values (separated by space) - need braces
+        if echo "$dest_port" | grep -q ' '; then
+            dest_port=$(echo "$dest_port" | tr ' ' ',')
+            base_rule="$base_rule dport { $dest_port }"
+        else
+            # Single value (port or range) - no braces needed
+            base_rule="$base_rule dport $dest_port"
+        fi
+    fi
+    return "$rv"
+}
+
 # Return 1 when $1, which passed is_ipv4_entry, is a range a.b.c.d-e.f.g.h whose first
 # address is above its last one: nft rejects it with the whole element list
 ipv4_range_ordered() {
@@ -592,7 +676,12 @@ setup_geo_filter() {
 
     [ "$enabled" = "0" ] && return
 
-    local set_name="${NFT_SET_PREFIX}$(echo "$name" | tr ' ' '_')"
+    local set_name bad_option bad_value
+    if ! filter_set_name "$name"; then
+        report_nft_input_error "filter name" "$name" \
+            "only letters, digits, spaces, '_', '.' and '-' are allowed, filter skipped"
+        return
+    fi
 
     log_and_print "Setting up geo filter for $name" 1
 
@@ -614,41 +703,22 @@ setup_geo_filter() {
             "$allowed_entries" "$blocked_entries"
     fi
 
+    # A rule option with a character nft must not see leaves the filter without rules,
+    # like a value nft rejects
+    if ! check_rule_options "$1"; then
+        report_nft_input_error "$bad_option of filter $name" "$bad_value" \
+            "character not allowed in an nft rule (such as ';', '#' or a line break), filter has no rules" \
+            "${set_name}_allowed"
+        return
+    fi
+
     # Add rules for allowed and blocked IPs. If nft rejects the Source IP, nft_exec logs
     # it with @<set>_allowed and the filter gets no rules, as before
-    build_src_match "$src_ip" || \
+    local base_rule
+    build_base_rule "$protocol" "$src_ip" "$src_port" "$dest_port" || \
         log_and_print "Source IP '$src_ip' of filter $name is not a list of IPv4 entries: passed to nft unchanged" 1
     [ "$src_exceptions_only" -eq 1 ] && \
         log_and_print "Source IP of $name has exceptions only: the filter applies to all other devices" 0
-    local base_rule="$src_match"
-    [ -n "$protocol" ] && base_rule="$base_rule $protocol"
-
-    # Include src_port in the rule if set
-    local has_sport=0
-    if [ -n "$src_port" ] && [ "$src_port" != "any" ]; then
-        has_sport=1
-        # Check if multiple values (separated by space) - need braces
-        if echo "$src_port" | grep -q ' '; then
-            src_port=$(echo "$src_port" | tr ' ' ',')
-            base_rule="$base_rule sport { $src_port }"
-        else
-            # Single value (port or range) - no braces needed
-            base_rule="$base_rule sport $src_port"
-        fi
-    fi
-
-    # Include dest_port in the rule if set
-    if [ -n "$dest_port" ] && [ "$dest_port" != "any" ]; then
-        [ "$has_sport" = "1" ] && [ -n "$protocol" ] && base_rule="$base_rule $protocol"
-        # Check if multiple values (separated by space) - need braces
-        if echo "$dest_port" | grep -q ' '; then
-            dest_port=$(echo "$dest_port" | tr ' ' ',')
-            base_rule="$base_rule dport { $dest_port }"
-        else
-            # Single value (port or range) - no braces needed
-            base_rule="$base_rule dport $dest_port"
-        fi
-    fi
 
     # Add forward rule for allowed IPs with error checking
     log_and_print "Adding forward rule: $base_rule ip daddr @${set_name}_allowed counter accept" 2
@@ -697,7 +767,9 @@ create_dynamic_set() {
 
     [ "$enabled" = "0" ] && return
 
-    local set_name="${NFT_SET_PREFIX}$(echo "$name" | tr ' ' '_')"
+    # setup_geo_filter has reported an invalid name or rule option already
+    local set_name bad_option bad_value
+    filter_set_name "$name" || return
 
     log_and_print "Setting up sets for $name" 1
 
@@ -711,36 +783,9 @@ create_dynamic_set() {
     fi
 
     # Create the base rule. setup_geo_filter has logged an unchecked Source IP already
-    build_src_match "$src_ip"
-    local base_rule="$src_match"
-    [ -n "$protocol" ] && base_rule="$base_rule $protocol"
-
-    # Include src_port in the rule if set
-    local has_sport=0
-    if [ -n "$src_port" ] && [ "$src_port" != "any" ]; then
-        has_sport=1
-        # Check if multiple values (separated by space) - need braces
-        if echo "$src_port" | grep -q ' '; then
-            src_port=$(echo "$src_port" | tr ' ' ',')
-            base_rule="$base_rule sport { $src_port }"
-        else
-            # Single value (port or range) - no braces needed
-            base_rule="$base_rule sport $src_port"
-        fi
-    fi
-
-    # Include dest_port in the rule if set
-    if [ -n "$dest_port" ] && [ "$dest_port" != "any" ]; then
-        [ "$has_sport" = "1" ] && [ -n "$protocol" ] && base_rule="$base_rule $protocol"
-        # Check if multiple values (separated by space) - need braces
-        if echo "$dest_port" | grep -q ' '; then
-            dest_port=$(echo "$dest_port" | tr ' ' ',')
-            base_rule="$base_rule dport { $dest_port }"
-        else
-            # Single value (port or range) - no braces needed
-            base_rule="$base_rule dport $dest_port"
-        fi
-    fi
+    check_rule_options "$1" || return
+    local base_rule
+    build_base_rule "$protocol" "$src_ip" "$src_port" "$dest_port"
 
     # Add rule for the ui dynamic set (always needed) with error checking
     log_and_print "Adding prerouting rule for UI: $base_rule update @${set_name}_ui_dynamic { ip daddr }" 2
@@ -775,7 +820,8 @@ harvest_dynamic_set() {
     config_get ip_list "$1" 'ip_list'
     config_get expiry_days "$1" 'ip_expiry_days' '0'
     [ -n "$ip_list" ] || { log_and_print "Filter $name has no ip_list configured, skipping harvest" 2; return 0; }
-    set_name="${NFT_SET_PREFIX}$(echo "$name" | tr ' ' '_')"
+    # A filter with an invalid name has no sets (setup_geo_filter)
+    filter_set_name "$name" || return 0
 
     # Only filters that were enabled outside static mode at the last start have this set
     elements=$(nft list set inet geomate "${set_name}_dynamic" 2>/dev/null) || return 0
@@ -873,7 +919,7 @@ process_dynamic_set() {
     # Read the regions as a list, like the start and the live reload do
     config_list_foreach "$1" 'allowed_region' append_allowed_region
     [ -n "$allowed_regions" ] || return 0
-    set_name="${NFT_SET_PREFIX}$(echo "$name" | tr ' ' '_')"
+    filter_set_name "$name" || return 0
     # The start has reported skipped entries already
     filter_set_entries "$1" "$name" "$set_name" 0
     # A list nft rejected at start covers nothing (add_filter_entries). A live reload
@@ -1231,7 +1277,9 @@ reload_filter_sets() {
 
     config_get name "$1" 'name'
     config_list_foreach "$1" 'allowed_region' append_allowed_region
-    set_name="${NFT_SET_PREFIX}$(echo "$name" | tr ' ' '_')"
+    # The start skipped a filter with an invalid name and wrote an nft error, after which
+    # reload_regions restarts instead of getting here
+    filter_set_name "$name" || return 0
     filter_set_entries "$1" "$name" "$set_name" 1
     geo_data_file="${GEOMATE_DATA_DIR}/${name}_geo_data.json"
 
@@ -1260,11 +1308,12 @@ strip_reloadable_lists() {
 
 # config_foreach callback: print the set name prefix of an enabled filter
 print_enabled_set_name() {
-    local name enabled
+    local name enabled set_name
     config_get enabled "$1" 'enabled' '0'
     [ "$enabled" = "0" ] && return 0
     config_get name "$1" 'name'
-    echo "${NFT_SET_PREFIX}$(echo "$name" | tr ' ' '_')"
+    filter_set_name "$name" || return 0
+    echo "$set_name"
 }
 
 # Live reload (reload_service): when only allowed_region or allowed_ip lists changed since
