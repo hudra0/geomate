@@ -448,16 +448,67 @@ report_nft_input_error() {
 
 # Build the nft match of a filter's traffic into the global base_rule, shared by the
 # forward and the prerouting rules: Source IP (build_src_match), protocol and ports.
-# $1: protocol, $2: src_ip, $3: src_port, $4: dest_port. Returns the status of
-# build_src_match, which also sets src_exceptions_only
+# $1: protocol, $2: src_ip, $3: src_port, $4: dest_port; a port 'any' is no port.
+#   one protocol and ports: '<protocol> sport <ports> <protocol> dport <ports>'
+#   protocols without ports: 'meta l4proto udp', or for several separated by spaces
+#   ('tcp udp') 'meta l4proto { tcp, udp }'. nft has no match by a bare protocol name
+#   ports without a protocol or with several protocols: 'meta l4proto { tcp, udp } th
+#   sport <ports> th dport <ports>', with the given protocols if any. nft has no port
+#   match without a protocol
+#   neither: the Source IP only (all traffic)
+# The last three apply only when every word of the protocol is a name in the case below
+# or a number. Any other protocol, such as 'meta l4proto udp' or 'udp dport 3074', is an
+# nft expression written by hand and goes into the rule unchanged, as in older versions.
+# Sets proto_only to 1 for a protocol without ports and a Source IP that names devices,
+# to 2 when the Source IP is empty or has exceptions only (the match would cover every
+# device and the replies of the servers too), else to 0.
+# Returns the status of build_src_match, which also sets src_exceptions_only
 build_base_rule() {
     local protocol="$1" src_port="$3" dest_port="$4" has_sport=0 rv=0
+    local port_proto="$1" l4proto word proto_list=1 src_first glob_off=0
+    proto_only=0
     build_src_match "$2" || rv=1
     base_rule="$src_match"
-    [ -n "$protocol" ] && base_rule="$base_rule $protocol"
+    [ "$src_port" = "any" ] && src_port=""
+    [ "$dest_port" = "any" ] && dest_port=""
+
+    # Split Source IP and protocol at whitespace without expanding wildcards (as
+    # build_src_match)
+    case "$-" in *f*) glob_off=1 ;; esac
+    set -f
+    set -- $2
+    src_first="$1"
+    set -- $protocol
+    [ "$glob_off" -eq 1 ] || set +f
+    for word in "$@"; do
+        case "$word" in
+            tcp|udp|udplite|sctp|dccp|icmp|igmp|esp|ah|comp|gre|[0-9]|[0-9][0-9]|[0-9][0-9][0-9]) ;;
+            *) proto_list=0 ;;
+        esac
+    done
+    l4proto="$*"
+    [ $# -gt 1 ] && l4proto="{ ${l4proto// /, } }"
+
+    if [ "$proto_list" -eq 0 ] || { [ $# -eq 1 ] && [ -n "$src_port$dest_port" ]; }; then
+        base_rule="$base_rule $protocol"
+    elif [ -n "$src_port$dest_port" ]; then
+        [ -n "$l4proto" ] || l4proto="{ tcp, udp }"
+        base_rule="$base_rule meta l4proto $l4proto th"
+        port_proto="th"
+    elif [ -n "$l4proto" ]; then
+        base_rule="$base_rule meta l4proto $l4proto"
+        # No device: empty or whitespace only, exceptions only, or a value passed to nft
+        # unchecked that starts with one ('!= 192.168.1.5')
+        proto_only=1
+        if [ -z "$src_first" ] || [ "$src_exceptions_only" -eq 1 ]; then
+            proto_only=2
+        elif [ "$rv" -eq 1 ]; then
+            case "$src_first" in '!'*) proto_only=2 ;; esac
+        fi
+    fi
 
     # Include src_port in the rule if set
-    if [ -n "$src_port" ] && [ "$src_port" != "any" ]; then
+    if [ -n "$src_port" ]; then
         has_sport=1
         # Check if multiple values (separated by space) - need braces
         if echo "$src_port" | grep -q ' '; then
@@ -470,8 +521,8 @@ build_base_rule() {
     fi
 
     # Include dest_port in the rule if set
-    if [ -n "$dest_port" ] && [ "$dest_port" != "any" ]; then
-        [ "$has_sport" = "1" ] && [ -n "$protocol" ] && base_rule="$base_rule $protocol"
+    if [ -n "$dest_port" ]; then
+        [ "$has_sport" = "1" ] && base_rule="$base_rule $port_proto"
         # Check if multiple values (separated by space) - need braces
         if echo "$dest_port" | grep -q ' '; then
             dest_port=$(echo "$dest_port" | tr ' ' ',')
@@ -717,6 +768,18 @@ setup_geo_filter() {
     local base_rule
     build_base_rule "$protocol" "$src_ip" "$src_port" "$dest_port" || \
         log_and_print "Source IP '$src_ip' of filter $name is not a list of IPv4 entries: passed to nft unchanged" 1
+    # A protocol without ports for all devices would also match the replies of the
+    # servers: with Strict Mode the filter would drop all traffic of that protocol in the
+    # network, without it collect every server the network reaches. Such a filter keeps
+    # no rules, as with an older backend
+    if [ "$proto_only" -eq 2 ]; then
+        report_nft_input_error "protocol of filter $name" "$protocol" \
+            "no ports and no device in Source IP would match this protocol for the whole network: set ports or a Source IP, filter has no rules" \
+            "${set_name}_allowed"
+        return
+    fi
+    [ "$proto_only" -eq 1 ] && \
+        log_and_print "Filter $name has no ports: it applies to all $protocol traffic of its Source IP" 0
     [ "$src_exceptions_only" -eq 1 ] && \
         log_and_print "Source IP of $name has exceptions only: the filter applies to all other devices" 0
 
@@ -786,6 +849,8 @@ create_dynamic_set() {
     check_rule_options "$1" || return
     local base_rule
     build_base_rule "$protocol" "$src_ip" "$src_port" "$dest_port"
+    # setup_geo_filter has reported a protocol without ports for all devices
+    [ "$proto_only" -eq 2 ] && return
 
     # Add rule for the ui dynamic set (always needed) with error checking
     log_and_print "Adding prerouting rule for UI: $base_rule update @${set_name}_ui_dynamic { ip daddr }" 2
