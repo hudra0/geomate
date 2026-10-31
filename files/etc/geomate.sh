@@ -1680,7 +1680,8 @@ case "$1" in
         # servers inside the regions too, and changes of 'list blocked_ip' reload live
         # geolocate_status: every full geolocate.sh run holds /tmp/geomate/geolocation.lock
         # (PID on line 1, start epoch on line 2) and a second one exits with 3;
-        # 'geolocate.sh start' starts the manual run detached (exit 0, or 3 when running)
+        # 'geolocate.sh start' starts the manual run detached (exit 0, 3 when running, 1 when
+        # it cannot start)
         printf '%s\n' 'src_ip_multi set_counters blocked_ip geolocate_status'
         ;;
     run)

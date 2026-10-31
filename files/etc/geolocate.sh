@@ -103,11 +103,14 @@ start_detached() {
         report "Geolocation is already running (PID $pid)" 0
         return "$EXIT_RUNNING"
     fi
-    # No inherited stdout/stderr: the caller gets its answer without waiting for the run
+    # No inherited stdout/stderr: the caller gets its answer without waiting for the run.
+    # The subshell redirects with exec before it starts the run, and the exec keeps its PID.
+    # With the redirections on the command itself, rpcd's file exec (the web interface)
+    # waited until its 30 s timeout although the run had its own stdout
     if command -v setsid >/dev/null 2>&1; then
-        setsid /bin/sh "$0" </dev/null >/dev/null 2>&1 &
+        ( exec </dev/null >/dev/null 2>&1; exec setsid /bin/sh "$0" ) &
     else
-        /bin/sh "$0" </dev/null >/dev/null 2>&1 &
+        ( exec </dev/null >/dev/null 2>&1; exec /bin/sh "$0" ) &
     fi
     child=$!
     # Wait until the run owns the lock (a second start sees it from then on) or has ended
