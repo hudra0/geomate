@@ -81,7 +81,13 @@ check_and_run_geolocate() {
     if [ $((current_time - last_daily_update)) -ge 86400 ]; then  # 86400 seconds = 24 hours
         log_and_print "Geomate_Trigger: Starting daily update of all IPs" 1
         /etc/geolocate.sh daily
-        echo "$current_time" > "${LAST_RUN_FILE}.daily"
+        # Exit 3: another full run (such as a manual one) is active and this one did
+        # nothing, so the daily update stays due for the next trigger run
+        if [ $? -eq 3 ]; then
+            log_and_print "Geomate_Trigger: Geolocation is already running, daily update postponed" 1
+        else
+            echo "$current_time" > "${LAST_RUN_FILE}.daily"
+        fi
     fi
 
     # Only do frequent updates if mode is 'frequent'
