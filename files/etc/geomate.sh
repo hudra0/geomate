@@ -266,7 +266,7 @@ setup_nftables_and_filters() {
     fi
     
     # Every rebuild starts with an empty nft error log (nft_exec appends to it) and without
-    # the markers of rejected allowed_ip and blocked_ips lists (add_filter_entries)
+    # the markers of rejected allowed and blocked IP lists (add_filter_entries)
     : > "$NFT_ERROR_LOG"
     rm -f "$GEOMATE_TMP_DIR"/*.entries_failed
 
@@ -679,15 +679,23 @@ check_set_entries() {
 
 # Element lists of filter section $1 for its sets, shared by the start, the live reload
 # and the loop harvest (check_set_entries): sets allowed_entries from the allowed_ip list
-# and blocked_entries from the comma-separated blocked_ips option. $2: filter name,
-# $3: set name prefix, $4: 1 to report skipped and merged entries, 0 to stay quiet
+# and blocked_entries from the blocked_ip list plus the older comma-separated blocked_ips
+# option. $2: filter name, $3: set name prefix, $4: 1 to report skipped and merged
+# entries, 0 to stay quiet
 filter_set_entries() {
-    local allowed_ips="" blocked_ips set_entries
+    local allowed_ips="" blocked_ips="" legacy_blocked option=blocked_ip set_entries
     config_list_foreach "$1" 'allowed_ip' append_allowed_ip
     check_set_entries "$2" allowed_ip "${3}_allowed" "$allowed_ips" "$4"
     allowed_entries="$set_entries"
-    config_get blocked_ips "$1" 'blocked_ips'
-    check_set_entries "$2" blocked_ips "${3}_blocked" "$blocked_ips" "$4"
+    config_list_foreach "$1" 'blocked_ip' append_blocked_ip
+    config_get legacy_blocked "$1" 'blocked_ips'
+    # Messages name the option the entries come from, both when both are set
+    if [ -z "$blocked_ips" ]; then
+        option=blocked_ips
+    elif [ -n "$legacy_blocked" ]; then
+        option=blocked_ip/blocked_ips
+    fi
+    check_set_entries "$2" "$option" "${3}_blocked" "${blocked_ips}${legacy_blocked}" "$4"
     blocked_entries="$set_entries"
 }
 
@@ -1129,17 +1137,25 @@ append_allowed_ip() {
     allowed_ips="${allowed_ips}${1},"
 }
 
+# Helper function to collect blocked_ip entries
+append_blocked_ip() {
+    blocked_ips="${blocked_ips}${1},"
+}
+
 # Split the geolocated IPs of a filter by its regions (Haversine, R = 6371000 m).
 # Shared by the start, the loop harvest and the live reload.
 # $1 = geo data file, $2 = regions ("circle:lat:lon:radius_m ..."), $3 and $4 = element
-# lists of allowed_ip and blocked_ips (filter_set_entries). An in-region IP inside an
-# entry of $3 is left out of the allowed IPs, an out-of-region IP inside an entry of $4
-# out of the blocked IPs: the entry matches it already, and the sets reject overlaps
+# lists of allowed_ip and of blocked_ip plus blocked_ips (filter_set_entries). An
+# in-region IP inside an entry of $3 is left out of the allowed IPs: the entry matches it
+# already, and the sets reject overlaps. Any other IP inside an entry of $4 is left out
+# of both lists: the entry in the blocked set drops it, also inside a region, because
+# the accept rule of the allowed set comes first. So allowed_ip wins over blocked_ip,
+# and blocked_ip over the regions
 # PERFORMANCE OPTIMIZATION: Process ALL IPs in a SINGLE awk process
 # Instead of spawning a new awk process for each IP (11000+ processes),
 # we do everything in one pass: parse regions, calculate haversine, categorize IPs
 # Output format: First line = comma-separated allowed IPs, Second line = comma-separated blocked IPs,
-# third line = the numbers of allowed and blocked IPs left out
+# third line = the numbers of IPs left out inside allowed and inside blocked entries
 split_geo_data() {
     jq -r '. | [.query, .lat, .lon] | @tsv' "$1" 2>/dev/null | \
         awk -v regions="$2" -v allowed_cover="$3" -v blocked_cover="$4" "$AWK_IPV4_ENTRY"'
@@ -1215,9 +1231,11 @@ split_geo_data() {
                 }
             }
             
-            # Append to appropriate list
+            # Append to appropriate list. In a region an allowed entry wins over a
+            # blocked entry, and a blocked entry over the region
             if (allowed) {
                 if (allowed_cover != "" && covered(ip, acover_ip, n_acover, acover_lo, acover_hi)) { left_allowed++; next }
+                if (blocked_cover != "" && covered(ip, bcover_ip, n_bcover, bcover_lo, bcover_hi)) { left_blocked++; next }
                 if (allowed_list != "") allowed_list = allowed_list ","
                 allowed_list = allowed_list ip
             } else {
@@ -1236,7 +1254,7 @@ split_geo_data() {
 
 # Process geo data from the JSON file
 # $1: name, $2: allowed set, $3: blocked set, $4: allowed regions, $5 and $6: element
-# lists of allowed_ip and blocked_ips (filter_set_entries)
+# lists of allowed_ip and of blocked_ip plus blocked_ips (filter_set_entries)
 process_geo_data() {
     local name="$1"
     local allowed_set="$2"
@@ -1264,7 +1282,7 @@ process_geo_data() {
     [ -n "$blocked_ips" ] && blocked_count=$(echo "$blocked_ips" | tr ',' '\n' | wc -l)
     log_and_print "Geo processing for $name: $allowed_count allowed, $blocked_count blocked IPs" 1
     [ "${left_out:-0 0}" = "0 0" ] || \
-        log_and_print "Geo processing for $name: left out ${left_out% *} allowed IPs inside allowed_ip entries, ${left_out#* } blocked IPs inside blocked_ips entries" 2
+        log_and_print "Geo processing for $name: left out ${left_out% *} IPs inside allowed_ip entries, ${left_out#* } IPs inside blocked_ip and blocked_ips entries" 2
 
     # Batch update the sets - handling potential large IP lists
     add_ips_to_set() {
@@ -1332,7 +1350,8 @@ print_set_elements() {
 
 # config_foreach callback of reload_regions: for a changed, enabled filter append the
 # commands that refill its _allowed and _blocked sets to $reload_batch, with the same
-# content as at start (allowed_ip, blocked_ips, geolocated IPs split by region)
+# content as at start (allowed_ip, blocked_ip and blocked_ips, geolocated IPs split by
+# region)
 reload_filter_sets() {
     local name enabled set_name result geo_data_file allowed_entries blocked_entries
     local allowed_regions="" geo_allowed="" geo_blocked=""
@@ -1368,9 +1387,10 @@ reload_filter_sets() {
     echo "Live reload of $name: $allowed_count allowed, $blocked_count blocked geolocated IPs" >> "${reload_batch}.log"
 }
 
-# Print configuration file $1 without its 'list allowed_region' and 'list allowed_ip' lines
+# Print configuration file $1 without its 'list allowed_region', 'list allowed_ip' and
+# 'list blocked_ip' lines
 strip_reloadable_lists() {
-    sed '/^[[:space:]]*list[[:space:]][[:space:]]*allowed_\(region\|ip\)[[:space:]]/d' "$1"
+    sed '/^[[:space:]]*list[[:space:]][[:space:]]*\(allowed_region\|allowed_ip\|blocked_ip\)[[:space:]]/d' "$1"
 }
 
 # config_foreach callback: print the set name prefix of an enabled filter
@@ -1383,11 +1403,12 @@ print_enabled_set_name() {
     echo "$set_name"
 }
 
-# Live reload (reload_service): when only allowed_region or allowed_ip lists changed since
-# the configuration copy of the last start, refill the _allowed and _blocked sets of
-# the changed, enabled filters in one nft transaction. Rules, counters, _dynamic and
-# _ui_dynamic stay, so the collected IPs and the harvest timer survive. The caller
-# removes the work directory. Returns 1 when the service has to be restarted instead
+# Live reload (reload_service): when only allowed_region, allowed_ip or blocked_ip lists
+# changed since the configuration copy of the last start, refill the _allowed and
+# _blocked sets of the changed, enabled filters in one nft transaction. Rules, counters,
+# _dynamic and _ui_dynamic stay, so the collected IPs and the harvest timer survive. The
+# caller removes the work directory. Returns 1 when the service has to be restarted
+# instead
 reload_regions() {
     local work="${GEOMATE_TMP_DIR}/reload" changed line
     local UCI_CONFIG_DIR="$UCI_CONFIG_DIR"
@@ -1420,12 +1441,12 @@ reload_regions() {
     fi
     # uci show prints a one-element list like an option, but the sets read only lists.
     # Both copies come from the same uci writer, so any file change besides 'list
-    # allowed_region' and 'list allowed_ip' lines (such as an option turned into a list)
-    # needs a restart
+    # allowed_region', 'list allowed_ip' and 'list blocked_ip' lines (such as an option
+    # turned into a list) needs a restart
     strip_reloadable_lists "$BUILT_CONFIG_DIR/geomate" > "$work/old.conf"
     strip_reloadable_lists "$work/config/geomate" > "$work/new.conf"
     if ! cmp -s "$work/old.conf" "$work/new.conf"; then
-        log_and_print "Live reload: configuration lines other than allowed_region and allowed_ip lists changed, restarting" 1
+        log_and_print "Live reload: configuration lines other than allowed_region, allowed_ip and blocked_ip lists changed, restarting" 1
         return 1
     fi
 
@@ -1439,14 +1460,14 @@ reload_regions() {
         return 0
     fi
 
-    # Section IDs of the changed allowed_region and allowed_ip lists; any other change
-    # needs a restart
+    # Section IDs of the changed allowed_region, allowed_ip and blocked_ip lists; any
+    # other change needs a restart
     reload_sections=$(printf '%s\n' "$changed" | awk '
         { key = substr($0, 1, index($0, "=") - 1) }
-        key !~ /^geomate\.[A-Za-z0-9_]+\.allowed_(region|ip)$/ { bad = 1; exit }
+        key !~ /^geomate\.[A-Za-z0-9_]+\.(allowed_region|allowed_ip|blocked_ip)$/ { bad = 1; exit }
         { split(key, part, "."); if (!(part[2] in seen)) { seen[part[2]] = 1; printf " %s", part[2] } }
         END { if (bad) exit 1; print " " }') || {
-        log_and_print "Live reload: options other than allowed_region and allowed_ip changed, restarting" 1
+        log_and_print "Live reload: options other than allowed_region, allowed_ip and blocked_ip changed, restarting" 1
         return 1
     }
 
@@ -1472,7 +1493,7 @@ reload_regions() {
             log_and_print "$line" 1
         done < "${reload_batch}.log"
     else
-        log_and_print "Live reload: only regions or allowed IPs of disabled filters changed" 1
+        log_and_print "Live reload: only regions, allowed or blocked IPs of disabled filters changed" 1
     fi
 
     mv "$work/config/geomate" "$BUILT_CONFIG_DIR/geomate"
@@ -1655,7 +1676,9 @@ case "$1" in
         # src_ip_multi: Source IP accepts several entries and exceptions with ! or !=
         # set_counters: each element of a filter's _dynamic set carries 'counter packets N
         # bytes M' (static mode has no _dynamic set)
-        printf '%s\n' 'src_ip_multi set_counters'
+        # blocked_ip: 'list blocked_ip' (and the older 'option blocked_ips') blocks its
+        # servers inside the regions too, and changes of 'list blocked_ip' reload live
+        printf '%s\n' 'src_ip_multi set_counters blocked_ip'
         ;;
     run)
         run
