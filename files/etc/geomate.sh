@@ -689,7 +689,12 @@ filter_set_entries() {
     allowed_entries="$set_entries"
     config_list_foreach "$1" 'blocked_ip' append_blocked_ip
     config_get legacy_blocked "$1" 'blocked_ips'
-    [ -n "$blocked_ips" ] || option=blocked_ips
+    # Messages name the option the entries come from, both when both are set
+    if [ -z "$blocked_ips" ]; then
+        option=blocked_ips
+    elif [ -n "$legacy_blocked" ]; then
+        option=blocked_ip/blocked_ips
+    fi
     check_set_entries "$2" "$option" "${3}_blocked" "${blocked_ips}${legacy_blocked}" "$4"
     blocked_entries="$set_entries"
 }
