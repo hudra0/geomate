@@ -168,9 +168,9 @@ acquire_rate_lock() {
     until ln -snT "$$" "$RATE_DIR/lock" 2>/dev/null; do
         owner=$(readlink "$RATE_DIR/lock" 2>/dev/null)
         # The owner may have unlocked between ln and readlink.
-        case "$owner" in '') continue ;; *[!0-9]*) return 1 ;; esac
+        case "$owner" in *[!0-9]*) return 1 ;; esac
         claim="$RATE_DIR/stale.$owner"
-        if ! kill -0 "$owner" 2>/dev/null && mkdir "$claim" 2>/dev/null; then
+        if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null && mkdir "$claim" 2>/dev/null; then
             if [ "$(readlink "$RATE_DIR/lock" 2>/dev/null)" = "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
                 rm -f "$RATE_DIR/lock"
             fi
