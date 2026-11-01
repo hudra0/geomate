@@ -1024,11 +1024,11 @@ harvest_all() {
 # Write geolocation status to JSON file for UI/CLI consumption
 # This is called once per cycle (every 30 min) and after reload_geo refilled sets
 # $1: next_cycle to keep (reload_geo does not reset the loop timer), default now plus
-# CHECK_INTERVAL. The file is written next to its place and renamed, so a reader never
+# CHECK_INTERVAL. A per-process file next to its place is renamed, so a reader never
 # sees half a file
 write_geolocation_status() {
     local status_path="${GEOMATE_RUNTIME_DIR}/geolocation_status.json"
-    local status_file="${GEOMATE_RUNTIME_DIR}/geolocation_status.json.tmp"
+    local status_file="${GEOMATE_RUNTIME_DIR}/geolocation_status.json.tmp.$$"
     local current_time
     local next_cycle="$1"
     local last_geolocate=0
@@ -1646,8 +1646,8 @@ reload_geo() {
     acquire_sets_lock || return 1
     reload_geo_locked "$@"
     rv=$?
-    release_sets_lock
     rm -rf "$work"
+    release_sets_lock
     return "$rv"
 }
 
@@ -1668,8 +1668,9 @@ run_reload_geo() {
 # Restart Geomate from its run loop. procd since 2026-10-18 kills every process of the
 # service's cgroup when the run loop exits: a restart started inside the service would kill
 # itself after stop had deleted the table, and leave Geomate stopped. rpcd runs the init
-# script as its own child, outside that cgroup. Without rpcd's rc object the init script
-# runs directly, which is safe with older procd only. The loop dies with the stop
+# script as its own child, outside that cgroup. Without rpcd's rc object leave the current
+# rules intact and report failure.
+# The loop dies with the stop
 restart_service() {
     local rv
     if ubus list rc >/dev/null 2>&1; then
@@ -1677,9 +1678,10 @@ restart_service() {
         ubus -t 120 call rc init '{"name":"geomate","action":"restart"}' >/dev/null 2>&1
         rv=$?
         [ "$rv" -eq 0 ] || log_and_print "Error: restart through rpcd failed (ubus status $rv)" 0
+        return "$rv"
     else
-        log_and_print "Restarting Geomate" 1
-        /etc/init.d/geomate restart
+        log_and_print "Error: cannot restart safely without rpcd rc" 0
+        return 1
     fi
 }
 
@@ -1771,7 +1773,7 @@ run_geomate_trigger() {
     [ -f "$GEO_RESTART_FLAG" ] || return 0
     rm -f "$GEO_RESTART_FLAG"
     log_and_print "Geo data reload failed during the geolocation, restarting" 1
-    restart_service
+    restart_service || : > "$GEO_RESTART_FLAG"
 }
 
 # Main function to run the service
