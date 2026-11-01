@@ -1565,6 +1565,17 @@ reload_geo_locked() {
     : > "${reload_batch}.log"
     : > "${reload_batch}.stamps"
 
+    # config_load applies pending UCI deltas to the saved file too. Check them
+    # before selecting filters or renewing a stamp from a different configuration.
+    if [ -f "$UCI_PENDING_CHANGES" ]; then
+        cmp -s "$UCI_PENDING_CHANGES" "$BUILT_CONFIG_DIR/pending"
+    else
+        [ ! -s "$BUILT_CONFIG_DIR/pending" ]
+    fi || {
+        log_and_print "Geo data reload: pending uci changes differ from the last start, restarting" 1
+        return 1
+    }
+
     config_load 'geomate'
     config_foreach select_changed_geo 'geo_filter'
     if [ "$reload_sections" = " " ]; then
@@ -1574,21 +1585,11 @@ reload_geo_locked() {
 
     # The gates of the live reload (reload_regions): after nft errors at start a filter
     # may lack its sets or entries, and the shared sets of two filters whose names differ
-    # only in spaces and underscores cannot be refilled per filter. Pending uci changes:
-    # config_load applies the current ones to the copy too, but the sets were built with
-    # those of the start
+    # only in spaces and underscores cannot be refilled per filter.
     if [ -s "$NFT_ERROR_LOG" ]; then
         log_and_print "Geo data reload: the last start had nft errors, restarting" 1
         return 1
     fi
-    if [ -f "$UCI_PENDING_CHANGES" ]; then
-        cmp -s "$UCI_PENDING_CHANGES" "$BUILT_CONFIG_DIR/pending"
-    else
-        [ ! -s "$BUILT_CONFIG_DIR/pending" ]
-    fi || {
-        log_and_print "Geo data reload: pending uci changes differ from the last start, restarting" 1
-        return 1
-    }
     if [ -n "$(config_foreach print_enabled_set_name 'geo_filter' | sort | uniq -d)" ]; then
         log_and_print "Geo data reload: enabled filters share a set name, restarting" 1
         return 1
