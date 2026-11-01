@@ -19,7 +19,12 @@ IP_API_URL="http://ip-api.com/batch"
 BATCH_SIZE=90
 RATE_LIMIT=15
 RATE_LIMIT_WINDOW=60
+# Lock of the full runs (manual and daily): the owner's PID on line 1, its start time
+# (Unix epoch) on line 2. The web interface reads it to show a running geolocation
 LOCK_FILE="$GEOMATE_TMP_DIR/geolocation.lock"
+LOCK_HELD=0          # Set to 1 once this process owns LOCK_FILE
+EXIT_RUNNING=3       # Exit code: another full run is active, nothing was done
+EXIT_NO_LOCK=4       # Exit code: the full run could not create its lock, nothing was done
 FILTER_LOCK_FILE=""  # Per-filter lock of the 'specific' mode, removed on exit
 FAILED_BATCHES=0     # Batches without a usable API answer
 GEO_DATA_CHANGED=0   # Set to 1 when a geo data file was rewritten
@@ -34,19 +39,113 @@ log_and_print() {
 }
 
 cleanup() {
-    log_and_print "Removing lock file: $LOCK_FILE" 2
-    rm -f "$LOCK_FILE" ${FILTER_LOCK_FILE:+"$FILTER_LOCK_FILE"}
+    if [ "$LOCK_HELD" = "1" ]; then
+        log_and_print "Removing lock file: $LOCK_FILE" 2
+        rm -f "$LOCK_FILE"
+    fi
+    rm -f ${FILTER_LOCK_FILE:+"$FILTER_LOCK_FILE"}
+}
+
+# Prints the PID of the full run that owns LOCK_FILE; returns 1 when there is none: no
+# lock, no PID in it (written by an older version), or the process is gone or is no
+# longer a full geolocate.sh run (PID reused, for example by a 'specific' run)
+full_run_owner() {
+    local pid cmdline
+    read -r pid 2>/dev/null < "$LOCK_FILE"
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    # Each argument ends with a NUL, so the converted cmdline ends with a space
+    cmdline=$(tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline") || return 1
+    case "$cmdline" in
+        *geolocate.sh\ specific\ *|*geolocate.sh\ start\ ) return 1 ;;
+        *geolocate.sh\ *) printf '%s\n' "$pid" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Takes LOCK_FILE for a full run, exits with EXIT_RUNNING while another full run is
+# alive. ln creates the lock atomically and only when it does not exist, so the file
+# never appears without its content. A stale lock is taken over; exits with EXIT_NO_LOCK
+# when the lock cannot be created
+acquire_full_run_lock() {
+    local tmp_lock="${LOCK_FILE}.$$" pid tries=0
+    printf '%s\n%s\n' "$$" "$(date +%s)" > "$tmp_lock" || {
+        log_and_print "Error: Failed to create lock file $tmp_lock" 0; exit "$EXIT_NO_LOCK"; }
+    until ln "$tmp_lock" "$LOCK_FILE" 2>/dev/null; do
+        if pid=$(full_run_owner); then
+            rm -f "$tmp_lock"
+            log_and_print "Geolocation is already running (PID $pid), not starting another run" 0
+            exit "$EXIT_RUNNING"
+        fi
+        tries=$((tries + 1))
+        if [ "$tries" -gt 3 ]; then
+            rm -f "$tmp_lock"
+            log_and_print "Error: Failed to take lock file $LOCK_FILE" 0
+            exit "$EXIT_NO_LOCK"
+        fi
+        log_and_print "Taking over stale lock $LOCK_FILE" 1
+        rm -f "$LOCK_FILE"
+    done
+    rm -f "$tmp_lock"
+    LOCK_HELD=1
+    log_and_print "Created lock file: $LOCK_FILE" 2
+}
+
+# Starts a manual full run detached from the caller and returns at once, for the web
+# interface (a request that runs the whole geolocation would time out). Prints one line.
+# Exit 0: started (the run may have ended already); EXIT_RUNNING: a full run is active
+# already; 1: the run could not create its lock
+start_detached() {
+    local pid child rc waited=0
+    # The answer line is printed whatever the debug level, and logged like other messages
+    report() { log_and_print "$1" "$2" >/dev/null; printf '%s\n' "$1"; }
+    
+    if pid=$(full_run_owner); then
+        report "Geolocation is already running (PID $pid)" 0
+        return "$EXIT_RUNNING"
+    fi
+    # No inherited stdout/stderr: the caller gets its answer without waiting for the run.
+    # The subshell redirects with exec before it starts the run, and the exec keeps its PID.
+    # With the redirections on the command itself, rpcd's file exec (the web interface)
+    # waited until its 30 s timeout although the run had its own stdout
+    if command -v setsid >/dev/null 2>&1; then
+        ( exec </dev/null >/dev/null 2>&1; exec setsid /bin/sh "$0" ) &
+    else
+        ( exec </dev/null >/dev/null 2>&1; exec /bin/sh "$0" ) &
+    fi
+    child=$!
+    # Wait until the run owns the lock (a second start sees it from then on) or has ended
+    while [ "$waited" -lt 50 ]; do
+        pid=$(full_run_owner) && [ "$pid" = "$child" ] && break
+        kill -0 "$child" 2>/dev/null || break
+        sleep 0.1 2>/dev/null || sleep 1
+        waited=$((waited + 1))
+    done
+    if [ "$pid" != "$child" ] && ! kill -0 "$child" 2>/dev/null; then
+        # The run ended between two polls, for example with no filter to process. Only
+        # exit 3 and 4 mean it did nothing: another full run held the lock, or no lock
+        wait "$child"
+        rc=$?
+        if [ "$rc" -eq "$EXIT_RUNNING" ]; then
+            if pid=$(full_run_owner); then
+                report "Geolocation is already running (PID $pid)" 0
+            else
+                report "Geolocation is already running" 0
+            fi
+            return "$EXIT_RUNNING"
+        elif [ "$rc" -eq "$EXIT_NO_LOCK" ]; then
+            report "Error: Failed to start geolocation" 0
+            return 1
+        fi
+    fi
+    # The run owns the lock, has ended, or is still starting on a busy router
+    report "Geolocation started (PID $child)" 1
 }
 
 # Create temporary directory if it doesn't exist
 mkdir -p "$GEOMATE_TMP_DIR"
 chmod 755 "$GEOMATE_TMP_DIR"
 
-# Create lock file
-touch "$LOCK_FILE"
-log_and_print "Created lock file: $LOCK_FILE" 2
-
-# Ensure lock file is removed on script exit
+# Ensure the locks this process owns are removed on script exit
 trap cleanup EXIT
 
 # Retrieves geographic information for a batch of IPs
@@ -291,10 +390,22 @@ process_specific_ips() {
     FILTER_LOCK_FILE=""
 }
 
-# Main function to handle different execution modes
+# Main function to handle different execution modes:
+#   geolocate.sh             manual full run of all enabled filters
+#   geolocate.sh start       manual full run, detached; returns at once (exit 0, 3 or 1)
+#   geolocate.sh daily       full run of the trigger's daily update
+#   geolocate.sh specific <filter name> "<ip> ..."   new IPs of one filter (trigger)
+# Full runs share LOCK_FILE: while one is alive, another exits with 3 and does nothing;
+# a full run that cannot create the lock exits with 4
 main() {
     case "$1" in
+        start)
+            # Returns before the run ends: no restart handling here
+            start_detached
+            exit $?
+            ;;
         daily)
+            acquire_full_run_lock
             daily_update
             ;;
         specific)
@@ -302,6 +413,7 @@ main() {
             process_specific_ips "$@"
             ;;
         *)
+            acquire_full_run_lock
             config_load 'geomate'
             config_foreach process_geo_filter 'geo_filter'
             ;;
@@ -321,6 +433,8 @@ if [ "$GEO_DATA_CHANGED" = "1" ]; then
     else
         log_and_print "Service restart failed with status $restart_status"
         status=$restart_status
+        # Exit codes 3 and 4 are reserved for full runs that did nothing
+        case "$status" in "$EXIT_RUNNING"|"$EXIT_NO_LOCK") status=1 ;; esac
     fi
 elif [ "$FAILED_BATCHES" -gt 0 ]; then
     log_and_print "No geo data updated, $FAILED_BATCHES API request(s) failed. Skipping service restart"

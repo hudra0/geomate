@@ -455,6 +455,9 @@ The geolocation process can be triggered manually through the UI or runs automat
 - Only active filters are processed during geolocation
 - IP addresses are processed in batches to respect API rate limits
 - The process runs in the background and may take several minutes to complete
+- Only one full run of all IPs runs at a time: Manual Geolocation, `service geomate geolocate`, `/etc/geolocate.sh` or the daily update. While one runs, `/tmp/geomate/geolocation.lock` holds its PID on the first line and its start time (Unix time) on the second. Another full run then logs "Geolocation is already running (PID n)", does nothing and exits with 3. A daily update that finds a run in progress stays due and runs with the next automatic update. A lock whose process is gone, for example after the run was killed, is taken over by the next run. The geolocation of newly collected IPs between the daily updates does not wait for this lock
+- `/etc/geolocate.sh start` starts a manual full run in the background and returns at once with one line: "Geolocation started (PID n)" and exit code 0, "Geolocation is already running (PID n)" and exit code 3, or an error and exit code 1 when the run cannot create its lock file. A run with nothing to look up can end before `start` returns and still counts as started. The run logs to the system log as usual (tag `geolocate`) and restarts Geomate at the end if it changed geo data. `/etc/geolocate.sh` without argument and `service geomate geolocate` run in the foreground and end with exit code 0, with 1 when API requests failed and no geo data changed, with 3 when a run is in progress already, or with 4 when the lock file cannot be created
+- A web interface that knows the backend capability `geolocate_status` (see [Debug and Monitoring Tools](#debug-and-monitoring-tools)) can show a running geolocation and start Manual Geolocation with `start`. An older web interface starts the run as before; a second click while it runs starts no second run
 
 ### Understanding IP Lists and Allowed IPs
 
@@ -694,6 +697,13 @@ Example: If you want to play COD with friends from both Europe and USA:
      - Consider hardware upgrade if persistent
      - Monitor system resources
 
+5. **Manual Geolocation Starts No Run**
+   - Cause: a geolocation of all IPs is in progress already, a manual one or the daily update. It can take several minutes, and a second one would double the requests to ip-api.com
+   - Solutions:
+     - Wait for the end of the run. `logread -e geolocate` shows "Geolocation is already running (PID n)" for the refused start. With Debug Level 1 or higher it also shows the end of the run: "restarting geomate service" or "skipping service restart"
+     - `cat /tmp/geomate/geolocation.lock` shows the PID and the start time (Unix time) of the run in progress. The file is gone when the run has ended
+     - If the run hangs, end it with `kill <PID>`. The next run takes over the lock
+
 ### Game-Specific Network Analysis
 - Use QoSmate for monitoring game connections
 - Consider Wireshark for detailed packet analysis
@@ -740,7 +750,7 @@ Example: If you want to play COD with friends from both Europe and USA:
 
 5. **Backend Capabilities**
    - `/etc/geomate.sh capabilities` prints the features of the installed backend as one line of words and exits with 0. It reads no configuration and changes nothing
-   - Today it prints `src_ip_multi set_counters blocked_ip`. `src_ip_multi`: Source IP accepts several entries and exceptions with `!`. `set_counters`: each server in a filter's collected set (`geomate_<filter>_dynamic`, dynamic and monitor mode) carries `counter packets N bytes M`. Every restart of Geomate empties the set, so a server can disappear or start again from 0 between two reads. `blocked_ip`: `list blocked_ip` (and the older `option blocked_ips`) blocks its servers inside the circles too, and a change of `list blocked_ip` is applied without a restart
+   - Today it prints `src_ip_multi set_counters blocked_ip geolocate_status`. `src_ip_multi`: Source IP accepts several entries and exceptions with `!`. `set_counters`: each server in a filter's collected set (`geomate_<filter>_dynamic`, dynamic and monitor mode) carries `counter packets N bytes M`. Every restart of Geomate empties the set, so a server can disappear or start again from 0 between two reads. `blocked_ip`: `list blocked_ip` (and the older `option blocked_ips`) blocks its servers inside the circles too, and a change of `list blocked_ip` is applied without a restart. `geolocate_status`: every full geolocation run holds `/tmp/geomate/geolocation.lock` with its PID and start time, a second one exits with 3, and `/etc/geolocate.sh start` starts a manual run in the background (see [Geolocation Process](#geolocation-process))
    - Words are only added, never renamed or removed, so the web interface and scripts can rely on them. An older backend prints its usage and exits with 1, which means no capabilities
 
 ## FAQ
