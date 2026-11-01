@@ -15,10 +15,12 @@ config_get debug_level global debug_level '0'
 
 GEOMATE_DATA_DIR="/etc/geomate.d"
 GEOMATE_TMP_DIR="/tmp/geomate"
-IP_API_URL="http://ip-api.com/batch"
-BATCH_SIZE=90
+# Provider settings: request budget is shared across full and specific runs.
+GEO_PROVIDER_URL="http://ip-api.com/batch?fields=status,message,country,countryCode,city,lat,lon,isp,org,query"
+BATCH_SIZE=100
 RATE_LIMIT=15
 RATE_LIMIT_WINDOW=60
+RATE_DIR="$GEOMATE_TMP_DIR/ratelimit"
 # Lock of the full runs (manual and daily): the owner's PID on line 1, its start time
 # (Unix epoch) on line 2. The web interface reads it to show a running geolocation
 LOCK_FILE="$GEOMATE_TMP_DIR/geolocation.lock"
@@ -151,24 +153,141 @@ chmod 755 "$GEOMATE_TMP_DIR"
 # Ensure the locks this process owns are removed on script exit
 trap cleanup EXIT
 
-# Retrieves geographic information for a batch of IPs
-get_geo_info_batch() {
-    local batch="$1"
-    local response
-    
-    log_and_print "API request sent for $(echo "$batch" | wc -w) IPs" 2
-    response=$(curl -s --retry 3 "$IP_API_URL" \
-        -H "Content-Type: application/json" \
-        -d "[$(echo "$batch" | sed 's/[[:space:]]\+/","/g' | sed 's/^/"/;s/$/"/')]" \
-        2>/dev/null)
-    
-    # ip-api answers with a JSON array; anything else (e.g. an error page) counts as failed
-    if [ "${response#\[}" != "$response" ]; then
-        echo "$response"
-        return 0
-    else
-        return 1
+# Monotonic seconds: wall-clock corrections must not reopen the request budget.
+rate_now() {
+    local uptime rest
+    read -r uptime rest < /proc/uptime || return 1
+    printf '%s\n' "${uptime%%.*}"
+}
+
+# Short, non-blocking lock shared by every geolocation process. A stale-owner claim
+# prevents two waiters from removing a lock that a third process just acquired.
+acquire_rate_lock() {
+    local owner claim waited=0
+    mkdir -p "$RATE_DIR" || return 1
+    until ln -snT "$$" "$RATE_DIR/lock" 2>/dev/null; do
+        owner=$(readlink "$RATE_DIR/lock" 2>/dev/null)
+        # The owner may have unlocked between ln and readlink.
+        case "$owner" in '') continue ;; *[!0-9]*) return 1 ;; esac
+        claim="$RATE_DIR/stale.$owner"
+        if ! kill -0 "$owner" 2>/dev/null && mkdir "$claim" 2>/dev/null; then
+            if [ "$(readlink "$RATE_DIR/lock" 2>/dev/null)" = "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+                rm -f "$RATE_DIR/lock"
+            fi
+            rmdir "$claim"
+            continue
+        fi
+        [ "$waited" -lt 60 ] || return 1
+        sleep 1
+        waited=$((waited + 1))
+    done
+}
+
+release_rate_lock() {
+    [ "$(readlink "$RATE_DIR/lock" 2>/dev/null)" != "$$" ] || rm -f "$RATE_DIR/lock"
+}
+
+# Reserve one request in the rolling window, including partial batches and retries.
+# Sleeping never holds the lock. The extra second covers the clock's whole-second
+# precision, so requests at the edges of a 60-second window cannot exceed the limit.
+reserve_request() {
+    local now count first wait_for until_time tmp="$RATE_DIR/requests.$$"
+    while :; do
+        acquire_rate_lock || return 1
+        now=$(rate_now) || { release_rate_lock; return 1; }
+        until_time=0
+        read -r until_time 2>/dev/null < "$RATE_DIR/until"
+        case "$until_time" in ''|*[!0-9]*) until_time=0 ;; esac
+        : > "$tmp" || { release_rate_lock; return 1; }
+        if [ -f "$RATE_DIR/requests" ]; then
+            awk -v now="$now" -v window="$RATE_LIMIT_WINDOW" \
+                '$0 ~ /^[0-9]+$/ && now - $0 <= window { print }' \
+                "$RATE_DIR/requests" > "$tmp" || { release_rate_lock; return 1; }
+        fi
+        count=$(wc -l < "$tmp")
+        wait_for=$((until_time - now))
+        if [ "$count" -ge "$RATE_LIMIT" ]; then
+            read -r first < "$tmp"
+            [ "$wait_for" -ge $((first + RATE_LIMIT_WINDOW + 1 - now)) ] ||
+                wait_for=$((first + RATE_LIMIT_WINDOW + 1 - now))
+        fi
+        if [ "$wait_for" -le 0 ]; then
+            printf '%s\n' "$now" >> "$tmp" && mv "$tmp" "$RATE_DIR/requests" || {
+                release_rate_lock; return 1; }
+            release_rate_lock
+            return 0
+        fi
+        rm -f "$tmp"
+        release_rate_lock
+        sleep "$wait_for"
+    done
+}
+
+# Provider headers can delay requests, but never grant extra slots. Ignore malformed
+# hints and cap a wait at 65 seconds. Retry-After's numeric form also works with other
+# providers; the local rolling window remains authoritative when headers are absent.
+record_rate_hint() {
+    local headers="$1" status="$2" hint remaining ttl retry now old
+    hint=$(awk '
+        /^HTTP\// { rl = ""; ttl = ""; retry = "" }
+        { key = tolower($1); value = $2; sub(/\r$/, "", value) }
+        key == "x-rl:" && value ~ /^[0-9]+$/ { rl = (value + 0 == 0 ? 0 : 1) }
+        key == "x-ttl:" && value ~ /^[0-9]+$/ { ttl = (value + 0 > 65 ? 65 : value + 0) }
+        key == "retry-after:" && value ~ /^[0-9]+$/ { retry = (value + 0 > 65 ? 65 : value + 0) }
+        END { print (rl == "" ? "-" : rl), (ttl == "" ? "-" : ttl), (retry == "" ? "-" : retry) }
+    ' "$headers")
+    read -r remaining ttl retry <<EOF
+$hint
+EOF
+    # The arithmetic only sees small integers, even for an invalid oversized header.
+    hint=0
+    if [ "$status" = 429 ] || [ "$remaining" = 0 ]; then
+        case "$ttl" in -) ;; ?????* ) hint=65 ;; *) hint=$((ttl + 1)) ;; esac
+        case "$retry" in -) ;; ?????* ) hint=65 ;; *) [ "$hint" -ge "$retry" ] || hint="$retry" ;; esac
+        [ "$hint" -gt 0 ] || hint="$RATE_LIMIT_WINDOW"
+        [ "$hint" -le 65 ] || hint=65
     fi
+    [ "$hint" -gt 0 ] || return 0
+    acquire_rate_lock || return 1
+    now=$(rate_now) || { release_rate_lock; return 1; }
+    old=0
+    read -r old 2>/dev/null < "$RATE_DIR/until"
+    case "$old" in ''|*[!0-9]*) old=0 ;; esac
+    [ "$old" -ge $((now + hint)) ] || printf '%s\n' "$((now + hint))" > "$RATE_DIR/until"
+    release_rate_lock
+}
+
+# Retrieves geographic information for a batch of IPs. curl never retries on its
+# own: a 429 gets one separately budgeted attempt, with a fresh response body.
+get_geo_info_batch() {
+    local batch="$1" response status attempt=0 curl_status
+    local headers="$GEOMATE_TMP_DIR/geo_headers.$$" body="$GEOMATE_TMP_DIR/geo_body.$$"
+    while :; do
+        reserve_request || { log_and_print "Error: could not reserve a geolocation request" 0 >&2; return 1; }
+        : > "$headers"
+        : > "$body"
+        log_and_print "API request sent for $(echo "$batch" | wc -w) IPs" 2 >&2
+        status=$(curl -s --connect-timeout 10 --max-time 30 "$GEO_PROVIDER_URL" \
+            -D "$headers" -o "$body" -w '%{http_code}' \
+            -H "Content-Type: application/json" \
+            -d "[$(echo "$batch" | sed 's/[[:space:]]\+/","/g' | sed 's/^/"/;s/$/"/')]" \
+            2>/dev/null)
+        curl_status=$?
+        record_rate_hint "$headers" "$status" || {
+            rm -f "$headers" "$body"; return 1; }
+        if [ "$curl_status" -eq 0 ] && [ "$status" = 429 ] && [ "$attempt" -eq 0 ]; then
+            attempt=1
+            continue
+        fi
+        response=$(cat "$body")
+        rm -f "$headers" "$body"
+        [ "$curl_status" -eq 0 ] && [ "$status" = 200 ] || return 1
+        # A partial response or an error page must not replace existing coordinates.
+        [ "${response#\[}" != "$response" ] && [ "${response%\]}" != "$response" ] || return 1
+        printf '%s\n' "$response" | jq -e 'type == "array"' >/dev/null 2>&1 || return 1
+        printf '%s\n' "$response"
+        return 0
+    done
 }
 
 # Puts the complete new content ($1) in place of the geo data file ($2) if it differs,
@@ -214,9 +333,7 @@ process_game_ips() {
     local game_name="$1"
     local ip_list="$2"
     local output_file="${GEOMATE_DATA_DIR}/${game_name}_geo_data.json"
-    local temp_output_file="${output_file}.tmp"
-    local start_time=$(date +%s)
-    local request_count=0
+    local temp_output_file="${GEOMATE_TMP_DIR}/geo_output.$$"
     local batch=""
     local batch_count=0
     local processed_count=0
@@ -248,18 +365,7 @@ process_game_ips() {
             log_and_print "Processed $processed_count IPs for $game_name" 2
             batch=""
             batch_count=0
-            request_count=$((request_count + 1))
 
-            current_time=$(date +%s)
-            elapsed=$((current_time - start_time))
-            log_and_print "Elapsed time: $elapsed seconds, Requests: $request_count" 2
-            if [ "$elapsed" -lt "$RATE_LIMIT_WINDOW" ] && [ "$request_count" -ge "$RATE_LIMIT" ]; then
-                sleep_time=$((RATE_LIMIT_WINDOW - elapsed + 1))
-                log_and_print "Rate limit reached. Sleeping for $sleep_time seconds." 1
-                sleep "$sleep_time"
-                start_time=$(date +%s)
-                request_count=0
-            fi
         fi
     done < "$ip_list"
 
@@ -343,7 +449,7 @@ process_specific_ips() {
     # Deduplicate IPs before processing; strip a ",timestamp" taken over from a list line
     local ips=$(echo "$*" | tr ' ' '\n' | cut -d, -f1 | sort -u | tr '\n' ' ')
     local output_file="${GEOMATE_DATA_DIR}/${game_name}_geo_data.json"
-    local temp_output_file="${output_file}.tmp"
+    local temp_output_file="${GEOMATE_TMP_DIR}/geo_output.$$"
     local lock_file="${GEOMATE_TMP_DIR}/${game_name}_geo_data.lock"
     local total_ips=$(echo "$ips" | wc -w)
 
@@ -371,7 +477,6 @@ process_specific_ips() {
             process_batch "$batch" "$temp_output_file"
             batch=""
             count=0
-            sleep 4  # Wait 4 seconds between batches
         fi
     done
 

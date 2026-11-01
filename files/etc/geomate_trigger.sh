@@ -20,7 +20,6 @@ NEW_IPS_FILE="${GEOMATE_RUNTIME_DIR}/new_ips.txt"
 COLLECTED_LIST_PREFIX="/tmp/geomate/collected_list."  # + filter name: list copies of check_new_ips for this run
 MIN_GEOLOCATE_INTERVAL=1800  # Minimum interval in seconds (30 minutes)
 MAX_GEOLOCATE_INTERVAL=3600  # Maximum interval in seconds (1 hour)
-RATE_LIMIT=15  # Maximum number of API calls per minute
 
 # Logs and prints messages based on the debug level
 log_and_print() {
@@ -92,9 +91,9 @@ check_and_run_geolocate() {
 
     # Only do frequent updates if mode is 'frequent'
     if [ "$geolocation_mode" = "frequent" ] && [ $((current_time - last_geolocate_time)) -ge "$geolocate_interval" ]; then
-        local time_since_last_run=$((current_time - last_geolocate_time))
-        local api_calls_allowed=$((RATE_LIMIT * (time_since_last_run / 60 + 1)))
-        local ips_to_process=$((new_ips_count < api_calls_allowed ? new_ips_count : api_calls_allowed))
+        # geolocate.sh shares the provider budget between all runs and batches.
+        # Queue length is an IP count, not a request count.
+        local ips_to_process="$new_ips_count"
 
         if [ $ips_to_process -gt 0 ]; then
             log_and_print "Geomate_Trigger: Processing $ips_to_process new IPs for geolocation" 1
