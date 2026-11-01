@@ -28,6 +28,9 @@ EXIT_NO_LOCK=4       # Exit code: the full run could not create its lock, nothin
 FILTER_LOCK_FILE=""  # Per-filter lock of the 'specific' mode, removed on exit
 FAILED_BATCHES=0     # Batches without a usable API answer
 GEO_DATA_CHANGED=0   # Set to 1 when a geo data file was rewritten
+PID_FILE="/var/run/geomate.pid"  # PID of the run loop of the service
+# Left for the run loop when this run was started by its trigger and reload_geo failed
+GEO_RESTART_FLAG="$GEOMATE_TMP_DIR/geo_restart_needed"
 
 log_and_print() {
     local message="$1"
@@ -420,21 +423,41 @@ main() {
     esac
 }
 
+# Return 0 when the trigger of the running service loop started this run: GEOMATE_FROM_LOOP
+# holds the PID of the loop, which still owns PID_FILE. A run whose loop has gone, for
+# example after a restart, acts on its own
+started_by_loop() {
+    local pid
+    [ -n "$GEOMATE_FROM_LOOP" ] || return 1
+    read -r pid 2>/dev/null < "$PID_FILE"
+    [ "$pid" = "$GEOMATE_FROM_LOOP" ] && kill -0 "$pid" 2>/dev/null
+}
+
 main "$@"
 status=$?
 
-# Only new geo data needs a restart (the nft sets are built from these files at start)
+# Only new geo data needs action (the nft sets are built from these files). reload_geo
+# refills the sets of the changed filters in place; an older geomate.sh without it prints
+# its usage and exits 1, which restarts as before. A run of the loop's trigger leaves the
+# restart to the loop: inside the service it would kill itself (and the trigger before it
+# recorded its progress) with procd since 2026-10-18
 if [ "$GEO_DATA_CHANGED" = "1" ]; then
-    log_and_print "Geolocation completed successfully, restarting geomate service"
-    /etc/init.d/geomate restart
-    restart_status=$?
-    if [ $restart_status -eq 0 ]; then
-        log_and_print "Service restart successful"
+    if /etc/geomate.sh reload_geo; then
+        log_and_print "Geolocation completed successfully, new geo data applied without a restart"
+    elif started_by_loop && : > "$GEO_RESTART_FLAG"; then
+        log_and_print "Geolocation completed successfully, the service restarts after the geolocation"
     else
-        log_and_print "Service restart failed with status $restart_status"
-        status=$restart_status
-        # Exit codes 3 and 4 are reserved for full runs that did nothing
-        case "$status" in "$EXIT_RUNNING"|"$EXIT_NO_LOCK") status=1 ;; esac
+        log_and_print "Geolocation completed successfully, restarting geomate service"
+        /etc/init.d/geomate restart
+        restart_status=$?
+        if [ $restart_status -eq 0 ]; then
+            log_and_print "Service restart successful"
+        else
+            log_and_print "Service restart failed with status $restart_status"
+            status=$restart_status
+            # Exit codes 3 and 4 are reserved for full runs that did nothing
+            case "$status" in "$EXIT_RUNNING"|"$EXIT_NO_LOCK") status=1 ;; esac
+        fi
     fi
 elif [ "$FAILED_BATCHES" -gt 0 ]; then
     log_and_print "No geo data updated, $FAILED_BATCHES API request(s) failed. Skipping service restart"
