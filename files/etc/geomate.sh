@@ -462,11 +462,19 @@ report_nft_input_error() {
 # Sets proto_only to 1 for a protocol without ports and a Source IP that names devices,
 # to 2 when the Source IP is empty or has exceptions only (the match would cover every
 # device and the replies of the servers too), else to 0.
+# Sets rx_rule to the match of the servers' replies to the filter's devices (forward
+# chain, capability rx_counters): the same match with 'ip daddr' for each 'ip saddr' and
+# the ports swapped (src_port as dport, dest_port as sport), the protocol kept. rx_ok is
+# 1, or 0 with an empty rx_rule for a protocol written as an nft expression, which has
+# no known direction to swap.
 # Returns the status of build_src_match, which also sets src_exceptions_only
 build_base_rule() {
     local protocol="$1" src_port="$3" dest_port="$4" has_sport=0 rv=0
     local port_proto="$1" l4proto word proto_list=1 src_first glob_off=0
+    local proto_part rx_sport="" rx_dport=""
     proto_only=0
+    rx_rule=""
+    rx_ok=0
     build_src_match "$2" || rv=1
     base_rule="$src_match"
     [ "$src_port" = "any" ] && src_port=""
@@ -506,6 +514,7 @@ build_base_rule() {
             case "$src_first" in '!'*) proto_only=2 ;; esac
         fi
     fi
+    proto_part="${base_rule#"$src_match"}"
 
     # Include src_port in the rule if set
     if [ -n "$src_port" ]; then
@@ -514,9 +523,11 @@ build_base_rule() {
         if echo "$src_port" | grep -q ' '; then
             src_port=$(echo "$src_port" | tr ' ' ',')
             base_rule="$base_rule sport { $src_port }"
+            rx_dport="dport { $src_port }"
         else
             # Single value (port or range) - no braces needed
             base_rule="$base_rule sport $src_port"
+            rx_dport="dport $src_port"
         fi
     fi
 
@@ -527,10 +538,21 @@ build_base_rule() {
         if echo "$dest_port" | grep -q ' '; then
             dest_port=$(echo "$dest_port" | tr ' ' ',')
             base_rule="$base_rule dport { $dest_port }"
+            rx_sport="sport { $dest_port }"
         else
             # Single value (port or range) - no braces needed
             base_rule="$base_rule dport $dest_port"
+            rx_sport="sport $dest_port"
         fi
+    fi
+
+    # The replies: Source IP entries as destinations, then the protocol and the swapped
+    # ports, in the order of base_rule
+    if [ "$proto_list" -eq 1 ]; then
+        rx_ok=1
+        rx_rule="${src_match//ip saddr /ip daddr }$proto_part"
+        [ -n "$rx_sport" ] && rx_rule="$rx_rule $rx_sport"
+        [ -n "$rx_dport" ] && rx_rule="$rx_rule${rx_sport:+ $port_proto} $rx_dport"
     fi
     return "$rv"
 }
@@ -857,7 +879,7 @@ create_dynamic_set() {
 
     # Create the base rule. setup_geo_filter has logged an unchecked Source IP already
     check_rule_options "$1" || return
-    local base_rule
+    local base_rule rx_rule rx_ok
     build_base_rule "$protocol" "$src_ip" "$src_port" "$dest_port"
     # setup_geo_filter has reported a protocol without ports for all devices
     [ "$proto_only" -eq 2 ] && return
@@ -877,6 +899,25 @@ create_dynamic_set() {
             log_and_print "Successfully added main dynamic set rule for $name" 2
         else
             log_and_print "ERROR: Failed to add main dynamic set rule for $name! Check $NFT_ERROR_LOG" 0
+        fi
+    fi
+
+    # Count the packets each server sends to the filter's devices (capability rx_counters)
+    # in _rx, which has the timeout and counters of _dynamic. Only servers the devices
+    # sent to in the last 10 s (_ui_dynamic), so traffic from elsewhere cannot fill _rx.
+    # Not _dynamic: a lookup of a set with counters counts the packet for the element, so
+    # the replies would show up in the counters of the sent packets. Forward chain: in
+    # prerouting a reply still has the WAN address as destination, the forward hook sees
+    # it after the de-NAT. These rules follow the accept and drop rules of all filters and
+    # come before the catch-all accept
+    if [ "$operational_mode" != "static" ]; then
+        if [ "$rx_ok" -eq 1 ]; then
+            nft_exec add set inet geomate "${set_name}_rx" { type ipv4_addr\; flags dynamic,timeout\; timeout 1h\; counter\; }
+            log_and_print "Adding forward rule for received packets: $rx_rule ip saddr @${set_name}_ui_dynamic update @${set_name}_rx { ip saddr }" 2
+            nft_exec add rule inet geomate forward "$rx_rule" ip saddr @"${set_name}"_ui_dynamic update @"${set_name}"_rx { ip saddr } || \
+                log_and_print "ERROR: Failed to add the rule for received packets of $name! Check $NFT_ERROR_LOG" 0
+        else
+            log_and_print "Filter $name: protocol '$protocol' is an nft expression, packets from its servers are not counted" 1
         fi
     fi
 
@@ -1682,7 +1723,12 @@ case "$1" in
         # (PID on line 1, start epoch on line 2) and a second one exits with 3;
         # 'geolocate.sh start' starts the manual run detached (exit 0, 3 when running, 1 when
         # it cannot start)
-        printf '%s\n' 'src_ip_multi set_counters blocked_ip geolocate_status'
+        # rx_counters: in dynamic and monitor mode each enabled filter has a set _rx with
+        # 'counter packets N bytes M' per server: what the server sent to the filter's
+        # devices and ports while they sent to it (_ui_dynamic), from the first such packet
+        # until it was idle for an hour. A filter whose protocol is an nft expression has
+        # none
+        printf '%s\n' 'src_ip_multi set_counters blocked_ip geolocate_status rx_counters'
         ;;
     run)
         run
