@@ -1033,7 +1033,10 @@ harvest_dynamic_set() {
         $0 == "" { next }
         ($1 in harvested) {
             known[$1] = 1
-            if (expiry != "0" && refresh && now - $2 >= min_age) { print $1 "," now; updated++; next }
+            # A returning IP near expiry must survive stop/start after the set is
+            # removed. Reserve an hour even when the regular refresh gate is shut.
+            if (expiry != "0" && ((refresh && now - $2 >= min_age) ||
+                now - $2 >= expiry * 86400 - 3600)) { print $1 "," now; updated++; next }
         }
         { print }
         END {
