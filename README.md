@@ -345,6 +345,8 @@ The table uses compact rows: cell padding of 5 px by 10 px and small buttons, so
 
 The map and selected server appear side by side, with Active connections open below. On narrow screens the server panel follows the map. Click a server IP in the list, or **Details** in its map popup, to select it. Selecting a server from the fullscreen map returns to this overview. Selecting it again keeps its history; selecting another server starts a new history.
 
+**Hide** collapses the panel to its heading below the full-width map and stops sampling. **Show**, or selecting the same server again, restores the panel and its history. **Close** removes the panel and selection; select a server to open it again. Showing the panel preserves a manual pause and does not reset the ten-minute sampling limit.
+
 **Ping**, **Jitter** and **Ping loss** appear above the three-minute ping graph. They use ICMP probes from the router, not the game's packets. A timeout or missing measurement clears the current Ping value while keeping the graph's history. If a server never replies, the panel shows **No ping reply** and leaves Ping loss as "–". This does not indicate 100% loss of game traffic. Ping stops after three unanswered attempts, or ten consecutive timeouts after a successful reply. **Retry** starts another attempt. A server that does not answer ICMP provides no measured ping.
 
 The smaller **Packets** graph shows packets per second: **Received** from the server and **Sent** to it, for all devices matching the filter. The rate tooltips show average packet size. These counts do not measure the game's tick rate. Flow offloading limits both counts as described above. A restarted counter or a long gap starts a new line instead of showing a false spike.
