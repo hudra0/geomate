@@ -24,8 +24,8 @@ PID_FILE="/var/run/geomate.pid"                    # PID of the run loop, writte
 LOADING_FLAG="/tmp/geomate_loading"                # Present while a start builds the table
 IP_CACHE_FILE="/tmp/geomate_ip_cache.json"         # Lookup cache of the web interface (luci.geomate)
 GEO_RESTART_FLAG="${GEOMATE_TMP_DIR}/geo_restart_needed"  # geolocate.sh under the loop: reload_geo failed
-CHECK_INTERVAL=1800  # Interval in seconds (30 minutes) - used for geolocation status
-harvest_refresh_per_day=0  # A harvest refreshes list timestamps this many seconds old per expiry day (0: all)
+CHECK_INTERVAL=1800  # Default loop interval in seconds, loaded from UCI
+harvest_refresh_per_day=0  # Timestamp refresh age per expiry day; at least one hour, at most one day
 debug_level=0
 
 # Wrapper for nft commands with error logging
@@ -48,6 +48,15 @@ load_config() {
     config_get debug_level global debug_level '0'
     config_get strict_mode global strict_mode '0'
     config_get operational_mode global operational_mode 'dynamic'
+    config_get CHECK_INTERVAL global check_interval '1800'
+    case "$CHECK_INTERVAL" in ''|*[!0-9]*) CHECK_INTERVAL=1800 ;; esac
+    # Strip leading zeros before arithmetic (ash otherwise treats them as octal).
+    while [ "${CHECK_INTERVAL#0}" != "$CHECK_INTERVAL" ]; do CHECK_INTERVAL="${CHECK_INTERVAL#0}"; done
+    case "$CHECK_INTERVAL" in '') CHECK_INTERVAL=0 ;; ?????*) CHECK_INTERVAL=3600 ;; esac
+    [ "$CHECK_INTERVAL" -ge 300 ] || CHECK_INTERVAL=300
+    [ "$CHECK_INTERVAL" -le 3600 ] || CHECK_INTERVAL=3600
+    # Static mode keeps its hourly loop and the existing 30-60 minute scheduler.
+    [ "$operational_mode" != static ] || CHECK_INTERVAL=1800
 }
 
 # Log messages and optionally print them based on the debug level
@@ -162,14 +171,22 @@ cleanup_expired_ips_for_filter() {
     # by the shell test of older versions), any other line is kept as IP,timestamp.
     # The counts go to ${tmp}.counts, the dropped IPs to ${tmp}.removed (debug level 3)
     mkdir -p "$GEOMATE_TMP_DIR"
+    # An IP can become active while timestamp refresh is gated. Keep it until the
+    # next refresh instead of expiring an address still present in a collected set.
+    config_foreach list_shared_dynamic_sets 'geo_filter' '' "$ip_list" |
+        sed -n '/elements = {/,/}/p' | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | sort -u > "${tmp}.active"
     awk -v now="$(date +%s)" -v days="$expiry_days" -v verbose="$((debug_level >= 3))" \
-        -v counts="${tmp}.counts" -v removed_file="${tmp}.removed" '
-        BEGIN { cutoff = now - days * 86400; printf "" > removed_file }
+        -v counts="${tmp}.counts" -v removed_file="${tmp}.removed" -v active_file="${tmp}.active" '
+        BEGIN {
+            cutoff = now - days * 86400; printf "" > removed_file
+            while ((getline ip < active_file) > 0) active[ip] = 1
+            close(active_file)
+        }
         $0 == "" { next }
         {
             i = index($0, ",")
             if (i) { ip = substr($0, 1, i - 1); ts = substr($0, i + 1) } else { ip = $0; ts = now }
-            if (ts ~ /^[[:space:]]*[-+]?[0-9]+[[:space:]]*$/ && ts + 0 < cutoff) {
+            if (!(ip in active) && ts ~ /^[[:space:]]*[-+]?[0-9]+[[:space:]]*$/ && ts + 0 < cutoff) {
                 removed++
                 if (verbose) print ip, ts > removed_file
                 next
@@ -179,7 +196,7 @@ cleanup_expired_ips_for_filter() {
         }
         END { print removed + 0, kept + 0 > counts }' "$ip_list" > "$tmp" || {
         log_and_print "Error: failed to check $ip_list of $name for expired IPs" 0
-        rm -f "$tmp" "${tmp}.counts" "${tmp}.removed"
+        rm -f "$tmp" "${tmp}.counts" "${tmp}.removed" "${tmp}.active"
         return 1
     }
     read -r removed_count kept_count < "${tmp}.counts"
@@ -191,10 +208,10 @@ cleanup_expired_ips_for_filter() {
         rm -f "$tmp"
     elif ! mv "$tmp" "$ip_list"; then
         log_and_print "Error: failed to update IP list $ip_list of $name" 0
-        rm -f "$tmp" "${tmp}.counts" "${tmp}.removed"
+        rm -f "$tmp" "${tmp}.counts" "${tmp}.removed" "${tmp}.active"
         return 1
     fi
-    rm -f "${tmp}.counts" "${tmp}.removed"
+    rm -f "${tmp}.counts" "${tmp}.removed" "${tmp}.active"
     
     [ "$removed_count" -gt 0 ] && log_and_print "Removed $removed_count expired IPs for $name, kept $kept_count" 1
     
@@ -890,11 +907,24 @@ create_dynamic_set() {
     log_and_print "Sets for $name set up successfully" 1
 }
 
+# Add the collected sets of other filters sharing this IP list. The first harvest
+# then refreshes all active IPs together, before the list's hourly gate closes.
+# Arguments: callback section, primary section, IP list path.
+list_shared_dynamic_sets() {
+    local shared_list name set_name
+    [ "$1" != "$2" ] || return 0
+    config_get shared_list "$1" 'ip_list'
+    [ "$shared_list" = "$3" ] || return 0
+    config_get name "$1" 'name'
+    filter_set_name "$name" || return 0
+    nft list set inet geomate "${set_name}_dynamic" 2>/dev/null
+}
+
 # Merge the public IPs of a filter's _dynamic set into its ip_list. Shared by the loop
 # (update_dynamic_ips) and the 'harvest' command; the caller holds the sets lock.
 # List lines are "IP", or "IP,<unix time>" with ip_expiry_days > 0: then a known IP
 # gets the current time once its time is ip_expiry_days * harvest_refresh_per_day
-# seconds old, at most a day. New IPs are appended. Sets harvest_added to their number
+# seconds old, at least an hour and at most a day. New IPs are appended. Sets harvest_added to their number
 harvest_dynamic_set() {
     local name ip_list expiry_days set_name elements
     harvest_added=0
@@ -916,8 +946,22 @@ harvest_dynamic_set() {
     local counts_file="${GEOMATE_TMP_DIR}/${set_name}_counts.txt"
     local list_tmp="${GEOMATE_TMP_DIR}/${set_name}_list.tmp"
     local ip old_list="$ip_list" skipped_private=0 updated_count=0
+    local now refresh_key refresh_file last_refresh=0 refresh_due=1
+    now=$(date +%s)
+    # Filters can share an IP list. Gate timestamp-only rewrites by list path, not
+    # filter name; staggered per-IP timestamps must not rewrite it every cycle.
+    refresh_key=$(printf '%s' "$ip_list" | md5sum)
+    refresh_file="${GEOMATE_TMP_DIR}/list_refresh.${refresh_key%% *}"
+    read -r last_refresh 2>/dev/null < "$refresh_file"
+    case "$last_refresh" in ''|*[!0-9]*) last_refresh=0 ;; esac
+    if [ "$last_refresh" -le "$now" ] && [ $((now - last_refresh)) -lt 3600 ]; then
+        refresh_due=0
+    fi
 
-    printf '%s\n' "$elements" | sed -n '/elements = {/,/}/p' | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | sort -u > "$set_file"
+    {
+        printf '%s\n' "$elements"
+        config_foreach list_shared_dynamic_sets 'geo_filter' "$1" "$ip_list"
+    } | sed -n '/elements = {/,/}/p' | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | sort -u > "$set_file"
 
     : > "$public_file"
     while IFS= read -r ip; do
@@ -939,14 +983,14 @@ harvest_dynamic_set() {
     # One pass over the list: refresh the timestamps of known IPs (expiry enabled),
     # append the new IPs in sorted order, count both
     [ -f "$ip_list" ] || old_list=/dev/null
-    awk -F, -v now="$(date +%s)" -v expiry="$expiry_days" -v per_day="$harvest_refresh_per_day" \
-        -v counts="$counts_file" -v new_file="$new_file" '
-        BEGIN { min_age = expiry * per_day; if (min_age > 86400) min_age = 86400 }
+    awk -F, -v now="$now" -v expiry="$expiry_days" -v per_day="$harvest_refresh_per_day" \
+        -v counts="$counts_file" -v new_file="$new_file" -v refresh="$refresh_due" '
+        BEGIN { min_age = expiry * per_day; if (min_age < 3600) min_age = 3600; if (min_age > 86400) min_age = 86400 }
         FILENAME == ARGV[1] { harvested[$0] = 1; order[++n] = $0; next }
         $0 == "" { next }
         ($1 in harvested) {
             known[$1] = 1
-            if (expiry != "0" && (min_age == 0 || now - $2 >= min_age)) { print $1 "," now; updated++; next }
+            if (expiry != "0" && refresh && now - $2 >= min_age) { print $1 "," now; updated++; next }
         }
         { print }
         END {
@@ -980,6 +1024,7 @@ harvest_dynamic_set() {
         if cmp -s "$list_tmp" "$ip_list"; then
             rm -f "$list_tmp"
         elif mv "$list_tmp" "$ip_list"; then
+            [ "$updated_count" -eq 0 ] || printf '%s\n' "$now" > "$refresh_file"
             log_and_print "Updated IP list for $name: $harvest_added added, $updated_count timestamps updated" 2
         else
             log_and_print "Error: failed to update IP list $ip_list for $name" 0
@@ -1010,7 +1055,7 @@ update_dynamic_ips() {
 harvest_all() {
     local UCI_CONFIG_DIR="$UCI_CONFIG_DIR"
     [ -f "$BUILT_CONFIG_DIR/geomate" ] && UCI_CONFIG_DIR="$BUILT_CONFIG_DIR"
-    # The loop refreshes timestamps every 30 minutes. A stop refreshes only timestamps
+    # The loop refreshes timestamps at most hourly. A stop refreshes only timestamps
     # one hour old per expiry day (at most a day): it rarely writes the list to flash
     # for known IPs, and a timestamp it leaves is far younger than the expiry window,
     # so the cleanup at the next start never drops an IP of the _dynamic set (1 h timeout)
@@ -1022,7 +1067,7 @@ harvest_all() {
 }
 
 # Write geolocation status to JSON file for UI/CLI consumption
-# This is called once per cycle (every 30 min) and after reload_geo refilled sets
+# This is called once per cycle and after reload_geo refilled sets
 # $1: next_cycle to keep (reload_geo does not reset the loop timer), default now plus
 # CHECK_INTERVAL. A per-process file next to its place is renamed, so a reader never
 # sees half a file
@@ -1032,7 +1077,7 @@ write_geolocation_status() {
     local current_time
     local next_cycle="$1"
     local last_geolocate=0
-    local geolocate_interval=1800
+    local geolocate_interval="$CHECK_INTERVAL"
     local pending_ips=0
     local last_daily=0
     local geolocation_mode_cfg
@@ -1049,6 +1094,9 @@ write_geolocation_status() {
     # Read geolocation timing info (frequent mode)
     [ -f "${GEOMATE_RUNTIME_DIR}/last_geolocate_run" ] && last_geolocate=$(cat "${GEOMATE_RUNTIME_DIR}/last_geolocate_run")
     [ -f "${GEOMATE_RUNTIME_DIR}/last_geolocate_run.interval" ] && geolocate_interval=$(cat "${GEOMATE_RUNTIME_DIR}/last_geolocate_run.interval")
+    case "$geolocate_interval" in ''|*[!0-9]*) geolocate_interval="$CHECK_INTERVAL" ;; esac
+    [ "$geolocate_interval" -ge "$CHECK_INTERVAL" ] || geolocate_interval="$CHECK_INTERVAL"
+    [ "$geolocate_interval" -le $((CHECK_INTERVAL * 2)) ] || geolocate_interval=$((CHECK_INTERVAL * 2))
     [ -f "${GEOMATE_RUNTIME_DIR}/new_ips.txt" ] && pending_ips=$(wc -l < "${GEOMATE_RUNTIME_DIR}/new_ips.txt" 2>/dev/null || echo 0)
     
     # Read daily geolocation timing
@@ -1826,7 +1874,6 @@ run() {
     fi
     
     SLEEP_DURATION=60  # Desired sleep duration
-    CHECK_INTERVAL=1800  # Interval in seconds (1800 seconds = 30 minutes)
 
     last_check_time=$(date +%s)
 
@@ -1906,7 +1953,7 @@ case "$1" in
         # it cannot start)
         # geo_reload: new geo data refills the filter's sets in place ('geomate.sh
         # reload_geo'), without a restart; geolocate.sh restarts only when that fails
-        printf '%s\n' 'src_ip_multi set_counters blocked_ip geolocate_status geo_reload'
+        printf '%s\n' 'src_ip_multi set_counters blocked_ip geolocate_status geo_reload check_interval'
         ;;
     run)
         run

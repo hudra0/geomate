@@ -152,7 +152,8 @@ After installing Geomate and the LuCI interface:
 | debug_level | Control logging verbosity | 0 (minimal), 1 (normal), 2 (verbose) | 0 |
 | strict_mode | Control how untracked connections are handled | 0 (allow untracked), 1 (block untracked) | 0 |
 | operational_mode | How IP lists are managed | 'dynamic' (automatic learning), 'static' (predefined lists) | 'dynamic' |
-| geolocation_mode | Frequency of IP geolocation updates | 'frequent' (30-60 min), 'daily' (once per day) | 'frequent' |
+| geolocation_mode | Frequency of IP geolocation updates | 'frequent' (check interval to twice that interval), 'daily' (once per day) | 'frequent' |
+| check_interval | Seconds between collection cycles in Dynamic and Monitor Mode; also the minimum interval for frequent geolocation. The scheduler backs off to twice this value when there are no new IPs. Static Mode keeps its hourly loop and 30-60 minute scheduler | 300-3600 seconds | 1800 |
 
 ### Per-Filter Options
 
@@ -448,12 +449,18 @@ Several words can show together, for example "Unsaved, No IP list".
   - Updates once per day
   - Reduces API calls
 
+### Check interval
+
+In Dynamic and Monitor Mode, `check_interval` sets how often Geomate saves collected addresses and checks for geolocation work. A missing or invalid value uses 1800 seconds, and numeric values are limited to 300-3600 seconds. Existing configurations need no change. Static Mode keeps its current timing.
+
+A shorter interval finds new servers sooner and runs more collection and status cycles. Known IP timestamps are refreshed at most once per hour per list, even at 300 seconds; filters sharing a list refresh their collected addresses together. New IPs are still saved at the next cycle. Daily expiry keeps addresses still present in a collected set until they can be refreshed. Geolocation requests from all cycles and manual runs use the same provider budget. Status and scheduler files can still be written more often at a shorter interval.
+
 ### Geolocation Process
 
 The geolocation process can be triggered manually through the UI or runs automatically based on your selected update mode. To optimize resource usage and API quota:
 
 - Only active filters are processed during geolocation
-- The ip-api batch endpoint accepts up to 100 IPs per request and 15 requests per minute. All filters, manual runs and scheduled runs share a rolling 15-request/60-second budget in `/tmp/geomate/ratelimit`, including partial batches and retries. The provider URL, batch size and request budget are grouped at the top of `geolocate.sh`
+- The [ip-api batch endpoint](https://ip-api.com/docs/api:batch) accepts up to 100 IPs per request and 15 requests per minute. All filters, manual runs and scheduled runs share a rolling 15-request/60-second budget in `/tmp/geomate/ratelimit`, including partial batches and retries. The provider URL, batch size and request budget are grouped at the top of `geolocate.sh`
 - `X-Rl` and `X-Ttl` response headers can delay the next request but never increase that budget. A numeric `Retry-After` is also accepted. HTTP 429 is retried once after the reported delay (at most 65 seconds), through the same limiter; curl does not retry on its own. Requests time out after 30 seconds. Failed batches keep the existing coordinates
 - Frequent updates process the queued IPs in batches; the request limiter controls the pace. The old scheduler counted IPs as requests, so it could leave new servers queued unnecessarily
 - The process runs in the background and may take several minutes to complete
@@ -754,7 +761,7 @@ Example: If you want to play COD with friends from both Europe and USA:
 
 5. **Backend Capabilities**
    - `/etc/geomate.sh capabilities` prints the features of the installed backend as one line of words and exits with 0. It reads no configuration and changes nothing
-   - Today it prints `src_ip_multi set_counters blocked_ip geolocate_status geo_reload`. `src_ip_multi`: Source IP accepts several entries and exceptions with `!`. `set_counters`: each server in a filter's collected set (`geomate_<filter>_dynamic`, dynamic and monitor mode) carries `counter packets N bytes M`. Every restart of Geomate empties the set, so a server can disappear or start again from 0 between two reads. `blocked_ip`: `list blocked_ip` (and the older `option blocked_ips`) blocks its servers inside the circles too, and a change of `list blocked_ip` is applied without a restart. `geolocate_status`: every full geolocation run holds `/tmp/geomate/geolocation.lock` with its PID and start time, a second one exits with 3, and `/etc/geolocate.sh start` starts a manual run in the background (see [Geolocation Process](#geolocation-process)). `geo_reload`: new geo data refills the filters' sets in place (`/etc/geomate.sh reload_geo`) instead of restarting Geomate, so the counts of the collected set keep running
+   - Today it prints `src_ip_multi set_counters blocked_ip geolocate_status geo_reload check_interval`. `src_ip_multi`: Source IP accepts several entries and exceptions with `!`. `set_counters`: each server in a filter's collected set (`geomate_<filter>_dynamic`, dynamic and monitor mode) carries `counter packets N bytes M`. Every restart of Geomate empties the set, so a server can disappear or start again from 0 between two reads. `blocked_ip`: `list blocked_ip` (and the older `option blocked_ips`) blocks its servers inside the circles too, and a change of `list blocked_ip` is applied without a restart. `geolocate_status`: every full geolocation run holds `/tmp/geomate/geolocation.lock` with its PID and start time, a second one exits with 3, and `/etc/geolocate.sh start` starts a manual run in the background (see [Geolocation Process](#geolocation-process)). `geo_reload`: new geo data refills the filters' sets in place (`/etc/geomate.sh reload_geo`) instead of restarting Geomate, so the counts of the collected set keep running. `check_interval`: the global collection interval is configurable between 300 and 3600 seconds, with 1800 as the default
    - Words are only added, never renamed or removed, so the web interface and scripts can rely on them. An older backend prints its usage and exits with 1, which means no capabilities
 
 ## FAQ

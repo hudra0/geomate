@@ -18,8 +18,18 @@ GEOMATE_RUNTIME_DIR="${GEOMATE_DATA_DIR}/runtime"
 LAST_RUN_FILE="${GEOMATE_RUNTIME_DIR}/last_geolocate_run"
 NEW_IPS_FILE="${GEOMATE_RUNTIME_DIR}/new_ips.txt"
 COLLECTED_LIST_PREFIX="/tmp/geomate/collected_list."  # + filter name: list copies of check_new_ips for this run
-MIN_GEOLOCATE_INTERVAL=1800  # Minimum interval in seconds (30 minutes)
-MAX_GEOLOCATE_INTERVAL=3600  # Maximum interval in seconds (1 hour)
+# Keep the same check_interval default and bounds as geomate.sh load_config.
+config_get operational_mode global operational_mode 'dynamic'
+config_get MIN_GEOLOCATE_INTERVAL global check_interval '1800'
+case "$MIN_GEOLOCATE_INTERVAL" in ''|*[!0-9]*) MIN_GEOLOCATE_INTERVAL=1800 ;; esac
+# Strip leading zeros before arithmetic (ash otherwise treats them as octal).
+while [ "${MIN_GEOLOCATE_INTERVAL#0}" != "$MIN_GEOLOCATE_INTERVAL" ]; do MIN_GEOLOCATE_INTERVAL="${MIN_GEOLOCATE_INTERVAL#0}"; done
+case "$MIN_GEOLOCATE_INTERVAL" in '') MIN_GEOLOCATE_INTERVAL=0 ;; ?????*) MIN_GEOLOCATE_INTERVAL=3600 ;; esac
+[ "$MIN_GEOLOCATE_INTERVAL" -ge 300 ] || MIN_GEOLOCATE_INTERVAL=300
+[ "$MIN_GEOLOCATE_INTERVAL" -le 3600 ] || MIN_GEOLOCATE_INTERVAL=3600
+# Static mode keeps its hourly loop and the existing 30-60 minute scheduler.
+[ "$operational_mode" != static ] || MIN_GEOLOCATE_INTERVAL=1800
+MAX_GEOLOCATE_INTERVAL=$((MIN_GEOLOCATE_INTERVAL * 2))
 
 # Logs and prints messages based on the debug level
 log_and_print() {
@@ -69,6 +79,9 @@ check_and_run_geolocate() {
 
     [ -f "$LAST_RUN_FILE" ] && last_geolocate_time=$(cat "$LAST_RUN_FILE")
     [ -f "${LAST_RUN_FILE}.interval" ] && geolocate_interval=$(cat "${LAST_RUN_FILE}.interval")
+    case "$geolocate_interval" in ''|*[!0-9]*) geolocate_interval="$MIN_GEOLOCATE_INTERVAL" ;; esac
+    [ "$geolocate_interval" -ge "$MIN_GEOLOCATE_INTERVAL" ] || geolocate_interval="$MIN_GEOLOCATE_INTERVAL"
+    [ "$geolocate_interval" -le "$MAX_GEOLOCATE_INTERVAL" ] || geolocate_interval="$MAX_GEOLOCATE_INTERVAL"
 
     check_new_ips
 
