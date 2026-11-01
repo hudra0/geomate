@@ -444,8 +444,13 @@ status=$?
 if [ "$GEO_DATA_CHANGED" = "1" ]; then
     if /etc/geomate.sh reload_geo; then
         log_and_print "Geolocation completed successfully, new geo data applied without a restart"
-    elif started_by_loop && : > "$GEO_RESTART_FLAG"; then
-        log_and_print "Geolocation completed successfully, the service restarts after the geolocation"
+    elif started_by_loop; then
+        if : > "$GEO_RESTART_FLAG"; then
+            log_and_print "Geolocation completed successfully, the service restarts after the geolocation"
+        else
+            log_and_print "Error: could not request a safe service restart" 0
+            status=1
+        fi
     else
         log_and_print "Geolocation completed successfully, restarting geomate service"
         /etc/init.d/geomate restart

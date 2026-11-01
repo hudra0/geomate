@@ -1603,7 +1603,6 @@ reload_geo_locked() {
         log_and_print "$line" 1
     done < "${reload_batch}.log"
     save_reload_stamps
-    rm -f "$IP_CACHE_FILE"
     geo_reloaded=1
 }
 
@@ -1658,6 +1657,8 @@ run_reload_geo() {
     reload_geo "$@"
     rv=$?
     if [ "$geo_reloaded" = "1" ]; then
+        # Regionless filters also changed coordinates, even without a set refill.
+        rm -f "$IP_CACHE_FILE"
         next_cycle=$(sed -n 's/^  "next_cycle": \([0-9][0-9]*\),$/\1/p' \
             "${GEOMATE_RUNTIME_DIR}/geolocation_status.json" 2>/dev/null)
         write_geolocation_status "$next_cycle"
