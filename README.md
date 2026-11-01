@@ -343,7 +343,7 @@ The table uses compact rows: cell padding of 5 px by 10 px and small buttons, so
 
 ### Server details
 
-The map and selected server appear side by side, with Active connections open below. On narrow screens the server panel follows the map. Click a server IP in the list, or **Details** in its map popup, to select it. Selecting a server from the fullscreen map returns to this overview. Selecting it again keeps its history; selecting another server starts a new history.
+The map and selected server appear side by side, with the Active connections bar below. On narrow screens the server panel follows the map. Click a server IP in the list, or **Details** in its map popup, to select it. Selecting a server from the fullscreen map returns to this overview. Selecting it again keeps its history; selecting another server starts a new history.
 
 **Hide** collapses the panel to its heading below the full-width map and stops sampling. **Show**, or selecting the same server again, restores the panel and its history. **Close** removes the panel and selection; select a server to open it again. Showing the panel preserves a manual pause and does not reset the ten-minute sampling limit.
 
