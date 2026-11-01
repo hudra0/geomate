@@ -879,7 +879,7 @@ create_dynamic_set() {
 
     # Create the base rule. setup_geo_filter has logged an unchecked Source IP already
     check_rule_options "$1" || return
-    local base_rule rx_rule rx_ok
+    local base_rule rx_rule rx_ok ui_rule_ok=0
     build_base_rule "$protocol" "$src_ip" "$src_port" "$dest_port"
     # setup_geo_filter has reported a protocol without ports for all devices
     [ "$proto_only" -eq 2 ] && return
@@ -888,6 +888,7 @@ create_dynamic_set() {
     log_and_print "Adding prerouting rule for UI: $base_rule update @${set_name}_ui_dynamic { ip daddr }" 2
     if nft_exec add rule inet geomate prerouting "$base_rule" update @"${set_name}"_ui_dynamic { ip daddr }; then
         log_and_print "Successfully added UI dynamic set rule for $name" 2
+        ui_rule_ok=1
     else
         log_and_print "ERROR: Failed to add UI dynamic set rule for $name! Check $NFT_ERROR_LOG" 0
     fi
@@ -909,15 +910,16 @@ create_dynamic_set() {
     # the replies would show up in the counters of the sent packets. Forward chain: in
     # prerouting a reply still has the WAN address as destination, the forward hook sees
     # it after the de-NAT. These rules follow the accept and drop rules of all filters and
-    # come before the catch-all accept
+    # come before the catch-all accept. Skipped when nft rejected the _ui_dynamic rule: the
+    # rx rule has the same match and would only add a second error for the same cause
     if [ "$operational_mode" != "static" ]; then
-        if [ "$rx_ok" -eq 1 ]; then
+        if [ "$rx_ok" -eq 0 ]; then
+            log_and_print "Filter $name: protocol '$protocol' is an nft expression, packets from its servers are not counted" 1
+        elif [ "$ui_rule_ok" -eq 1 ]; then
             nft_exec add set inet geomate "${set_name}_rx" { type ipv4_addr\; flags dynamic,timeout\; timeout 1h\; counter\; }
             log_and_print "Adding forward rule for received packets: $rx_rule ip saddr @${set_name}_ui_dynamic update @${set_name}_rx { ip saddr }" 2
             nft_exec add rule inet geomate forward "$rx_rule" ip saddr @"${set_name}"_ui_dynamic update @"${set_name}"_rx { ip saddr } || \
                 log_and_print "ERROR: Failed to add the rule for received packets of $name! Check $NFT_ERROR_LOG" 0
-        else
-            log_and_print "Filter $name: protocol '$protocol' is an nft expression, packets from its servers are not counted" 1
         fi
     fi
 
@@ -1726,8 +1728,8 @@ case "$1" in
         # rx_counters: in dynamic and monitor mode each enabled filter has a set _rx with
         # 'counter packets N bytes M' per server: what the server sent to the filter's
         # devices and ports while they sent to it (_ui_dynamic), from the first such packet
-        # until it was idle for an hour. A filter whose protocol is an nft expression has
-        # none
+        # until it was idle for an hour. A filter without working rules (see the nft errors)
+        # or whose protocol is an nft expression has none: its count is unknown
         printf '%s\n' 'src_ip_multi set_counters blocked_ip geolocate_status rx_counters'
         ;;
     run)
