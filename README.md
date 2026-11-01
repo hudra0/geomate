@@ -343,11 +343,13 @@ The table uses compact rows: cell padding of 5 px by 10 px and small buttons, so
 
 ### Server details
 
-Click a server IP in Active connections, or **Details** in its map popup, to open its live measurements. The window shows the last three minutes. **From server** and **To server** count packets per second, with the average packet size for each direction. A steady rate from a server can suggest its update rate, but it is not a direct measurement of the game's tick rate. Several devices, fragmented packets and other traffic can change it. Flow offloading limits both counts as described above.
+The map and selected server appear side by side, with Active connections open below. On narrow screens the server panel follows the map. Click a server IP in the list, or **Details** in its map popup, to select it. Selecting a server from the fullscreen map returns to this overview. Selecting it again keeps its history; selecting another server starts a new history.
 
-**Ping**, **Jitter** and **Loss** use ICMP from the router. Many game servers do not answer ping; after three unanswered attempts the window stops pinging and shows **No reply to ping**. The packet rates continue. **Try again** starts another attempt. These ping results do not measure the game's own traffic or its exact delay.
+**Ping**, **Jitter** and **Ping loss** appear above the three-minute ping graph. They use ICMP probes from the router, not the game's packets. A timeout or missing measurement clears the current Ping value while keeping the graph's history. If a server never replies, the panel shows **No ping reply** and leaves Ping loss as "–". This does not indicate 100% loss of game traffic. Ping stops after three unanswered attempts, or ten consecutive timeouts after a successful reply. **Retry** starts another attempt. A server that does not answer ICMP provides no measured ping.
 
-The window requests one sample at a time, once per second, while it is open, the tab is visible and LuCI auto refresh is on. Closing it stops the requests. After ten minutes it pauses until you click **Continue**. A restarted counter or a long gap starts a new line instead of showing a false spike.
+The smaller **Packets** graph shows packets per second: **Received** from the server and **Sent** to it, for all devices matching the filter. The rate tooltips show average packet size. These counts do not measure the game's tick rate. Flow offloading limits both counts as described above. A restarted counter or a long gap starts a new line instead of showing a false spike.
+
+Only the selected server is sampled, once per second with one request at a time. Sampling runs while the tab is visible and LuCI auto refresh is on. **Pause** freezes the measurements; **Resume** continues them. After ten minutes sampling pauses automatically. Leaving the page stops it. Nothing is sampled before a server is selected.
 
 The receiving rate needs a backend with `rx_counters`, and the sending rate needs `set_counters`. An older backend shows only the measurements it supports. Static mode has no packet counters. After updating the web interface, log in again if the new RPC method is unavailable. Server details are also available to read-only Geomate logins.
 
