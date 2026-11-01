@@ -20,8 +20,12 @@ NFT_SET_PREFIX="geomate_"
 SETS_LOCK="${GEOMATE_TMP_DIR}/sets.lock"           # Held while IP lists or sets are rewritten
 BUILT_CONFIG_DIR="${GEOMATE_TMP_DIR}/config"       # Copy of the configuration the running sets were built from
 UCI_PENDING_CHANGES="/tmp/.uci/geomate"            # Changes of uci set without commit, applied by every uci read
-CHECK_INTERVAL=1800  # Interval in seconds (30 minutes) - used for geolocation status
-harvest_refresh_per_day=0  # A harvest refreshes list timestamps this many seconds old per expiry day (0: all)
+PID_FILE="/var/run/geomate.pid"                    # PID of the run loop, written by procd and run
+LOADING_FLAG="/tmp/geomate_loading"                # Present while a start builds the table
+IP_CACHE_FILE="/tmp/geomate_ip_cache.json"         # Lookup cache of the web interface (luci.geomate)
+GEO_RESTART_FLAG="${GEOMATE_TMP_DIR}/geo_restart_needed"  # geolocate.sh under the loop: reload_geo failed
+CHECK_INTERVAL=1800  # Default loop interval in seconds, loaded from UCI
+harvest_refresh_per_day=0  # Timestamp refresh age per expiry day; at least one hour, at most one day
 debug_level=0
 
 # Wrapper for nft commands with error logging
@@ -44,6 +48,15 @@ load_config() {
     config_get debug_level global debug_level '0'
     config_get strict_mode global strict_mode '0'
     config_get operational_mode global operational_mode 'dynamic'
+    config_get CHECK_INTERVAL global check_interval '1800'
+    case "$CHECK_INTERVAL" in ''|*[!0-9]*) CHECK_INTERVAL=1800 ;; esac
+    # Strip leading zeros before arithmetic (ash otherwise treats them as octal).
+    while [ "${CHECK_INTERVAL#0}" != "$CHECK_INTERVAL" ]; do CHECK_INTERVAL="${CHECK_INTERVAL#0}"; done
+    case "$CHECK_INTERVAL" in '') CHECK_INTERVAL=0 ;; ?????*) CHECK_INTERVAL=3600 ;; esac
+    [ "$CHECK_INTERVAL" -ge 300 ] || CHECK_INTERVAL=300
+    [ "$CHECK_INTERVAL" -le 3600 ] || CHECK_INTERVAL=3600
+    # Static mode keeps its hourly loop and the existing 30-60 minute scheduler.
+    [ "$operational_mode" != static ] || CHECK_INTERVAL=1800
 }
 
 # Log messages and optionally print them based on the debug level
@@ -138,61 +151,67 @@ is_valid_public_ip() {
 
 # Clean up expired IPs from IP lists based on ip_expiry_days setting per filter
 # Format: IP or IP,timestamp - IPs without timestamp are treated as "today"
+# One awk pass; the list is rewritten only when its content changed (flash)
 cleanup_expired_ips_for_filter() {
     local name="$1"
     local ip_list="$2"
     local expiry_days="$3"
+    local tmp="${GEOMATE_TMP_DIR}/expiry.$$"
+    local removed_count=0 kept_count=0 ip timestamp
     
     # If expiry is 0 or not set, do nothing (disabled)
     [ -z "$expiry_days" ] || [ "$expiry_days" = "0" ] && return 0
     
     [ ! -f "$ip_list" ] && return 0
     
-    local current_time=$(date +%s)
-    local expiry_seconds=$((expiry_days * 86400))
-    local cutoff_time=$((current_time - expiry_seconds))
-    local temp_file="${ip_list}.cleanup_tmp"
-    local removed_count=0
-    local kept_count=0
-    
     log_and_print "Cleaning up expired IPs for $name (expiry: $expiry_days days)" 2
     
-    # Process each line
-    while IFS= read -r line || [ -n "$line" ]; do
-        [ -z "$line" ] && continue
-        
-        # Parse IP and timestamp (format: IP or IP,timestamp)
-        local ip timestamp
-        case "$line" in
-            *,*)
-                ip="${line%%,*}"
-                timestamp="${line#*,}"
-                ;;
-            *)
-                ip="$line"
-                # No timestamp = treat as today (won't be expired)
-                timestamp="$current_time"
-                ;;
-        esac
-        
-        # Check if expired
-        if [ "$timestamp" -lt "$cutoff_time" ] 2>/dev/null; then
-            removed_count=$((removed_count + 1))
-            log_and_print "  Removed expired IP: $ip (last seen: $timestamp)" 3
-        else
-            # Keep the IP with its timestamp
-            echo "${ip},${timestamp}" >> "$temp_file"
-            kept_count=$((kept_count + 1))
-        fi
-    done < "$ip_list"
+    # A line without timestamp gets the current time (won't be expired), a line with a
+    # numeric timestamp before the cutoff is dropped (blanks around the number allowed, as
+    # by the shell test of older versions), any other line is kept as IP,timestamp.
+    # The counts go to ${tmp}.counts, the dropped IPs to ${tmp}.removed (debug level 3)
+    mkdir -p "$GEOMATE_TMP_DIR"
+    # An IP can become active while timestamp refresh is gated. Keep it until the
+    # next refresh instead of expiring an address still present in a collected set.
+    config_foreach list_shared_dynamic_sets 'geo_filter' '' "$ip_list" |
+        sed -n '/elements = {/,/}/p' | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | sort -u > "${tmp}.active"
+    awk -v now="$(date +%s)" -v days="$expiry_days" -v verbose="$((debug_level >= 3))" \
+        -v counts="${tmp}.counts" -v removed_file="${tmp}.removed" -v active_file="${tmp}.active" '
+        BEGIN {
+            cutoff = now - days * 86400; printf "" > removed_file
+            while ((getline ip < active_file) > 0) active[ip] = 1
+            close(active_file)
+        }
+        $0 == "" { next }
+        {
+            i = index($0, ",")
+            if (i) { ip = substr($0, 1, i - 1); ts = substr($0, i + 1) } else { ip = $0; ts = now }
+            if (!(ip in active) && ts ~ /^[[:space:]]*[-+]?[0-9]+[[:space:]]*$/ && ts + 0 < cutoff) {
+                removed++
+                if (verbose) print ip, ts > removed_file
+                next
+            }
+            print ip "," ts
+            kept++
+        }
+        END { print removed + 0, kept + 0 > counts }' "$ip_list" > "$tmp" || {
+        log_and_print "Error: failed to check $ip_list of $name for expired IPs" 0
+        rm -f "$tmp" "${tmp}.counts" "${tmp}.removed" "${tmp}.active"
+        return 1
+    }
+    read -r removed_count kept_count < "${tmp}.counts"
+    while read -r ip timestamp; do
+        log_and_print "  Removed expired IP: $ip (last seen: $timestamp)" 3
+    done < "${tmp}.removed"
     
-    # Replace original file atomically
-    if [ -f "$temp_file" ]; then
-        mv "$temp_file" "$ip_list"
-    else
-        # All IPs expired, create empty file
-        : > "$ip_list"
+    if cmp -s "$tmp" "$ip_list"; then
+        rm -f "$tmp"
+    elif ! mv "$tmp" "$ip_list"; then
+        log_and_print "Error: failed to update IP list $ip_list of $name" 0
+        rm -f "$tmp" "${tmp}.counts" "${tmp}.removed" "${tmp}.active"
+        return 1
     fi
+    rm -f "${tmp}.counts" "${tmp}.removed" "${tmp}.active"
     
     [ "$removed_count" -gt 0 ] && log_and_print "Removed $removed_count expired IPs for $name, kept $kept_count" 1
     
@@ -266,9 +285,10 @@ setup_nftables_and_filters() {
     fi
     
     # Every rebuild starts with an empty nft error log (nft_exec appends to it) and without
-    # the markers of rejected allowed and blocked IP lists (add_filter_entries)
+    # the markers of rejected allowed and blocked IP lists (add_filter_entries) and the
+    # geo data stamps of reload_geo
     : > "$NFT_ERROR_LOG"
-    rm -f "$GEOMATE_TMP_DIR"/*.entries_failed
+    rm -f "$GEOMATE_TMP_DIR"/*.entries_failed "$GEOMATE_TMP_DIR"/*.geo_stamp
 
     # Delete existing table and recreate it
     nft delete table inet geomate 2>/dev/null
@@ -294,11 +314,11 @@ setup_nftables_and_filters() {
     log_and_print "nftables rules and filters set up successfully" 1
 
     # Invalidate cache
-    rm -f /tmp/geomate_ip_cache.json
+    rm -f "$IP_CACHE_FILE"
     if [ $? -eq 0 ]; then
-        log_and_print "Cache invalidated by deleting /tmp/geomate_ip_cache.json" 2
+        log_and_print "Cache invalidated by deleting $IP_CACHE_FILE" 2
     else
-        log_and_print "Failed to invalidate cache by deleting /tmp/geomate_ip_cache.json" 1
+        log_and_print "Failed to invalidate cache by deleting $IP_CACHE_FILE" 1
     fi
 
     verify_nftables_rules
@@ -462,11 +482,19 @@ report_nft_input_error() {
 # Sets proto_only to 1 for a protocol without ports and a Source IP that names devices,
 # to 2 when the Source IP is empty or has exceptions only (the match would cover every
 # device and the replies of the servers too), else to 0.
+# Sets rx_rule to the match of the servers' replies to the filter's devices (forward
+# chain, capability rx_counters): the same match with 'ip daddr' for each 'ip saddr' and
+# the ports swapped (src_port as dport, dest_port as sport), the protocol kept. rx_ok is
+# 1, or 0 with an empty rx_rule for a protocol written as an nft expression, which has
+# no known direction to swap.
 # Returns the status of build_src_match, which also sets src_exceptions_only
 build_base_rule() {
     local protocol="$1" src_port="$3" dest_port="$4" has_sport=0 rv=0
     local port_proto="$1" l4proto word proto_list=1 src_first glob_off=0
+    local proto_part rx_sport="" rx_dport=""
     proto_only=0
+    rx_rule=""
+    rx_ok=0
     build_src_match "$2" || rv=1
     base_rule="$src_match"
     [ "$src_port" = "any" ] && src_port=""
@@ -506,6 +534,7 @@ build_base_rule() {
             case "$src_first" in '!'*) proto_only=2 ;; esac
         fi
     fi
+    proto_part="${base_rule#"$src_match"}"
 
     # Include src_port in the rule if set
     if [ -n "$src_port" ]; then
@@ -514,9 +543,11 @@ build_base_rule() {
         if echo "$src_port" | grep -q ' '; then
             src_port=$(echo "$src_port" | tr ' ' ',')
             base_rule="$base_rule sport { $src_port }"
+            rx_dport="dport { $src_port }"
         else
             # Single value (port or range) - no braces needed
             base_rule="$base_rule sport $src_port"
+            rx_dport="dport $src_port"
         fi
     fi
 
@@ -527,10 +558,21 @@ build_base_rule() {
         if echo "$dest_port" | grep -q ' '; then
             dest_port=$(echo "$dest_port" | tr ' ' ',')
             base_rule="$base_rule dport { $dest_port }"
+            rx_sport="sport { $dest_port }"
         else
             # Single value (port or range) - no braces needed
             base_rule="$base_rule dport $dest_port"
+            rx_sport="sport $dest_port"
         fi
+    fi
+
+    # The replies: Source IP entries as destinations, then the protocol and the swapped
+    # ports, in the order of base_rule
+    if [ "$proto_list" -eq 1 ]; then
+        rx_ok=1
+        rx_rule="${src_match//ip saddr /ip daddr }$proto_part"
+        [ -n "$rx_sport" ] && rx_rule="$rx_rule $rx_sport"
+        [ -n "$rx_dport" ] && rx_rule="$rx_rule${rx_sport:+ $port_proto} $rx_dport"
     fi
     return "$rv"
 }
@@ -755,12 +797,16 @@ setup_geo_filter() {
     add_filter_entries "${set_name}_allowed" "$allowed_entries" allowed || allowed_entries=""
     add_filter_entries "${set_name}_blocked" "$blocked_entries" blocked || blocked_entries=""
 
-    # Process all allowed regions together
+    # Process all allowed regions together. The stamp of the geo data file is taken before
+    # the file is read (reload_geo)
+    local geo_stamp
+    geo_stamp=$(geo_file_stamp "${GEOMATE_DATA_DIR}/${name}_geo_data.json")
     if [ -n "$allowed_regions" ]; then
         log_and_print "Processing geo data for $name with allowed regions: $allowed_regions" 2
         process_geo_data "$name" "${set_name}_allowed" "${set_name}_blocked" "$allowed_regions" \
             "$allowed_entries" "$blocked_entries"
     fi
+    printf '%s\n' "$geo_stamp" > "${GEOMATE_TMP_DIR}/${set_name}.geo_stamp"
 
     # A rule option with a character nft must not see leaves the filter without rules,
     # like a value nft rejects
@@ -857,7 +903,7 @@ create_dynamic_set() {
 
     # Create the base rule. setup_geo_filter has logged an unchecked Source IP already
     check_rule_options "$1" || return
-    local base_rule
+    local base_rule rx_rule rx_ok ui_rule_ok=0
     build_base_rule "$protocol" "$src_ip" "$src_port" "$dest_port"
     # setup_geo_filter has reported a protocol without ports for all devices
     [ "$proto_only" -eq 2 ] && return
@@ -866,6 +912,7 @@ create_dynamic_set() {
     log_and_print "Adding prerouting rule for UI: $base_rule update @${set_name}_ui_dynamic { ip daddr }" 2
     if nft_exec add rule inet geomate prerouting "$base_rule" update @"${set_name}"_ui_dynamic { ip daddr }; then
         log_and_print "Successfully added UI dynamic set rule for $name" 2
+        ui_rule_ok=1
     else
         log_and_print "ERROR: Failed to add UI dynamic set rule for $name! Check $NFT_ERROR_LOG" 0
     fi
@@ -880,14 +927,47 @@ create_dynamic_set() {
         fi
     fi
 
+    # Count the packets each server sends to the filter's devices (capability rx_counters)
+    # in _rx, which has the timeout and counters of _dynamic. Only servers the devices
+    # sent to in the last 10 s (_ui_dynamic), so traffic from elsewhere cannot fill _rx.
+    # Not _dynamic: a lookup of a set with counters counts the packet for the element, so
+    # the replies would show up in the counters of the sent packets. Forward chain: in
+    # prerouting a reply still has the WAN address as destination, the forward hook sees
+    # it after the de-NAT. These rules follow the accept and drop rules of all filters and
+    # come before the catch-all accept. Skipped when nft rejected the _ui_dynamic rule: the
+    # rx rule has the same match and would only add a second error for the same cause
+    if [ "$operational_mode" != "static" ]; then
+        if [ "$rx_ok" -eq 0 ]; then
+            log_and_print "Filter $name: protocol '$protocol' is an nft expression, packets from its servers are not counted" 1
+        elif [ "$ui_rule_ok" -eq 1 ]; then
+            nft_exec add set inet geomate "${set_name}_rx" { type ipv4_addr\; flags dynamic,timeout\; timeout 1h\; counter\; }
+            log_and_print "Adding forward rule for received packets: $rx_rule ip saddr @${set_name}_ui_dynamic update @${set_name}_rx { ip saddr }" 2
+            nft_exec add rule inet geomate forward "$rx_rule" ip saddr @"${set_name}"_ui_dynamic update @"${set_name}"_rx { ip saddr } || \
+                log_and_print "ERROR: Failed to add the rule for received packets of $name! Check $NFT_ERROR_LOG" 0
+        fi
+    fi
+
     log_and_print "Sets for $name set up successfully" 1
 }
 
+# Add the collected sets of other filters sharing this IP list. The first harvest
+# then refreshes all active IPs together, before the list's hourly gate closes.
+# Arguments: callback section, primary section, IP list path.
+list_shared_dynamic_sets() {
+    local shared_list name set_name
+    [ "$1" != "$2" ] || return 0
+    config_get shared_list "$1" 'ip_list'
+    [ "$shared_list" = "$3" ] || return 0
+    config_get name "$1" 'name'
+    filter_set_name "$name" || return 0
+    nft list set inet geomate "${set_name}_dynamic" 2>/dev/null
+}
+
 # Merge the public IPs of a filter's _dynamic set into its ip_list. Shared by the loop
-# (process_dynamic_set) and the 'harvest' command; the caller holds the sets lock.
+# (update_dynamic_ips) and the 'harvest' command; the caller holds the sets lock.
 # List lines are "IP", or "IP,<unix time>" with ip_expiry_days > 0: then a known IP
 # gets the current time once its time is ip_expiry_days * harvest_refresh_per_day
-# seconds old, at most a day. New IPs are appended. Sets harvest_added to their number
+# seconds old, at least an hour and at most a day. New IPs are appended. Sets harvest_added to their number
 harvest_dynamic_set() {
     local name ip_list expiry_days set_name elements
     harvest_added=0
@@ -909,8 +989,22 @@ harvest_dynamic_set() {
     local counts_file="${GEOMATE_TMP_DIR}/${set_name}_counts.txt"
     local list_tmp="${GEOMATE_TMP_DIR}/${set_name}_list.tmp"
     local ip old_list="$ip_list" skipped_private=0 updated_count=0
+    local now refresh_key refresh_file last_refresh=0 refresh_due=1
+    now=$(date +%s)
+    # Filters can share an IP list. Gate timestamp-only rewrites by list path, not
+    # filter name; staggered per-IP timestamps must not rewrite it every cycle.
+    refresh_key=$(printf '%s' "$ip_list" | md5sum)
+    refresh_file="${GEOMATE_TMP_DIR}/list_refresh.${refresh_key%% *}"
+    read -r last_refresh 2>/dev/null < "$refresh_file"
+    case "$last_refresh" in ''|*[!0-9]*) last_refresh=0 ;; esac
+    if [ "$last_refresh" -le "$now" ] && [ $((now - last_refresh)) -lt 3600 ]; then
+        refresh_due=0
+    fi
 
-    printf '%s\n' "$elements" | sed -n '/elements = {/,/}/p' | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | sort -u > "$set_file"
+    {
+        printf '%s\n' "$elements"
+        config_foreach list_shared_dynamic_sets 'geo_filter' "$1" "$ip_list"
+    } | sed -n '/elements = {/,/}/p' | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | sort -u > "$set_file"
 
     : > "$public_file"
     while IFS= read -r ip; do
@@ -932,14 +1026,17 @@ harvest_dynamic_set() {
     # One pass over the list: refresh the timestamps of known IPs (expiry enabled),
     # append the new IPs in sorted order, count both
     [ -f "$ip_list" ] || old_list=/dev/null
-    awk -F, -v now="$(date +%s)" -v expiry="$expiry_days" -v per_day="$harvest_refresh_per_day" \
-        -v counts="$counts_file" -v new_file="$new_file" '
-        BEGIN { min_age = expiry * per_day; if (min_age > 86400) min_age = 86400 }
+    awk -F, -v now="$now" -v expiry="$expiry_days" -v per_day="$harvest_refresh_per_day" \
+        -v counts="$counts_file" -v new_file="$new_file" -v refresh="$refresh_due" '
+        BEGIN { min_age = expiry * per_day; if (min_age < 3600) min_age = 3600; if (min_age > 86400) min_age = 86400 }
         FILENAME == ARGV[1] { harvested[$0] = 1; order[++n] = $0; next }
         $0 == "" { next }
         ($1 in harvested) {
             known[$1] = 1
-            if (expiry != "0" && (min_age == 0 || now - $2 >= min_age)) { print $1 "," now; updated++; next }
+            # A returning IP near expiry must survive stop/start after the set is
+            # removed. Reserve an hour even when the regular refresh gate is shut.
+            if (expiry != "0" && ((refresh && now - $2 >= min_age) ||
+                now - $2 >= expiry * 86400 - 3600)) { print $1 "," now; updated++; next }
         }
         { print }
         END {
@@ -973,6 +1070,7 @@ harvest_dynamic_set() {
         if cmp -s "$list_tmp" "$ip_list"; then
             rm -f "$list_tmp"
         elif mv "$list_tmp" "$ip_list"; then
+            [ "$updated_count" -eq 0 ] || printf '%s\n' "$now" > "$refresh_file"
             log_and_print "Updated IP list for $name: $harvest_added added, $updated_count timestamps updated" 2
         else
             log_and_print "Error: failed to update IP list $ip_list for $name" 0
@@ -983,35 +1081,13 @@ harvest_dynamic_set() {
     rm -f "$set_file" "$public_file" "$new_file" "$counts_file" "$list_tmp"
 }
 
-# Loop harvest: merge the _dynamic set into the IP list, then add the geolocated IPs of
-# the list to the filter's sets when the list gained new IPs
-process_dynamic_set() {
-    local name set_name allowed_regions="" allowed_entries blocked_entries
-    harvest_dynamic_set "$1"
-    [ "$harvest_added" -gt 0 ] || return 0
-
-    config_get name "$1" 'name'
-    # Read the regions as a list, like the start and the live reload do
-    config_list_foreach "$1" 'allowed_region' append_allowed_region
-    [ -n "$allowed_regions" ] || return 0
-    filter_set_name "$name" || return 0
-    # The start has reported skipped entries already
-    filter_set_entries "$1" "$name" "$set_name" 0
-    # A list nft rejected at start covers nothing (add_filter_entries). A live reload
-    # never runs after such a start: its nft error makes the reload restart instead
-    [ -f "${GEOMATE_TMP_DIR}/${set_name}_allowed.entries_failed" ] && allowed_entries=""
-    [ -f "${GEOMATE_TMP_DIR}/${set_name}_blocked.entries_failed" ] && blocked_entries=""
-
-    process_geo_data "$name" "${set_name}_allowed" "${set_name}_blocked" "$allowed_regions" \
-        "$allowed_entries" "$blocked_entries"
-}
-
-# Update dynamic IPs based on configuration. The config is read on every run, so a
-# live reload of the regions reaches the next harvest
+# Loop harvest: merge each _dynamic set into its IP list. New IPs have no coordinates yet,
+# and the sets hold every IP of the geo data already, so nothing is added to the sets
+# here: new geo data reaches them through reload_geo after the geolocation
 update_dynamic_ips() {
     if acquire_sets_lock; then
         config_load 'geomate'
-        config_foreach process_dynamic_set 'geo_filter'
+        config_foreach harvest_dynamic_set 'geo_filter'
         release_sets_lock
     fi
 
@@ -1025,7 +1101,7 @@ update_dynamic_ips() {
 harvest_all() {
     local UCI_CONFIG_DIR="$UCI_CONFIG_DIR"
     [ -f "$BUILT_CONFIG_DIR/geomate" ] && UCI_CONFIG_DIR="$BUILT_CONFIG_DIR"
-    # The loop refreshes timestamps every 30 minutes. A stop refreshes only timestamps
+    # The loop refreshes timestamps at most hourly. A stop refreshes only timestamps
     # one hour old per expiry day (at most a day): it rarely writes the list to flash
     # for known IPs, and a timestamp it leaves is far younger than the expiry window,
     # so the cleanup at the next start never drops an IP of the _dynamic set (1 h timeout)
@@ -1037,19 +1113,23 @@ harvest_all() {
 }
 
 # Write geolocation status to JSON file for UI/CLI consumption
-# This is called once per cycle (every 30 min) - minimal performance impact
+# This is called once per cycle and after reload_geo refilled sets
+# $1: next_cycle to keep (reload_geo does not reset the loop timer), default now plus
+# CHECK_INTERVAL. A per-process file next to its place is renamed, so a reader never
+# sees half a file
 write_geolocation_status() {
-    local status_file="${GEOMATE_RUNTIME_DIR}/geolocation_status.json"
+    local status_path="${GEOMATE_RUNTIME_DIR}/geolocation_status.json"
+    local status_file="${GEOMATE_RUNTIME_DIR}/geolocation_status.json.tmp.$$"
     local current_time
-    local next_cycle
+    local next_cycle="$1"
     local last_geolocate=0
-    local geolocate_interval=1800
+    local geolocate_interval="$CHECK_INTERVAL"
     local pending_ips=0
     local last_daily=0
     local geolocation_mode_cfg
     
     current_time=$(date +%s)
-    next_cycle=$((current_time + CHECK_INTERVAL))
+    case "$next_cycle" in ''|*[!0-9]*) next_cycle=$((current_time + CHECK_INTERVAL)) ;; esac
     
     # Get config values
     config_load 'geomate'
@@ -1060,6 +1140,9 @@ write_geolocation_status() {
     # Read geolocation timing info (frequent mode)
     [ -f "${GEOMATE_RUNTIME_DIR}/last_geolocate_run" ] && last_geolocate=$(cat "${GEOMATE_RUNTIME_DIR}/last_geolocate_run")
     [ -f "${GEOMATE_RUNTIME_DIR}/last_geolocate_run.interval" ] && geolocate_interval=$(cat "${GEOMATE_RUNTIME_DIR}/last_geolocate_run.interval")
+    case "$geolocate_interval" in ''|*[!0-9]*) geolocate_interval="$CHECK_INTERVAL" ;; esac
+    [ "$geolocate_interval" -ge "$CHECK_INTERVAL" ] || geolocate_interval="$CHECK_INTERVAL"
+    [ "$geolocate_interval" -le $((CHECK_INTERVAL * 2)) ] || geolocate_interval=$((CHECK_INTERVAL * 2))
     [ -f "${GEOMATE_RUNTIME_DIR}/new_ips.txt" ] && pending_ips=$(wc -l < "${GEOMATE_RUNTIME_DIR}/new_ips.txt" 2>/dev/null || echo 0)
     
     # Read daily geolocation timing
@@ -1129,7 +1212,11 @@ write_geolocation_status() {
     printf '\n  }\n' >> "$status_file"
     printf '}\n' >> "$status_file"
     
-    log_and_print "Geolocation status updated: $status_file" 2
+    if ! mv "$status_file" "$status_path"; then
+        log_and_print "Error: failed to write $status_path" 0
+        return 1
+    fi
+    log_and_print "Geolocation status updated: $status_path" 2
 }
 
 # Helper function to collect allowed_ip entries
@@ -1348,10 +1435,12 @@ print_set_elements() {
         END { if (chunk != "") print "add element inet geomate " set " { " chunk " }" }'
 }
 
-# config_foreach callback of reload_regions: for a changed, enabled filter append the
-# commands that refill its _allowed and _blocked sets to $reload_batch, with the same
-# content as at start (allowed_ip, blocked_ip and blocked_ips, geolocated IPs split by
-# region)
+# config_foreach callback of reload_regions and reload_geo: for a changed, enabled filter
+# append the commands that refill its _allowed and _blocked sets to $reload_batch, with the
+# same content as at start (allowed_ip, blocked_ip and blocked_ips, geolocated IPs split by
+# region), a log line to ${reload_batch}.log and the stamp of its geo data file, taken
+# before the file is read, to ${reload_batch}.stamps (save_reload_stamps).
+# $reload_label starts the log line, $reload_report is filter_set_entries' $4
 reload_filter_sets() {
     local name enabled set_name result geo_data_file allowed_entries blocked_entries
     local allowed_regions="" geo_allowed="" geo_blocked=""
@@ -1366,8 +1455,9 @@ reload_filter_sets() {
     # The start skipped a filter with an invalid name and wrote an nft error, after which
     # reload_regions restarts instead of getting here
     filter_set_name "$name" || return 0
-    filter_set_entries "$1" "$name" "$set_name" 1
+    filter_set_entries "$1" "$name" "$set_name" "${reload_report:-1}"
     geo_data_file="${GEOMATE_DATA_DIR}/${name}_geo_data.json"
+    printf '%s %s\n' "${set_name}.geo_stamp" "$(geo_file_stamp "$geo_data_file")" >> "${reload_batch}.stamps"
 
     if [ -n "$allowed_regions" ] && [ -f "$geo_data_file" ]; then
         result=$(split_geo_data "$geo_data_file" "$allowed_regions" "$allowed_entries" "$blocked_entries")
@@ -1384,7 +1474,24 @@ reload_filter_sets() {
         print_set_elements "${set_name}_allowed" "$geo_allowed"
         print_set_elements "${set_name}_blocked" "$geo_blocked"
     } >> "$reload_batch"
-    echo "Live reload of $name: $allowed_count allowed, $blocked_count blocked geolocated IPs" >> "${reload_batch}.log"
+    echo "${reload_label:-Live reload} of $name: $allowed_count allowed, $blocked_count blocked geolocated IPs" >> "${reload_batch}.log"
+}
+
+# Write the geo data stamps that reload_filter_sets noted, once their batch is applied
+save_reload_stamps() {
+    local line
+    [ -f "${reload_batch}.stamps" ] || return 0
+    while IFS= read -r line; do
+        printf '%s\n' "${line#* }" > "${GEOMATE_TMP_DIR}/${line%% *}"
+    done < "${reload_batch}.stamps"
+}
+
+# Identity of geo data file $1 for reload_geo: its 'ls' line with inode, size and
+# modification time, or 'none' when the file is missing. geolocate.sh replaces the file
+# with mv, so a rewrite changes the line. A BusyBox ls without --full-time shows the time
+# in minutes only; inode and size still differ
+geo_file_stamp() {
+    ls -lin --full-time "$1" 2>/dev/null || ls -lin "$1" 2>/dev/null || echo none
 }
 
 # Print configuration file $1 without its 'list allowed_region', 'list allowed_ip' and
@@ -1482,6 +1589,7 @@ reload_regions() {
 
     : > "$reload_batch"
     : > "${reload_batch}.log"
+    : > "${reload_batch}.stamps"
     config_foreach reload_filter_sets 'geo_filter'
 
     if [ -s "$reload_batch" ]; then
@@ -1492,11 +1600,201 @@ reload_regions() {
         while IFS= read -r line; do
             log_and_print "$line" 1
         done < "${reload_batch}.log"
+        save_reload_stamps
     else
         log_and_print "Live reload: only regions, allowed or blocked IPs of disabled filters changed" 1
     fi
 
     mv "$work/config/geomate" "$BUILT_CONFIG_DIR/geomate"
+}
+
+# Return 0 while the run loop of the service lives: the PID in $PID_FILE runs 'geomate.sh run'
+service_instance_alive() {
+    local pid cmdline
+    read -r pid 2>/dev/null < "$PID_FILE"
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    # Each argument ends with a NUL, so the converted cmdline ends with a space
+    cmdline=$(tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline") || return 1
+    case "$cmdline" in *geomate.sh\ run\ *) return 0 ;; esac
+    return 1
+}
+
+# config_foreach callback of reload_geo: note the section of an enabled filter (only the
+# names in $reload_names, "|name|name|", when set) whose geo data file differs from the
+# stamp of its last set build in $reload_sections. A filter without regions holds no
+# geolocated IPs: only its stamp is renewed
+select_changed_geo() {
+    local name enabled set_name stamp allowed_regions=""
+    config_get enabled "$1" 'enabled' '0'
+    [ "$enabled" = "0" ] && return 0
+    config_get name "$1" 'name'
+    if [ -n "$reload_names" ]; then
+        case "$reload_names" in *"|$name|"*) ;; *) return 0 ;; esac
+    fi
+    filter_set_name "$name" || return 0
+    stamp=$(geo_file_stamp "${GEOMATE_DATA_DIR}/${name}_geo_data.json")
+    [ "$stamp" = "$(cat "${GEOMATE_TMP_DIR}/${set_name}.geo_stamp" 2>/dev/null)" ] && return 0
+    config_list_foreach "$1" 'allowed_region' append_allowed_region
+    if [ -z "$allowed_regions" ]; then
+        printf '%s\n' "$stamp" > "${GEOMATE_TMP_DIR}/${set_name}.geo_stamp"
+        geo_reloaded=1  # its count in the status file changed
+        return 0
+    fi
+    reload_sections="${reload_sections}$1 "
+}
+
+# Body of reload_geo under the sets lock. Reads the configuration copy of the last start,
+# so the sets match the running rules, like the live reload does
+reload_geo_locked() {
+    local UCI_CONFIG_DIR="$BUILT_CONFIG_DIR" reload_names="" name line
+    for name in "$@"; do reload_names="${reload_names:-|}${name}|"; done
+    reload_batch="${work}/batch.nft"
+    reload_sections=" "
+    reload_label="Geo data reload"
+    reload_report=0  # the start has reported skipped and merged entries already
+
+    rm -rf "$work"
+    mkdir -p "$work" || { log_and_print "Error: failed to create $work" 0; return 1; }
+    : > "$reload_batch"
+    : > "${reload_batch}.log"
+    : > "${reload_batch}.stamps"
+
+    # config_load applies pending UCI deltas to the saved file too. Check them
+    # before selecting filters or renewing a stamp from a different configuration.
+    if [ -f "$UCI_PENDING_CHANGES" ]; then
+        cmp -s "$UCI_PENDING_CHANGES" "$BUILT_CONFIG_DIR/pending"
+    else
+        [ ! -s "$BUILT_CONFIG_DIR/pending" ]
+    fi || {
+        log_and_print "Geo data reload: pending uci changes differ from the last start, restarting" 1
+        return 1
+    }
+
+    config_load 'geomate'
+    config_foreach select_changed_geo 'geo_filter'
+    if [ "$reload_sections" = " " ]; then
+        log_and_print "Geo data reload: the sets hold the current geo data" 1
+        return 0
+    fi
+
+    # The gates of the live reload (reload_regions): after nft errors at start a filter
+    # may lack its sets or entries, and the shared sets of two filters whose names differ
+    # only in spaces and underscores cannot be refilled per filter.
+    if [ -s "$NFT_ERROR_LOG" ]; then
+        log_and_print "Geo data reload: the last start had nft errors, restarting" 1
+        return 1
+    fi
+    if [ -n "$(config_foreach print_enabled_set_name 'geo_filter' | sort | uniq -d)" ]; then
+        log_and_print "Geo data reload: enabled filters share a set name, restarting" 1
+        return 1
+    fi
+
+    config_foreach reload_filter_sets 'geo_filter'
+    if ! nft -f "$reload_batch" 2> "${reload_batch}.err"; then
+        log_and_print "Error: geo data reload failed, restarting: $(head -n 1 "${reload_batch}.err" | cut -c 1-200)" 0
+        return 1
+    fi
+    while IFS= read -r line; do
+        log_and_print "$line" 1
+    done < "${reload_batch}.log"
+    save_reload_stamps
+    geo_reloaded=1
+}
+
+# reload_geo [filter name...]: apply new geo data without a restart. Refills the _allowed
+# and _blocked sets of each enabled filter (of the given names only, when there are any)
+# whose geo data file changed since its sets were built (start, live reload, reload_geo),
+# in one nft transaction with the same content as a start. Rules, counters, _dynamic,
+# _ui_dynamic and the loop timer stay. Idempotent: an unchanged file is skipped, so a
+# second call or a start that read the new file already does nothing. Sets geo_reloaded
+# to 1 when it refilled sets or renewed the stamp of a filter without regions.
+# Returns 0 when the sets hold the current geo data, or Geomate is not running (the next
+# start reads the files); 1 when Geomate has to be restarted instead
+reload_geo() {
+    local work="${GEOMATE_TMP_DIR}/reload_geo" waited=0 rv
+    geo_reloaded=0
+
+    # A start in progress may have read the old file: wait until it has finished
+    while [ -f "$LOADING_FLAG" ]; do
+        if [ "$waited" -ge 60 ]; then
+            log_and_print "Geo data reload: the start has not finished after 60 s, restarting" 1
+            return 1
+        fi
+        [ "$waited" -eq 0 ] && log_and_print "Geo data reload: waiting for the start to finish" 1
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if ! nft list chain inet geomate prerouting >/dev/null 2>&1; then
+        if service_instance_alive; then
+            log_and_print "Geo data reload: table inet geomate is missing, restarting" 1
+            return 1
+        fi
+        log_and_print "Geo data reload: Geomate is not running, its next start reads the geo data" 1
+        return 0
+    fi
+    if [ ! -f "$BUILT_CONFIG_DIR/geomate" ]; then
+        log_and_print "Geo data reload: no configuration copy of the last start, restarting" 1
+        return 1
+    fi
+
+    acquire_sets_lock || return 1
+    reload_geo_locked "$@"
+    rv=$?
+    rm -rf "$work"
+    release_sets_lock
+    return "$rv"
+}
+
+# reload_geo, then write the status file when it refilled sets (geo data counts), keeping
+# the next cycle of the run loop. Returns the status of reload_geo
+run_reload_geo() {
+    local rv next_cycle
+    reload_geo "$@"
+    rv=$?
+    if [ "$geo_reloaded" = "1" ]; then
+        # Regionless filters also changed coordinates, even without a set refill.
+        rm -f "$IP_CACHE_FILE"
+        next_cycle=$(sed -n 's/^  "next_cycle": \([0-9][0-9]*\),$/\1/p' \
+            "${GEOMATE_RUNTIME_DIR}/geolocation_status.json" 2>/dev/null)
+        write_geolocation_status "$next_cycle"
+    fi
+    return "$rv"
+}
+
+# Restart Geomate from its run loop. procd since 2026-10-18 kills every process of the
+# service's cgroup when the run loop exits: a restart started inside the service would kill
+# itself after stop had deleted the table, and leave Geomate stopped. rpcd runs the init
+# script as its own child, outside that cgroup. Without rpcd's rc object leave the current
+# rules intact and report failure.
+# The loop dies with the stop
+restart_service() {
+    local rv
+    if ubus list rc >/dev/null 2>&1; then
+        log_and_print "Restarting Geomate through rpcd" 1
+        ubus -t 120 call rc init '{"name":"geomate","action":"restart"}' >/dev/null 2>&1
+        rv=$?
+        [ "$rv" -eq 0 ] || log_and_print "Error: restart through rpcd failed (ubus status $rv)" 0
+        return "$rv"
+    else
+        log_and_print "Error: cannot restart safely without rpcd rc" 0
+        return 1
+    fi
+}
+
+# Daily IP expiry of the run loop. Geomate can run for weeks without a start, which was the
+# only place where ip_expiry_days took effect. Runs when the last pass is a day old or the
+# daily update of the trigger is due, so that update, which looks up only the listed IPs,
+# drops the expired IPs from the geo data, and reload_geo from the sets
+expire_ips_if_due() {
+    local now last_daily=0
+    now=$(date +%s)
+    read -r last_daily 2>/dev/null < "${GEOMATE_RUNTIME_DIR}/last_geolocate_run.daily"
+    case "$last_daily" in ''|*[!0-9]*) last_daily=0 ;; esac
+    [ $((now - ${last_expiry_time:-0})) -ge 86400 ] || [ $((now - last_daily)) -ge 86400 ] || return 0
+    acquire_sets_lock || return 0
+    cleanup_all_expired_ips
+    release_sets_lock
+    last_expiry_time="$now"
 }
 
 # Verify the nftables rules to ensure they are set up correctly
@@ -1560,9 +1858,18 @@ verify_nftables_rules() {
     fi
 }
 
-# Execute the Geomate trigger script
+# Execute the Geomate trigger script, after the daily IP expiry when it is due.
+# geolocate.sh applies new geo data itself (reload_geo). GEOMATE_FROM_LOOP tells it the PID
+# of this loop: when reload_geo fails, it only leaves $GEO_RESTART_FLAG, and the loop
+# restarts once the trigger has recorded its progress (last processed lists, queue, daily
+# run), from outside the service (restart_service)
 run_geomate_trigger() {
-    /etc/geomate_trigger.sh
+    expire_ips_if_due
+    GEOMATE_FROM_LOOP="$$" /etc/geomate_trigger.sh
+    [ -f "$GEO_RESTART_FLAG" ] || return 0
+    rm -f "$GEO_RESTART_FLAG"
+    log_and_print "Geo data reload failed during the geolocation, restarting" 1
+    restart_service || : > "$GEO_RESTART_FLAG"
 }
 
 # Main function to run the service
@@ -1570,32 +1877,34 @@ run() {
     # Copy of the configuration the sets are built from: the live reload compares
     # against it, the stop harvest takes the set names from it
     rm -rf "$BUILT_CONFIG_DIR" "${BUILT_CONFIG_DIR}.new"
-    # Takeover claims of a process killed while taking over a stale sets lock
-    rm -rf "${SETS_LOCK}.stale."*
+    # Takeover claims of a process killed while taking over a stale sets lock, and a
+    # restart request of the previous run loop (this start fulfills it)
+    rm -rf "${SETS_LOCK}.stale."* "$GEO_RESTART_FLAG"
     copy_config "${BUILT_CONFIG_DIR}.new" || log_and_print "Error: failed to copy the configuration" 0
 
     load_config
     setup_geomate_d
 
-    # Clean up expired IPs before loading filters
+    # Clean up expired IPs before loading filters; the loop repeats it daily
     cleanup_all_expired_ips
+    last_expiry_time=$(date +%s)
 
     # Create loading flag file
-    log_and_print "Creating loading flag file at /tmp/geomate_loading" 1
-    touch /tmp/geomate_loading
+    log_and_print "Creating loading flag file at $LOADING_FLAG" 1
+    touch "$LOADING_FLAG"
 
     setup_nftables_and_filters
     [ -f "${BUILT_CONFIG_DIR}.new/geomate" ] && mv "${BUILT_CONFIG_DIR}.new" "$BUILT_CONFIG_DIR"
 
     # Remove loading flag file
-    log_and_print "Removing loading flag file at /tmp/geomate_loading" 1
-    rm -f /tmp/geomate_loading
+    log_and_print "Removing loading flag file at $LOADING_FLAG" 1
+    rm -f "$LOADING_FLAG"
 
     # Write initial geolocation status
     write_geolocation_status
 
     log_and_print "Service is running" 0
-    echo $$ > "/var/run/geomate.pid"
+    echo $$ > "$PID_FILE"
     
     # Log operational mode at startup
     if [ "$operational_mode" = "monitor" ]; then
@@ -1611,7 +1920,6 @@ run() {
     fi
     
     SLEEP_DURATION=60  # Desired sleep duration
-    CHECK_INTERVAL=1800  # Interval in seconds (1800 seconds = 30 minutes)
 
     last_check_time=$(date +%s)
 
@@ -1668,6 +1976,13 @@ case "$1" in
         release_sets_lock
         exit "$reload_status"
         ;;
+    reload_geo)
+        # Called by geolocate.sh after it rewrote geo data; exit 1 means a restart is needed
+        shift
+        load_config
+        run_reload_geo "$@"
+        exit $?
+        ;;
     capabilities)
         # Stable contract for the web interface: one line of space-separated feature
         # tokens. Tokens are only added, never renamed or removed. Reads no
@@ -1682,13 +1997,20 @@ case "$1" in
         # (PID on line 1, start epoch on line 2) and a second one exits with 3;
         # 'geolocate.sh start' starts the manual run detached (exit 0, 3 when running, 1 when
         # it cannot start)
-        printf '%s\n' 'src_ip_multi set_counters blocked_ip geolocate_status'
+        # geo_reload: new geo data refills the filter's sets in place ('geomate.sh
+        # reload_geo'), without a restart; geolocate.sh restarts only when that fails
+        # rx_counters: in dynamic and monitor mode each enabled filter has a set _rx with
+        # 'counter packets N bytes M' per server: what the server sent to the filter's
+        # devices and ports while they sent to it (_ui_dynamic), from the first such packet
+        # until it was idle for an hour. A filter without working rules (see the nft errors)
+        # or whose protocol is an nft expression has none: its count is unknown
+        printf '%s\n' 'src_ip_multi set_counters blocked_ip geolocate_status geo_reload check_interval rx_counters'
         ;;
     run)
         run
         ;;
     *)
-        echo "Usage: $0 {run|cleanup|harvest|reload|capabilities}"
+        echo "Usage: $0 {run|cleanup|harvest|reload|reload_geo|capabilities}"
         exit 1
 esac
 

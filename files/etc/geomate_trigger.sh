@@ -18,9 +18,18 @@ GEOMATE_RUNTIME_DIR="${GEOMATE_DATA_DIR}/runtime"
 LAST_RUN_FILE="${GEOMATE_RUNTIME_DIR}/last_geolocate_run"
 NEW_IPS_FILE="${GEOMATE_RUNTIME_DIR}/new_ips.txt"
 COLLECTED_LIST_PREFIX="/tmp/geomate/collected_list."  # + filter name: list copies of check_new_ips for this run
-MIN_GEOLOCATE_INTERVAL=1800  # Minimum interval in seconds (30 minutes)
-MAX_GEOLOCATE_INTERVAL=3600  # Maximum interval in seconds (1 hour)
-RATE_LIMIT=15  # Maximum number of API calls per minute
+# Keep the same check_interval default and bounds as geomate.sh load_config.
+config_get operational_mode global operational_mode 'dynamic'
+config_get MIN_GEOLOCATE_INTERVAL global check_interval '1800'
+case "$MIN_GEOLOCATE_INTERVAL" in ''|*[!0-9]*) MIN_GEOLOCATE_INTERVAL=1800 ;; esac
+# Strip leading zeros before arithmetic (ash otherwise treats them as octal).
+while [ "${MIN_GEOLOCATE_INTERVAL#0}" != "$MIN_GEOLOCATE_INTERVAL" ]; do MIN_GEOLOCATE_INTERVAL="${MIN_GEOLOCATE_INTERVAL#0}"; done
+case "$MIN_GEOLOCATE_INTERVAL" in '') MIN_GEOLOCATE_INTERVAL=0 ;; ?????*) MIN_GEOLOCATE_INTERVAL=3600 ;; esac
+[ "$MIN_GEOLOCATE_INTERVAL" -ge 300 ] || MIN_GEOLOCATE_INTERVAL=300
+[ "$MIN_GEOLOCATE_INTERVAL" -le 3600 ] || MIN_GEOLOCATE_INTERVAL=3600
+# Static mode keeps its hourly loop and the existing 30-60 minute scheduler.
+[ "$operational_mode" != static ] || MIN_GEOLOCATE_INTERVAL=1800
+MAX_GEOLOCATE_INTERVAL=$((MIN_GEOLOCATE_INTERVAL * 2))
 
 # Logs and prints messages based on the debug level
 log_and_print() {
@@ -70,6 +79,9 @@ check_and_run_geolocate() {
 
     [ -f "$LAST_RUN_FILE" ] && last_geolocate_time=$(cat "$LAST_RUN_FILE")
     [ -f "${LAST_RUN_FILE}.interval" ] && geolocate_interval=$(cat "${LAST_RUN_FILE}.interval")
+    case "$geolocate_interval" in ''|*[!0-9]*) geolocate_interval="$MIN_GEOLOCATE_INTERVAL" ;; esac
+    [ "$geolocate_interval" -ge "$MIN_GEOLOCATE_INTERVAL" ] || geolocate_interval="$MIN_GEOLOCATE_INTERVAL"
+    [ "$geolocate_interval" -le "$MAX_GEOLOCATE_INTERVAL" ] || geolocate_interval="$MAX_GEOLOCATE_INTERVAL"
 
     check_new_ips
 
@@ -92,9 +104,9 @@ check_and_run_geolocate() {
 
     # Only do frequent updates if mode is 'frequent'
     if [ "$geolocation_mode" = "frequent" ] && [ $((current_time - last_geolocate_time)) -ge "$geolocate_interval" ]; then
-        local time_since_last_run=$((current_time - last_geolocate_time))
-        local api_calls_allowed=$((RATE_LIMIT * (time_since_last_run / 60 + 1)))
-        local ips_to_process=$((new_ips_count < api_calls_allowed ? new_ips_count : api_calls_allowed))
+        # geolocate.sh shares the provider budget between all runs and batches.
+        # Queue length is an IP count, not a request count.
+        local ips_to_process="$new_ips_count"
 
         if [ $ips_to_process -gt 0 ]; then
             log_and_print "Geomate_Trigger: Processing $ips_to_process new IPs for geolocation" 1
@@ -230,30 +242,32 @@ process_batch_specific_ips() {
 
     log_and_print "Processing batch of $ips_to_process IPs" 2
 
+    # Keep each argument comfortably below the kernel's per-argument size limit.
+    # The provider limiter, not this transport chunk size, controls API requests.
+    local queued_batch_count=0
     while IFS='|' read -r game ip; do
         if [ "$game" != "$current_game" ]; then
-            # Process the previous batch if present
-            if [ -n "$current_game" ] && [ -n "$ips" ]; then
-                log_and_print "Calling geolocate.sh for $current_game with IPs: $ips" 2
-                /etc/geolocate.sh specific "$current_game" "$ips"
-
-                # Update last_processed_file for the current filter/game
+            if [ -n "$current_game" ]; then
+                [ -z "$ips" ] || /etc/geolocate.sh specific "$current_game" "$ips"
                 update_last_processed_file "$current_game"
             fi
             current_game="$game"
-            ips="$ip"
-        else
-            ips="$ips $ip"
+            ips=""
+            queued_batch_count=0
+        fi
+        ips="${ips:+$ips }$ip"
+        queued_batch_count=$((queued_batch_count + 1))
+        if [ "$queued_batch_count" -ge 1000 ]; then
+            /etc/geolocate.sh specific "$current_game" "$ips"
+            ips=""
+            queued_batch_count=0
         fi
         processed_ips=$((processed_ips + 1))
     done < "$temp_ips_file"
 
-    # Process the last batch
-    if [ -n "$current_game" ] && [ -n "$ips" ]; then
-        log_and_print "Calling geolocate.sh for $current_game with IPs: $ips" 2
-        /etc/geolocate.sh specific "$current_game" "$ips"
-
-        # Update last_processed_file for the current filter/game
+    # Record a filter once, after its last group (also for exact multiples of 1000).
+    if [ -n "$current_game" ]; then
+        [ -z "$ips" ] || /etc/geolocate.sh specific "$current_game" "$ips"
         update_last_processed_file "$current_game"
     fi
 
