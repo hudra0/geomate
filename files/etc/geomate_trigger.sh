@@ -229,30 +229,32 @@ process_batch_specific_ips() {
 
     log_and_print "Processing batch of $ips_to_process IPs" 2
 
+    # Keep each argument comfortably below the kernel's per-argument size limit.
+    # The provider limiter, not this transport chunk size, controls API requests.
+    local queued_batch_count=0
     while IFS='|' read -r game ip; do
         if [ "$game" != "$current_game" ]; then
-            # Process the previous batch if present
-            if [ -n "$current_game" ] && [ -n "$ips" ]; then
-                log_and_print "Calling geolocate.sh for $current_game with IPs: $ips" 2
-                /etc/geolocate.sh specific "$current_game" "$ips"
-
-                # Update last_processed_file for the current filter/game
+            if [ -n "$current_game" ]; then
+                [ -z "$ips" ] || /etc/geolocate.sh specific "$current_game" "$ips"
                 update_last_processed_file "$current_game"
             fi
             current_game="$game"
-            ips="$ip"
-        else
-            ips="$ips $ip"
+            ips=""
+            queued_batch_count=0
+        fi
+        ips="${ips:+$ips }$ip"
+        queued_batch_count=$((queued_batch_count + 1))
+        if [ "$queued_batch_count" -ge 1000 ]; then
+            /etc/geolocate.sh specific "$current_game" "$ips"
+            ips=""
+            queued_batch_count=0
         fi
         processed_ips=$((processed_ips + 1))
     done < "$temp_ips_file"
 
-    # Process the last batch
-    if [ -n "$current_game" ] && [ -n "$ips" ]; then
-        log_and_print "Calling geolocate.sh for $current_game with IPs: $ips" 2
-        /etc/geolocate.sh specific "$current_game" "$ips"
-
-        # Update last_processed_file for the current filter/game
+    # Record a filter once, after its last group (also for exact multiples of 1000).
+    if [ -n "$current_game" ]; then
+        [ -z "$ips" ] || /etc/geolocate.sh specific "$current_game" "$ips"
         update_last_processed_file "$current_game"
     fi
 
