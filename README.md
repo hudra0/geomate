@@ -765,6 +765,20 @@ Example: If you want to play COD with friends from both Europe and USA:
 
 ## FAQ
 
+**Does Geomate work with IPv6?**
+
+Geomate only filters IPv4. The servers of the games covered here use IPv4.
+
+If a console or PC connects to a game server over IPv6, Geomate does not see that connection. The server is not collected, not filtered and does not show on the map.
+
+**How to check:** while you play, look at the router's connections, either in LuCI under **Status → Realtime Graphs → Connections** (network column **IPv6**), or with QoSmate under **Network → QoSmate → Connections** (IPv6 addresses contain colons, for example `2a02:…`). Look for connections on your game's port, for example 3074 for Call of Duty.
+
+**If you find some** and want Geomate to cover these connections, one option is to turn off IPv6 in the network settings of that console or PC. The rest of your network can keep IPv6.
+
+**Note:** a filter without a Source IP builds its rules from the ports only. In Strict Mode they also drop IPv6 traffic on those ports. A filter with a Source IP does not touch that device's IPv6 traffic.
+
+On the command line you can check the same with `grep '^ipv6' /proc/net/nf_conntrack | grep -E 'port=(3074|3075) '` (use the ports of your filter).
+
 **Q: Why should I keep Strict Mode disabled initially?**
 A: During initial setup or when adding a new game, disabling Strict Mode allows Geomate to learn new server IPs while you play. Once most server IPs are collected, you can enable it for stricter filtering.
 
