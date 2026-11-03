@@ -338,7 +338,9 @@ install_geo_data() {
 }
 
 # Merges new ip-api results ($1) into the geo data file ($2): one line per IP, a new
-# entry replaces the old entry of the same IP, all other old entries are kept
+# entry replaces the old entry of the same IP in its place, entries of IPs the file
+# lacks follow at its end, all other old entries are kept. The order of the old entries
+# stays, so new results equal to the old entries leave the file unchanged
 merge_geo_data() {
     local new_data="$1" geo_file="$2"
     local merged="${GEOMATE_TMP_DIR}/merged_geo_data.$$"
@@ -346,8 +348,18 @@ merge_geo_data() {
     # Nothing to merge with: the new results become the geo data
     [ -s "$geo_file" ] || { install_geo_data "$new_data" "$geo_file"; return; }
 
-    awk '{ key = match($0, /"query":"[^"]*"/) ? substr($0, RSTART, RLENGTH) : $0 }
-        !(key in seen) { seen[key]; print }' "$new_data" "$geo_file" > "$merged" || {
+    awk 'function ip_key(line) {
+            return match(line, /"query":"[^"]*"/) ? substr(line, RSTART, RLENGTH) : line
+        }
+        FILENAME == ARGV[1] {
+            key = ip_key($0)
+            if (!(key in entry)) { entry[key] = $0; order[++n] = key }
+            next
+        }
+        { key = ip_key($0) }
+        !(key in seen) { seen[key]; print ((key in entry) ? entry[key] : $0) }
+        END { for (i = 1; i <= n; i++) if (!(order[i] in seen)) print entry[order[i]] }
+    ' "$new_data" "$geo_file" > "$merged" || {
         rm -f "$merged"
         log_and_print "Error: Failed to merge new geo data into $geo_file" 0
         return 1
