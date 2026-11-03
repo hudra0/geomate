@@ -228,27 +228,51 @@ get_ip_list_for_game() {
     fi
 }
 
-# Processes a batch of specific IPs for geolocation
+# Processes a batch of specific IPs for geolocation. When geolocate.sh fails for a filter
+# (exit 1: its requests failed and no geo data changed), this run skips that filter: the
+# failed group and the filter's later queued IPs stay in the queue for the next run. Its
+# last processed copy is updated as usual, so they are not queued a second time
 process_batch_specific_ips() {
     local ips_to_process="$1"
     local processed_ips=0
     local game_name=""
     local ips=""
     local current_game=""
-    local temp_ips_file="${GEOMATE_RUNTIME_DIR}/temp_ips_to_process.txt"
+    local scratch_dir="${COLLECTED_LIST_PREFIX%/*}"
+    local temp_ips_file="${scratch_dir}/ips_to_process.txt"
+    local kept_ips_file="${scratch_dir}/ips_kept.txt"
+    local failed_filters="|"  # "|name|name|": filters whose geolocation failed in this run
 
     # Write the IPs to be processed to a temporary file
+    mkdir -p "$scratch_dir"
     head -n "$ips_to_process" "$NEW_IPS_FILE" > "$temp_ips_file"
+    : > "$kept_ips_file"
 
     log_and_print "Processing batch of $ips_to_process IPs" 2
+
+    # Geolocates the IPs collected in $ips for $current_game, or keeps them queued
+    geolocate_group() {
+        local queued_ip
+        [ -n "$ips" ] || return 0
+        /etc/geolocate.sh specific "$current_game" "$ips" && return 0
+        log_and_print "Geomate_Trigger: Geolocation failed for $current_game, its IPs stay queued" 1
+        failed_filters="${failed_filters}${current_game}|"
+        for queued_ip in $ips; do
+            printf '%s|%s\n' "$current_game" "$queued_ip"
+        done >> "$kept_ips_file"
+    }
 
     # Keep each argument comfortably below the kernel's per-argument size limit.
     # The provider limiter, not this transport chunk size, controls API requests.
     local queued_batch_count=0
     while IFS='|' read -r game ip; do
+        processed_ips=$((processed_ips + 1))
+        case "$failed_filters" in
+            *"|$game|"*) printf '%s|%s\n' "$game" "$ip" >> "$kept_ips_file"; continue ;;
+        esac
         if [ "$game" != "$current_game" ]; then
             if [ -n "$current_game" ]; then
-                [ -z "$ips" ] || /etc/geolocate.sh specific "$current_game" "$ips"
+                geolocate_group
                 update_last_processed_file "$current_game"
             fi
             current_game="$game"
@@ -258,25 +282,24 @@ process_batch_specific_ips() {
         ips="${ips:+$ips }$ip"
         queued_batch_count=$((queued_batch_count + 1))
         if [ "$queued_batch_count" -ge 1000 ]; then
-            /etc/geolocate.sh specific "$current_game" "$ips"
+            geolocate_group
             ips=""
             queued_batch_count=0
         fi
-        processed_ips=$((processed_ips + 1))
     done < "$temp_ips_file"
 
     # Record a filter once, after its last group (also for exact multiples of 1000).
     if [ -n "$current_game" ]; then
-        [ -z "$ips" ] || /etc/geolocate.sh specific "$current_game" "$ips"
+        geolocate_group
         update_last_processed_file "$current_game"
     fi
 
-    # Remove the processed IPs from NEW_IPS_FILE
-    if [ $processed_ips -gt 0 ]; then
-        sed -i "1,${processed_ips}d" "$NEW_IPS_FILE"
+    # Remove the processed IPs from NEW_IPS_FILE, keeping those of failed filters in front
+    if [ $processed_ips -gt 0 ] && tail -n +$((processed_ips + 1)) "$NEW_IPS_FILE" >> "$kept_ips_file"; then
+        cmp -s "$kept_ips_file" "$NEW_IPS_FILE" || mv "$kept_ips_file" "$NEW_IPS_FILE"
     fi
 
-    rm -f "$temp_ips_file"
+    rm -f "$temp_ips_file" "$kept_ips_file"
 
     # Invalidate cache for the UI
     rm -f /tmp/geomate_ip_cache.json
