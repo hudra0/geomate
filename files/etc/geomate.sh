@@ -1094,9 +1094,6 @@ update_dynamic_ips() {
         config_foreach harvest_dynamic_set 'geo_filter'
         release_sets_lock
     fi
-
-    # Write geolocation status after processing
-    write_geolocation_status
 }
 
 # Harvest before a stop: merge every _dynamic set into its IP list so a restart loses
@@ -1117,7 +1114,7 @@ harvest_all() {
 }
 
 # Write geolocation status to JSON file for UI/CLI consumption
-# This is called once per cycle and after reload_geo refilled sets
+# This is called at start, once per cycle after the trigger and after reload_geo refilled sets
 # $1: next_cycle to keep (reload_geo does not reset the loop timer), default now plus
 # CHECK_INTERVAL. A per-process file next to its place is renamed, so a reader never
 # sees half a file
@@ -1791,7 +1788,9 @@ run_reload_geo() {
     if [ "$geo_reloaded" = "1" ]; then
         # Regionless filters also changed coordinates, even without a set refill.
         rm -f "$IP_CACHE_FILE"
-        next_cycle=$(sed -n 's/^  "next_cycle": \([0-9][0-9]*\),$/\1/p' \
+        # Under the loop's trigger the status file still names the cycle that is running
+        next_cycle="$GEOMATE_NEXT_CYCLE"
+        [ -n "$next_cycle" ] || next_cycle=$(sed -n 's/^  "next_cycle": \([0-9][0-9]*\),$/\1/p' \
             "${GEOMATE_RUNTIME_DIR}/geolocation_status.json" 2>/dev/null)
         write_geolocation_status "$next_cycle"
     fi
@@ -1899,10 +1898,11 @@ verify_nftables_rules() {
 # geolocate.sh applies new geo data itself (reload_geo). GEOMATE_FROM_LOOP tells it the PID
 # of this loop: when reload_geo fails, it only leaves $GEO_RESTART_FLAG, and the loop
 # restarts once the trigger has recorded its progress (last processed lists, queue, daily
-# run), from outside the service (restart_service)
+# run), from outside the service (restart_service). $1: the loop's next cycle, which a
+# reload_geo writes into the status meanwhile (GEOMATE_NEXT_CYCLE)
 run_geomate_trigger() {
     expire_ips_if_due
-    GEOMATE_FROM_LOOP="$$" /etc/geomate_trigger.sh
+    GEOMATE_FROM_LOOP="$$" GEOMATE_NEXT_CYCLE="$1" /etc/geomate_trigger.sh
     [ -f "$GEO_RESTART_FLAG" ] || return 0
     rm -f "$GEO_RESTART_FLAG"
     log_and_print "Geo data reload failed during the geolocation, restarting" 1
@@ -1952,6 +1952,8 @@ run() {
         while true; do
             # Run geomate trigger to check for IP list changes and daily updates
             run_geomate_trigger
+            # After the trigger, so the status shows its run
+            write_geolocation_status "$(($(date +%s) + 3600))"
             sleep 3600  # Check every hour (3600 seconds)
         done
     fi
@@ -1970,7 +1972,9 @@ run() {
         if [ $remaining_time -le 0 ]; then
             # Only perform dynamic updates in dynamic mode
             update_dynamic_ips
-            run_geomate_trigger
+            run_geomate_trigger "$((current_time + CHECK_INTERVAL))"
+            # After the trigger, so the status shows its geolocation run
+            write_geolocation_status "$((current_time + CHECK_INTERVAL))"
             last_check_time=$current_time
             remaining_time=$CHECK_INTERVAL
         fi
