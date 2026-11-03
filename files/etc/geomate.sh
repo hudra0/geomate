@@ -997,7 +997,11 @@ harvest_dynamic_set() {
     refresh_file="${GEOMATE_TMP_DIR}/list_refresh.${refresh_key%% *}"
     read -r last_refresh 2>/dev/null < "$refresh_file"
     case "$last_refresh" in ''|*[!0-9]*) last_refresh=0 ;; esac
-    if [ "$last_refresh" -le "$now" ] && [ $((now - last_refresh)) -lt 3600 ]; then
+    # A minute of slack: a harvest runs some seconds earlier or later in its cycle, and an
+    # hour of cycles must not miss the refresh by a second. The stop harvest (harvest_all)
+    # is not gated: it removes the set, so an active IP it leaves keeps its old time
+    if [ "$harvest_refresh_per_day" -eq 0 ] && [ "$last_refresh" -le "$now" ] && \
+        [ $((now - last_refresh)) -lt 3540 ]; then
         refresh_due=0
     fi
 
