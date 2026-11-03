@@ -29,6 +29,7 @@ EXIT_RUNNING=3       # Exit code: another full run is active, nothing was done
 EXIT_NO_LOCK=4       # Exit code: the full run could not create its lock, nothing was done
 FILTER_LOCK_FILE=""  # Per-filter lock of the 'specific' mode, removed on exit
 FAILED_BATCHES=0     # Batches without a usable API answer
+RESERVE_FAILED=0     # Set to 1 when no request could be reserved: the run stops
 GEO_DATA_CHANGED=0   # Set to 1 when a geo data file was rewritten
 PID_FILE="/var/run/geomate.pid"  # PID of the run loop of the service
 # Left for the run loop when this run was started by its trigger and reload_geo failed
@@ -160,22 +161,47 @@ rate_now() {
     printf '%s\n' "${uptime%%.*}"
 }
 
+# Returns 0 while the owner $1 of the rate lock runs geolocate.sh. A killed run leaves its
+# PID in the lock, and another process may have that PID by now. A lock that names this
+# process while it waits is stale too: its subshells take the lock with the same $$, one
+# at a time
+rate_lock_owner_alive() {
+    local cmdline
+    [ "$1" != "$$" ] || return 1
+    cmdline=$(tr '\0' ' ' 2>/dev/null < "/proc/$1/cmdline") || return 1
+    case "$cmdline" in *geolocate.sh\ *) return 0 ;; esac
+    return 1
+}
+
 # Short, non-blocking lock shared by every geolocation process. A stale-owner claim
-# prevents two waiters from removing a lock that a third process just acquired.
+# prevents two waiters from removing a lock that a third process just acquired. A claim
+# lasts milliseconds: one that stays for seconds while the lock still names the same
+# dead owner was left by a killed waiter and is removed
 acquire_rate_lock() {
-    local owner claim waited=0
+    local owner claim waited=0 stale_owner="" stale_for=0
     mkdir -p "$RATE_DIR" || return 1
     until ln -snT "$$" "$RATE_DIR/lock" 2>/dev/null; do
         owner=$(readlink "$RATE_DIR/lock" 2>/dev/null)
         # The owner may have unlocked between ln and readlink.
         case "$owner" in *[!0-9]*) return 1 ;; esac
         claim="$RATE_DIR/stale.$owner"
-        if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null && mkdir "$claim" 2>/dev/null; then
-            if [ "$(readlink "$RATE_DIR/lock" 2>/dev/null)" = "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
-                rm -f "$RATE_DIR/lock"
+        if [ -n "$owner" ] && ! rate_lock_owner_alive "$owner"; then
+            if mkdir "$claim" 2>/dev/null; then
+                if ! rate_lock_owner_alive "$owner" && [ "$(readlink "$RATE_DIR/lock" 2>/dev/null)" = "$owner" ]; then
+                    rm -f "$RATE_DIR/lock"
+                    log_and_print "Took over the stale request lock of PID $owner" 1 >&2
+                fi
+                rmdir "$claim"
+                continue
             fi
-            rmdir "$claim"
-            continue
+            [ "$owner" = "$stale_owner" ] || { stale_owner="$owner"; stale_for=0; }
+            stale_for=$((stale_for + 1))
+            # No claim right after the removal: waiters that found the claim stale at the
+            # same time remove it within this second, before any of them claims again
+            if [ "$stale_for" -gt 5 ]; then
+                rmdir "$claim" 2>/dev/null && log_and_print "Removed stale claim $claim" 1 >&2
+                stale_for=0
+            fi
         fi
         [ "$waited" -lt 60 ] || return 1
         sleep 1
@@ -259,11 +285,12 @@ EOF
 
 # Retrieves geographic information for a batch of IPs. curl never retries on its
 # own: a 429 gets one separately budgeted attempt, with a fresh response body.
+# Returns 2 when no request could be reserved (mostly: no request lock in 60 s), else 1
 get_geo_info_batch() {
     local batch="$1" response status attempt=0 curl_status
     local headers="$GEOMATE_TMP_DIR/geo_headers.$$" body="$GEOMATE_TMP_DIR/geo_body.$$"
     while :; do
-        reserve_request || { log_and_print "Error: could not reserve a geolocation request" 0 >&2; return 1; }
+        reserve_request || { log_and_print "Error: could not reserve a geolocation request" 0 >&2; return 2; }
         : > "$headers"
         : > "$body"
         log_and_print "API request sent for $(echo "$batch" | wc -w) IPs" 2 >&2
@@ -274,7 +301,7 @@ get_geo_info_batch() {
             2>/dev/null)
         curl_status=$?
         record_rate_hint "$headers" "$status" || {
-            rm -f "$headers" "$body"; return 1; }
+            rm -f "$headers" "$body"; return 2; }
         if [ "$curl_status" -eq 0 ] && [ "$status" = 429 ] && [ "$attempt" -eq 0 ]; then
             attempt=1
             continue
@@ -365,6 +392,7 @@ process_game_ips() {
             log_and_print "Processed $processed_count IPs for $game_name" 2
             batch=""
             batch_count=0
+            [ "$RESERVE_FAILED" = "0" ] || break
 
         fi
     done < "$ip_list"
@@ -396,12 +424,13 @@ process_batch() {
     local batch="$1"
     local output_file="$2"
     local batch_size=$(echo "$batch" | wc -w)
-    local response
+    local response rc
     
     log_and_print "Processing batch of $batch_size IPs: $batch" 2
     response=$(get_geo_info_batch "$batch")
+    rc=$?
     
-    if [ $? -eq 0 ] && [ -n "$response" ]; then
+    if [ "$rc" -eq 0 ] && [ -n "$response" ]; then
         echo "$response" | sed 's/^\[//;s/\]$//;s/},{/}\n{/g' | while IFS= read -r line; do
             if [ -n "$line" ] && echo "$line" | grep -q '"status":"success"'; then
                 echo "$line" >> "$output_file"
@@ -413,6 +442,11 @@ process_batch() {
     else
         FAILED_BATCHES=$((FAILED_BATCHES + 1))
         log_and_print "API request failed for batch" 1
+        if [ "$rc" -eq 2 ]; then
+            # Each further batch would wait 60 s for the request lock as well
+            RESERVE_FAILED=1
+            log_and_print "Error: skipping the remaining batches of this run" 0
+        fi
         return 1
     fi
 }
@@ -425,6 +459,7 @@ process_geo_filter() {
     config_get enabled "$1" 'enabled' '0'
 
     [ "$enabled" = "0" ] && return
+    [ "$RESERVE_FAILED" = "0" ] || return
 
     if [ -f "$ip_list" ]; then
         log_and_print "Geolocate: Processing IPs for $name" 1
@@ -477,6 +512,7 @@ process_specific_ips() {
             process_batch "$batch" "$temp_output_file"
             batch=""
             count=0
+            [ "$RESERVE_FAILED" = "0" ] || break
         fi
     done
 
