@@ -74,11 +74,13 @@ check_and_run_geolocate() {
     local geolocate_interval=$MIN_GEOLOCATE_INTERVAL
     local new_ips_count=0
     local geolocation_mode
+    local saved_interval=""
     
     config_get geolocation_mode global geolocation_mode 'frequent'
 
     [ -f "$LAST_RUN_FILE" ] && last_geolocate_time=$(cat "$LAST_RUN_FILE")
-    [ -f "${LAST_RUN_FILE}.interval" ] && geolocate_interval=$(cat "${LAST_RUN_FILE}.interval")
+    [ -f "${LAST_RUN_FILE}.interval" ] && saved_interval=$(cat "${LAST_RUN_FILE}.interval")
+    geolocate_interval="${saved_interval:-$MIN_GEOLOCATE_INTERVAL}"
     case "$geolocate_interval" in ''|*[!0-9]*) geolocate_interval="$MIN_GEOLOCATE_INTERVAL" ;; esac
     [ "$geolocate_interval" -ge "$MIN_GEOLOCATE_INTERVAL" ] || geolocate_interval="$MIN_GEOLOCATE_INTERVAL"
     [ "$geolocate_interval" -le "$MAX_GEOLOCATE_INTERVAL" ] || geolocate_interval="$MAX_GEOLOCATE_INTERVAL"
@@ -121,7 +123,9 @@ check_and_run_geolocate() {
             geolocate_interval=$((geolocate_interval * 2))
             [ $geolocate_interval -gt $MAX_GEOLOCATE_INTERVAL ] && geolocate_interval=$MAX_GEOLOCATE_INTERVAL
         fi
-        echo "$geolocate_interval" > "${LAST_RUN_FILE}.interval"
+        # The runtime folder is on flash: write the interval only when it changes
+        [ "$geolocate_interval" = "$saved_interval" ] ||
+            echo "$geolocate_interval" > "${LAST_RUN_FILE}.interval"
         echo "$current_time" > "$LAST_RUN_FILE"
     fi
 }
@@ -129,7 +133,8 @@ check_and_run_geolocate() {
 # Checks for new IPs and logs the information
 check_new_ips() {
     local enabled_filters="|"  # "|name|name|": set by collect_new_ips
-    touch "$NEW_IPS_FILE"
+    # Created only when missing: touch would write its time to flash on every run
+    [ -e "$NEW_IPS_FILE" ] || : > "$NEW_IPS_FILE"
     config_load 'geomate'
     config_foreach collect_new_ips 'geo_filter'
     drop_queued_ips_of_skipped_filters "$enabled_filters"
