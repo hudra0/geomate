@@ -999,7 +999,8 @@ harvest_dynamic_set() {
     case "$last_refresh" in ''|*[!0-9]*) last_refresh=0 ;; esac
     # A minute of slack: a harvest runs some seconds earlier or later in its cycle, and an
     # hour of cycles must not miss the refresh by a second. The stop harvest (harvest_all)
-    # is not gated: it removes the set, so an active IP it leaves keeps its old time
+    # is not gated: the stop deletes the set afterwards, so an active IP it leaves would
+    # keep its old time until it returns
     if [ "$harvest_refresh_per_day" -eq 0 ] && [ "$last_refresh" -le "$now" ] && \
         [ $((now - last_refresh)) -lt 3540 ]; then
         refresh_due=0
@@ -1102,10 +1103,11 @@ update_dynamic_ips() {
 harvest_all() {
     local UCI_CONFIG_DIR="$UCI_CONFIG_DIR"
     [ -f "$BUILT_CONFIG_DIR/geomate" ] && UCI_CONFIG_DIR="$BUILT_CONFIG_DIR"
-    # The loop refreshes timestamps at most hourly. A stop refreshes only timestamps
-    # one hour old per expiry day (at most a day): it rarely writes the list to flash
-    # for known IPs, and a timestamp it leaves is far younger than the expiry window,
-    # so the cleanup at the next start never drops an IP of the _dynamic set (1 h timeout)
+    # The loop refreshes timestamps at most hourly. A stop refreshes timestamps one hour
+    # old per expiry day (at most a day): a timestamp it leaves is far younger than the
+    # expiry window, so the cleanup at the next start never drops an IP of the _dynamic
+    # set (1 h timeout). It writes the list at most once: with an expiry of one day at
+    # many stops, with longer expiries mostly for IPs that came back since the last refresh
     harvest_refresh_per_day=3600
     acquire_sets_lock || return 1
     config_load 'geomate'
