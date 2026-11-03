@@ -1751,23 +1751,36 @@ reload_geo() {
 
 # Gates of reload_geo, checked before and again after the wait for the sets lock. Returns 1
 # when reload_geo has to end, with its status in $gate_status: 1 when Geomate has to be
-# restarted, 0 when it is not running (its next start reads the geo data)
+# restarted, 0 when it is not running or being stopped (its next start reads the geo data)
 reload_geo_gates() {
     gate_status=0
     if ! nft list chain inet geomate prerouting >/dev/null 2>&1; then
-        if service_instance_alive; then
+        if ! service_instance_alive; then
+            log_and_print "Geo data reload: Geomate is not running, its next start reads the geo data" 1
+        elif ! reload_geo_stopping; then
             log_and_print "Geo data reload: table inet geomate is missing, restarting" 1
             gate_status=1
-        else
-            log_and_print "Geo data reload: Geomate is not running, its next start reads the geo data" 1
         fi
         return 1
     fi
     if [ ! -f "$BUILT_CONFIG_DIR/geomate" ]; then
+        reload_geo_stopping && return 1
         log_and_print "Geo data reload: no configuration copy of the last start, restarting" 1
         gate_status=1
         return 1
     fi
+}
+
+# Return 0, and log it, when the run loop that lives now ($loop_pid) is gone or replaced a
+# second later. A stop removes the configuration copy and the table before procd ends the
+# loop: without the wait, a reload_geo in between would restart a service being stopped
+reload_geo_stopping() {
+    local pid=""
+    service_instance_alive || return 1
+    sleep 1
+    read -r pid 2>/dev/null < "$PID_FILE"
+    [ "$pid" != "$loop_pid" ] || ! service_instance_alive || return 1
+    log_and_print "Geo data reload: Geomate was stopped or restarted meanwhile, a start reads the geo data" 1
 }
 
 # Return 0, and log it, when Geomate was stopped or started since reload_geo noted the PID
