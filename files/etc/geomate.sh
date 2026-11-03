@@ -1120,6 +1120,7 @@ harvest_all() {
 # sees half a file
 write_geolocation_status() {
     local status_path="${GEOMATE_RUNTIME_DIR}/geolocation_status.json"
+    # On flash next to its target: only a rename within one file system is atomic (run removes leftovers)
     local status_file="${GEOMATE_RUNTIME_DIR}/geolocation_status.json.tmp.$$"
     local current_time
     local next_cycle="$1"
@@ -1914,9 +1915,10 @@ run() {
     # Copy of the configuration the sets are built from: the live reload compares
     # against it, the stop harvest takes the set names from it
     rm -rf "$BUILT_CONFIG_DIR" "${BUILT_CONFIG_DIR}.new"
-    # Takeover claims of a process killed while taking over a stale sets lock, and a
-    # restart request of the previous run loop (this start fulfills it)
-    rm -rf "${SETS_LOCK}.stale."* "$GEO_RESTART_FLAG"
+    # Takeover claims of a process killed while taking over a stale sets lock, a restart
+    # request of the previous run loop (this start fulfills it) and status files a killed
+    # writer left on flash (write_geolocation_status)
+    rm -rf "${SETS_LOCK}.stale."* "$GEO_RESTART_FLAG" "${GEOMATE_RUNTIME_DIR}/geolocation_status.json.tmp."*
     copy_config "${BUILT_CONFIG_DIR}.new" || log_and_print "Error: failed to copy the configuration" 0
 
     load_config
