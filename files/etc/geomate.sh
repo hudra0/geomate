@@ -1690,7 +1690,11 @@ reload_geo_locked() {
     fi
 
     config_foreach reload_filter_sets 'geo_filter'
+    # The sets of a start that began meanwhile must not get the split of the old copy
+    reload_geo_superseded && return 0
     if ! nft -f "$reload_batch" 2> "${reload_batch}.err"; then
+        # A stop that began right after the check has deleted the table
+        reload_geo_superseded && return 0
         log_and_print "Error: geo data reload failed, restarting: $(head -n 1 "${reload_batch}.err" | cut -c 1-200)" 0
         return 1
     fi
@@ -1708,10 +1712,11 @@ reload_geo_locked() {
 # _ui_dynamic and the loop timer stay. Idempotent: an unchanged file is skipped, so a
 # second call or a start that read the new file already does nothing. Sets geo_reloaded
 # to 1 when it refilled sets or renewed the stamp of a filter without regions.
-# Returns 0 when the sets hold the current geo data, or Geomate is not running (the next
-# start reads the files); 1 when Geomate has to be restarted instead
+# Returns 0 when the sets hold the current geo data, or Geomate is not running or was
+# stopped or restarted meanwhile (a start reads the files); 1 when Geomate has to be
+# restarted instead
 reload_geo() {
-    local work="${GEOMATE_TMP_DIR}/reload_geo" waited=0 rv
+    local work="${GEOMATE_TMP_DIR}/reload_geo" waited=0 rv loop_pid=""
     geo_reloaded=0
 
     # A start in progress may have read the old file: wait until it has finished
@@ -1724,25 +1729,53 @@ reload_geo() {
         sleep 1
         waited=$((waited + 1))
     done
-    if ! nft list chain inet geomate prerouting >/dev/null 2>&1; then
-        if service_instance_alive; then
-            log_and_print "Geo data reload: table inet geomate is missing, restarting" 1
-            return 1
-        fi
-        log_and_print "Geo data reload: Geomate is not running, its next start reads the geo data" 1
-        return 0
-    fi
-    if [ ! -f "$BUILT_CONFIG_DIR/geomate" ]; then
-        log_and_print "Geo data reload: no configuration copy of the last start, restarting" 1
-        return 1
-    fi
+    read -r loop_pid 2>/dev/null < "$PID_FILE"
+    reload_geo_gates || return "$gate_status"
 
     acquire_sets_lock || return 1
-    reload_geo_locked "$@"
-    rv=$?
+    # Stop and start take no sets lock: check again what may have changed during the wait
+    if reload_geo_superseded; then
+        rv=0
+    elif reload_geo_gates; then
+        reload_geo_locked "$@"
+        rv=$?
+    else
+        rv="$gate_status"
+    fi
     rm -rf "$work"
     release_sets_lock
     return "$rv"
+}
+
+# Gates of reload_geo, checked before and again after the wait for the sets lock. Returns 1
+# when reload_geo has to end, with its status in $gate_status: 1 when Geomate has to be
+# restarted, 0 when it is not running (its next start reads the geo data)
+reload_geo_gates() {
+    gate_status=0
+    if ! nft list chain inet geomate prerouting >/dev/null 2>&1; then
+        if service_instance_alive; then
+            log_and_print "Geo data reload: table inet geomate is missing, restarting" 1
+            gate_status=1
+        else
+            log_and_print "Geo data reload: Geomate is not running, its next start reads the geo data" 1
+        fi
+        return 1
+    fi
+    if [ ! -f "$BUILT_CONFIG_DIR/geomate" ]; then
+        log_and_print "Geo data reload: no configuration copy of the last start, restarting" 1
+        gate_status=1
+        return 1
+    fi
+}
+
+# Return 0, and log it, when Geomate was stopped or started since reload_geo noted the PID
+# of its run loop ($loop_pid) and found the configuration copy of the last start. A stop
+# and a start remove that copy first, a start writes a new PID and reads the geo data itself
+reload_geo_superseded() {
+    local pid=""
+    read -r pid 2>/dev/null < "$PID_FILE"
+    [ "$pid" != "$loop_pid" ] || [ -f "$LOADING_FLAG" ] || [ ! -f "$BUILT_CONFIG_DIR/geomate" ] || return 1
+    log_and_print "Geo data reload: Geomate was stopped or restarted meanwhile, a start reads the geo data" 1
 }
 
 # reload_geo, then write the status file when it refilled sets (geo data counts), keeping
@@ -1951,8 +1984,10 @@ run() {
 # Clean up nftables rules when the service is stopped
 cleanup_nftables() {
     log_and_print "Cleaning up nftables rules..." 1
-    nft delete table inet geomate 2>/dev/null
+    # The configuration copy first: a reload_geo that finds the table gone then sees the
+    # stop (reload_geo_superseded) and does not restart Geomate
     rm -rf "$BUILT_CONFIG_DIR"
+    nft delete table inet geomate 2>/dev/null
     log_and_print "nftables rules cleaned up" 1
 }
 
