@@ -191,7 +191,8 @@ acquire_rate_lock() {
                     rm -f "$RATE_DIR/lock"
                     log_and_print "Took over the stale request lock of PID $owner" 1 >&2
                 fi
-                rmdir "$claim"
+                # A waiter may have removed it already, taking it for a stale claim
+                rmdir "$claim" 2>/dev/null
                 continue
             fi
             [ "$owner" = "$stale_owner" ] || { stale_owner="$owner"; stale_for=0; }
