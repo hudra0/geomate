@@ -596,7 +596,8 @@ status=$?
 # recorded its progress) with procd since 2026-10-18
 if [ "$GEO_DATA_CHANGED" = "1" ]; then
     if /etc/geomate.sh reload_geo; then
-        log_and_print "Geolocation completed successfully, new geo data applied without a restart"
+        # Also 0 while Geomate is stopped: its next start reads the new geo data
+        log_and_print "Geolocation completed successfully, the new geo data needs no restart"
     elif started_by_loop; then
         if printf '' > "$GEO_RESTART_FLAG"; then
             log_and_print "Geolocation completed successfully, the service restarts after the geolocation"
