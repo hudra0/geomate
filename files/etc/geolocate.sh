@@ -625,5 +625,8 @@ elif [ "$FAILED_BATCHES" -gt 0 ]; then
 else
     log_and_print "Geo data unchanged, skipping service restart"
 fi
+# A run that stopped because no request could be reserved never requested its remaining
+# IPs: exit 1 keeps them in the trigger's queue, also when earlier batches changed geo data
+[ "$RESERVE_FAILED" = "0" ] || status=1
 
 exit $status

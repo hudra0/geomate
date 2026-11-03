@@ -234,9 +234,10 @@ get_ip_list_for_game() {
 }
 
 # Processes a batch of specific IPs for geolocation. When geolocate.sh fails for a filter
-# (exit 1: its requests failed and no geo data changed), this run skips that filter: the
-# failed group and the filter's later queued IPs stay in the queue for the next run. Its
-# last processed copy is updated as usual, so they are not queued a second time
+# (exit 1: its requests failed and no geo data changed, or it stopped before requesting
+# all IPs), this run skips that filter: the failed group and the filter's later queued IPs
+# stay in the queue for the next run. Its last processed copy is updated as usual, so
+# they are not queued a second time
 process_batch_specific_ips() {
     local ips_to_process="$1"
     local processed_ips=0
