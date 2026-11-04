@@ -480,6 +480,7 @@ Several words can show together, for example "Unsaved, No IP list".
 - **Daily Mode**:
   - Updates once per day
   - Reduces API calls
+  - Queues no IPs, because every daily update looks up every listed IP. A queue left from Frequent Mode is emptied at the next cycle. After a switch to Frequent Mode, its first update also looks up the IPs a list gained in Daily Mode, or the whole list of a filter that never used Frequent Mode. That costs about as many requests as one daily update
 
 ### Check interval
 

@@ -85,9 +85,19 @@ check_and_run_geolocate() {
     [ "$geolocate_interval" -ge "$MIN_GEOLOCATE_INTERVAL" ] || geolocate_interval="$MIN_GEOLOCATE_INTERVAL"
     [ "$geolocate_interval" -le "$MAX_GEOLOCATE_INTERVAL" ] || geolocate_interval="$MAX_GEOLOCATE_INTERVAL"
 
-    check_new_ips
-
-    new_ips_count=$(wc -l < "$NEW_IPS_FILE")
+    # Only frequent mode processes the queue. The daily update looks up every listed IP,
+    # so the other modes queue nothing and empty a queue left from frequent mode once
+    # (the runtime folder is on flash: an empty queue is not written again)
+    if [ "$geolocation_mode" = "frequent" ]; then
+        check_new_ips
+        new_ips_count=$(wc -l < "$NEW_IPS_FILE")
+    elif [ -s "$NEW_IPS_FILE" ]; then
+        if : > "$NEW_IPS_FILE"; then
+            log_and_print "Geomate_Trigger: Emptied the queue, the daily update looks up every listed IP" 1
+        else
+            log_and_print "Geomate_Trigger: Error: could not empty $NEW_IPS_FILE" 0
+        fi
+    fi
 
     # Check if it's time for the daily update
     local last_daily_update=0
@@ -171,11 +181,15 @@ collect_new_ips() {
     cp "$ip_list" "$list_copy" || { rm -f "$list_copy"; list_copy="$ip_list"; }
 
     # Lines are "IP" or "IP,timestamp": compare and queue the IP part only, so a
-    # refreshed timestamp does not queue a known IP again
-    awk -F, -v old="$last_processed_file" '
+    # refreshed timestamp does not queue a known IP again. Neither does an IP the queue
+    # holds for this filter already (a run whose frequent update was not due queued it)
+    # or a repeated list line. awk reads the queue before the list, so it is done with
+    # the queue before the loop below appends to it
+    awk -F, -v old="$last_processed_file" -v queue="$NEW_IPS_FILE" -v prefix="$name|" '
         FILENAME == old { seen[$1]; next }
-        $1 != "" && !($1 in seen) { print $1 }
-    ' "$last_processed_file" "$list_copy" | while read -r ip; do
+        FILENAME == queue { if (index($0, prefix) == 1) seen[substr($0, length(prefix) + 1)]; next }
+        $1 != "" && !($1 in seen) { seen[$1]; print $1 }
+    ' "$last_processed_file" "$NEW_IPS_FILE" "$list_copy" | while read -r ip; do
         # Skip private/invalid IPs
         is_valid_public_ip "$ip" && echo "$name|$ip" >> "$NEW_IPS_FILE"
     done
