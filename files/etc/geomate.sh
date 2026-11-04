@@ -1106,8 +1106,9 @@ harvest_all() {
     # The loop refreshes timestamps at most hourly. A stop refreshes timestamps one hour
     # old per expiry day (at most a day): a timestamp it leaves is far younger than the
     # expiry window, so the cleanup at the next start never drops an IP of the _dynamic
-    # set (1 h timeout). It writes the list at most once: with an expiry of one day at
-    # many stops, with longer expiries mostly for IPs that came back since the last refresh
+    # set (1 h timeout). It writes a list at most once, or once per filter when filters
+    # sharing it differ in expiry: with an expiry of one day at many stops, with longer
+    # expiries mostly for IPs that came back since the last refresh
     harvest_refresh_per_day=3600
     acquire_sets_lock || return 1
     config_load 'geomate'
