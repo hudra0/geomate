@@ -740,7 +740,7 @@ Example: If you want to play COD with friends from both Europe and USA:
 5. **Manual Geolocation Starts No Run**
    - Cause: a geolocation of all IPs is in progress already, a manual one or the daily update. It can take several minutes, and a second one would double the requests to ip-api.com
    - Solutions:
-     - Wait for the end of the run. `logread -e geolocate` shows "Geolocation is already running (PID n)" for the refused start. With Debug Level 1 or higher it also shows the end of the run: "new geo data applied without a restart", "restarting geomate service" or "skipping service restart"
+     - Wait for the end of the run. `logread -e geolocate` shows "Geolocation is already running (PID n)" for the refused start. With Debug Level 1 or higher it also shows the end of the run: "the new geo data needs no restart", "restarting geomate service" or "skipping service restart"
      - `cat /tmp/geomate/geolocation.lock` shows the PID and the start time (Unix time) of the run in progress. The file is gone when the run has ended
      - If the run hangs, end it with `kill <PID>`. The next run takes over the lock
 
