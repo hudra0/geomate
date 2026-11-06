@@ -997,7 +997,12 @@ harvest_dynamic_set() {
     refresh_file="${GEOMATE_TMP_DIR}/list_refresh.${refresh_key%% *}"
     read -r last_refresh 2>/dev/null < "$refresh_file"
     case "$last_refresh" in ''|*[!0-9]*) last_refresh=0 ;; esac
-    if [ "$last_refresh" -le "$now" ] && [ $((now - last_refresh)) -lt 3600 ]; then
+    # A minute of slack: a harvest runs some seconds earlier or later in its cycle, and an
+    # hour of cycles must not miss the refresh by a second. The stop harvest (harvest_all)
+    # is not gated: the stop deletes the set afterwards, so an active IP it leaves would
+    # keep its old time until it returns
+    if [ "$harvest_refresh_per_day" -eq 0 ] && [ "$last_refresh" -le "$now" ] && \
+        [ $((now - last_refresh)) -lt 3540 ]; then
         refresh_due=0
     fi
 
@@ -1090,9 +1095,6 @@ update_dynamic_ips() {
         config_foreach harvest_dynamic_set 'geo_filter'
         release_sets_lock
     fi
-
-    # Write geolocation status after processing
-    write_geolocation_status
 }
 
 # Harvest before a stop: merge every _dynamic set into its IP list so a restart loses
@@ -1101,10 +1103,12 @@ update_dynamic_ips() {
 harvest_all() {
     local UCI_CONFIG_DIR="$UCI_CONFIG_DIR"
     [ -f "$BUILT_CONFIG_DIR/geomate" ] && UCI_CONFIG_DIR="$BUILT_CONFIG_DIR"
-    # The loop refreshes timestamps at most hourly. A stop refreshes only timestamps
-    # one hour old per expiry day (at most a day): it rarely writes the list to flash
-    # for known IPs, and a timestamp it leaves is far younger than the expiry window,
-    # so the cleanup at the next start never drops an IP of the _dynamic set (1 h timeout)
+    # The loop refreshes timestamps at most hourly. A stop refreshes timestamps one hour
+    # old per expiry day (at most a day): a timestamp it leaves is far younger than the
+    # expiry window, so the cleanup at the next start never drops an IP of the _dynamic
+    # set (1 h timeout). It writes a list at most once, or once per filter when filters
+    # sharing it differ in expiry: with an expiry of one day at many stops, with longer
+    # expiries mostly for IPs that came back since the last refresh
     harvest_refresh_per_day=3600
     acquire_sets_lock || return 1
     config_load 'geomate'
@@ -1113,12 +1117,13 @@ harvest_all() {
 }
 
 # Write geolocation status to JSON file for UI/CLI consumption
-# This is called once per cycle and after reload_geo refilled sets
+# This is called at start, once per cycle after the trigger and after reload_geo refilled sets
 # $1: next_cycle to keep (reload_geo does not reset the loop timer), default now plus
 # CHECK_INTERVAL. A per-process file next to its place is renamed, so a reader never
 # sees half a file
 write_geolocation_status() {
     local status_path="${GEOMATE_RUNTIME_DIR}/geolocation_status.json"
+    # On flash next to its target: only a rename within one file system is atomic (run removes leftovers)
     local status_file="${GEOMATE_RUNTIME_DIR}/geolocation_status.json.tmp.$$"
     local current_time
     local next_cycle="$1"
@@ -1690,7 +1695,11 @@ reload_geo_locked() {
     fi
 
     config_foreach reload_filter_sets 'geo_filter'
+    # The sets of a start that began meanwhile must not get the split of the old copy
+    reload_geo_superseded && return 0
     if ! nft -f "$reload_batch" 2> "${reload_batch}.err"; then
+        # A stop that began right after the check has deleted the table
+        reload_geo_superseded && return 0
         log_and_print "Error: geo data reload failed, restarting: $(head -n 1 "${reload_batch}.err" | cut -c 1-200)" 0
         return 1
     fi
@@ -1708,10 +1717,11 @@ reload_geo_locked() {
 # _ui_dynamic and the loop timer stay. Idempotent: an unchanged file is skipped, so a
 # second call or a start that read the new file already does nothing. Sets geo_reloaded
 # to 1 when it refilled sets or renewed the stamp of a filter without regions.
-# Returns 0 when the sets hold the current geo data, or Geomate is not running (the next
-# start reads the files); 1 when Geomate has to be restarted instead
+# Returns 0 when the sets hold the current geo data, or Geomate is not running or was
+# stopped or restarted meanwhile (a start reads the files); 1 when Geomate has to be
+# restarted instead
 reload_geo() {
-    local work="${GEOMATE_TMP_DIR}/reload_geo" waited=0 rv
+    local work="${GEOMATE_TMP_DIR}/reload_geo" waited=0 rv loop_pid=""
     geo_reloaded=0
 
     # A start in progress may have read the old file: wait until it has finished
@@ -1724,25 +1734,68 @@ reload_geo() {
         sleep 1
         waited=$((waited + 1))
     done
-    if ! nft list chain inet geomate prerouting >/dev/null 2>&1; then
-        if service_instance_alive; then
-            log_and_print "Geo data reload: table inet geomate is missing, restarting" 1
-            return 1
-        fi
-        log_and_print "Geo data reload: Geomate is not running, its next start reads the geo data" 1
-        return 0
-    fi
-    if [ ! -f "$BUILT_CONFIG_DIR/geomate" ]; then
-        log_and_print "Geo data reload: no configuration copy of the last start, restarting" 1
-        return 1
-    fi
+    read -r loop_pid 2>/dev/null < "$PID_FILE"
+    reload_geo_gates || return "$gate_status"
 
     acquire_sets_lock || return 1
-    reload_geo_locked "$@"
-    rv=$?
+    # Stop and start take no sets lock: check again what may have changed during the wait
+    if reload_geo_superseded; then
+        rv=0
+    elif reload_geo_gates; then
+        reload_geo_locked "$@"
+        rv=$?
+    else
+        rv="$gate_status"
+    fi
     rm -rf "$work"
     release_sets_lock
     return "$rv"
+}
+
+# Gates of reload_geo, checked before and again after the wait for the sets lock. Returns 1
+# when reload_geo has to end, with its status in $gate_status: 1 when Geomate has to be
+# restarted, 0 when it is not running, stopping or starting (a start reads the geo data)
+reload_geo_gates() {
+    gate_status=0
+    if ! nft list chain inet geomate prerouting >/dev/null 2>&1; then
+        if ! service_instance_alive; then
+            log_and_print "Geo data reload: Geomate is not running, its next start reads the geo data" 1
+        elif ! reload_geo_stopping; then
+            log_and_print "Geo data reload: table inet geomate is missing, restarting" 1
+            gate_status=1
+        fi
+        return 1
+    fi
+    if [ ! -f "$BUILT_CONFIG_DIR/geomate" ]; then
+        reload_geo_stopping && return 1
+        log_and_print "Geo data reload: no configuration copy of the last start, restarting" 1
+        gate_status=1
+        return 1
+    fi
+}
+
+# Return 0, and log it, when the run loop that lives now ($loop_pid) is gone or replaced a
+# second later, or has set the loading flag of its start by then. A stop removes the
+# configuration copy and the table before procd ends the loop, and the loop of a start
+# lives before it sets the flag: without the wait, a reload_geo in between would restart
+# a service being stopped or started
+reload_geo_stopping() {
+    local pid=""
+    service_instance_alive || return 1
+    sleep 1
+    read -r pid 2>/dev/null < "$PID_FILE"
+    [ "$pid" != "$loop_pid" ] || [ -f "$LOADING_FLAG" ] || ! service_instance_alive || return 1
+    log_and_print "Geo data reload: Geomate was stopped or restarted meanwhile, a start reads the geo data" 1
+}
+
+# Return 0, and log it, when Geomate was stopped or started since reload_geo noted the PID
+# of its run loop ($loop_pid) and found the configuration copy of the last start. A stop
+# and a start remove that copy first, a start writes a new PID and reads the geo data itself
+reload_geo_superseded() {
+    local pid=""
+    read -r pid 2>/dev/null < "$PID_FILE"
+    [ "$pid" != "$loop_pid" ] || [ -f "$LOADING_FLAG" ] || [ ! -f "$BUILT_CONFIG_DIR/geomate" ] || return 1
+    log_and_print "Geo data reload: Geomate was stopped or restarted meanwhile, a start reads the geo data" 1
 }
 
 # reload_geo, then write the status file when it refilled sets (geo data counts), keeping
@@ -1754,7 +1807,9 @@ run_reload_geo() {
     if [ "$geo_reloaded" = "1" ]; then
         # Regionless filters also changed coordinates, even without a set refill.
         rm -f "$IP_CACHE_FILE"
-        next_cycle=$(sed -n 's/^  "next_cycle": \([0-9][0-9]*\),$/\1/p' \
+        # Under the loop's trigger the status file still names the cycle that is running
+        next_cycle="$GEOMATE_NEXT_CYCLE"
+        [ -n "$next_cycle" ] || next_cycle=$(sed -n 's/^  "next_cycle": \([0-9][0-9]*\),$/\1/p' \
             "${GEOMATE_RUNTIME_DIR}/geolocation_status.json" 2>/dev/null)
         write_geolocation_status "$next_cycle"
     fi
@@ -1862,10 +1917,11 @@ verify_nftables_rules() {
 # geolocate.sh applies new geo data itself (reload_geo). GEOMATE_FROM_LOOP tells it the PID
 # of this loop: when reload_geo fails, it only leaves $GEO_RESTART_FLAG, and the loop
 # restarts once the trigger has recorded its progress (last processed lists, queue, daily
-# run), from outside the service (restart_service)
+# run), from outside the service (restart_service). $1: the loop's next cycle, which a
+# reload_geo writes into the status meanwhile (GEOMATE_NEXT_CYCLE)
 run_geomate_trigger() {
     expire_ips_if_due
-    GEOMATE_FROM_LOOP="$$" /etc/geomate_trigger.sh
+    GEOMATE_FROM_LOOP="$$" GEOMATE_NEXT_CYCLE="$1" /etc/geomate_trigger.sh
     [ -f "$GEO_RESTART_FLAG" ] || return 0
     rm -f "$GEO_RESTART_FLAG"
     log_and_print "Geo data reload failed during the geolocation, restarting" 1
@@ -1877,9 +1933,10 @@ run() {
     # Copy of the configuration the sets are built from: the live reload compares
     # against it, the stop harvest takes the set names from it
     rm -rf "$BUILT_CONFIG_DIR" "${BUILT_CONFIG_DIR}.new"
-    # Takeover claims of a process killed while taking over a stale sets lock, and a
-    # restart request of the previous run loop (this start fulfills it)
-    rm -rf "${SETS_LOCK}.stale."* "$GEO_RESTART_FLAG"
+    # Takeover claims of a process killed while taking over a stale sets lock, a restart
+    # request of the previous run loop (this start fulfills it) and status files a killed
+    # writer left on flash (write_geolocation_status)
+    rm -rf "${SETS_LOCK}.stale."* "$GEO_RESTART_FLAG" "${GEOMATE_RUNTIME_DIR}/geolocation_status.json.tmp."*
     copy_config "${BUILT_CONFIG_DIR}.new" || log_and_print "Error: failed to copy the configuration" 0
 
     load_config
@@ -1915,6 +1972,8 @@ run() {
         while true; do
             # Run geomate trigger to check for IP list changes and daily updates
             run_geomate_trigger
+            # After the trigger, so the status shows its run
+            write_geolocation_status "$(($(date +%s) + 3600))"
             sleep 3600  # Check every hour (3600 seconds)
         done
     fi
@@ -1933,7 +1992,9 @@ run() {
         if [ $remaining_time -le 0 ]; then
             # Only perform dynamic updates in dynamic mode
             update_dynamic_ips
-            run_geomate_trigger
+            run_geomate_trigger "$((current_time + CHECK_INTERVAL))"
+            # After the trigger, so the status shows its geolocation run
+            write_geolocation_status "$((current_time + CHECK_INTERVAL))"
             last_check_time=$current_time
             remaining_time=$CHECK_INTERVAL
         fi
@@ -1951,8 +2012,10 @@ run() {
 # Clean up nftables rules when the service is stopped
 cleanup_nftables() {
     log_and_print "Cleaning up nftables rules..." 1
-    nft delete table inet geomate 2>/dev/null
+    # The configuration copy first: a reload_geo that finds the table gone then sees the
+    # stop (reload_geo_superseded) and does not restart Geomate
     rm -rf "$BUILT_CONFIG_DIR"
+    nft delete table inet geomate 2>/dev/null
     log_and_print "nftables rules cleaned up" 1
 }
 
