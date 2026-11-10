@@ -1365,6 +1365,7 @@ run_update() {
 	# global vars, set during the run
 	upd_backup_dir= # backup dir, once a manually modified file was saved there
 	backend_updated= # a backend file was installed or deleted: Geomate restarts
+	rpcd_changed= # an acl.d or rpcd plugin file was installed or deleted: rpcd reloads
 	upd_post_failed= # a step after the installation failed: the run ends with 1
 	while getopts ":s:v:c:U:W:fiy" opt; do
 		case ${opt} in
@@ -1600,11 +1601,12 @@ install_geomate_files() {
 	# Notes what the installed or deleted file $1 asks for after the installation
 	note_file_change() {
 		[ "$component" = BACKEND ] && backend_updated=1
+		case "$1" in */usr/share/rpcd/acl.d/*|*/usr/libexec/rpcd/*) rpcd_changed=1 ;; esac
 		:
 	}
 
 	local file preinst_path curr_files new_file_list new_file_list exec_files='' \
-		dist_dir main_file_path frontend_updated='' \
+		dist_dir main_file_path \
 		upper_dist_dir="$1" components="$2" version upd_channel
 
 	for component in $components; do
@@ -1746,7 +1748,6 @@ install_geomate_files() {
 					return 1
 				}
 			note_file_change "$file"
-			[ "$component" = FRONTEND ] && frontend_updated=1
 		done
 
 		# delete obsolete files
@@ -1783,8 +1784,15 @@ install_geomate_files() {
 		IFS="$DEFAULT_IFS"
 	done
 
-    # Restart rpcd only if frontend files were updated
-    [ -n "$frontend_updated" ] && /etc/init.d/rpcd restart
+	# rpcd reads acl.d and its plugins when it starts. reload is SIGHUP: rpcd starts again with
+	# the same PID and keeps the LuCI sessions. Never restart it here: a run started through
+	# rpcd can die with it
+	if [ -n "$rpcd_changed" ]; then
+		/etc/init.d/rpcd reload || {
+			error_out "Failed to reload rpcd. Run '/etc/init.d/rpcd restart' and log in to LuCI again."
+			upd_post_failed=1
+		}
+	fi
 	:
 }
 
