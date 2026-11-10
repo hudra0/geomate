@@ -24,6 +24,14 @@ PID_FILE="/var/run/geomate.pid"                    # PID of the run loop, writte
 LOADING_FLAG="/tmp/geomate_loading"                # Present while a start builds the table
 IP_CACHE_FILE="/tmp/geomate_ip_cache.json"         # Lookup cache of the web interface (luci.geomate)
 GEO_RESTART_FLAG="${GEOMATE_TMP_DIR}/geo_restart_needed"  # geolocate.sh under the loop: reload_geo failed
+# Fast geolocation: answers/<filter name>.json holds the ip-api answers of a filter that
+# its geo data file lacks so far, in the line format of that file. RAM only, kept across
+# stop and start
+FAST_DIR="${GEOMATE_TMP_DIR}/fast"
+FAST_TICK=2                   # Seconds between two looks of the fast geolocation at the counter pending_new
+FAST_MAX_ANSWERS=2000         # Answer lines it keeps in RAM; it sends no request beyond
+FAST_LOCK_WAIT=10             # Seconds it waits for the sets lock
+FAST_FAIL_PAUSE='30 120 600'  # Seconds without a request after the first, the second and each further failed one
 CHECK_INTERVAL=1800  # Default loop interval in seconds, loaded from UCI
 harvest_refresh_per_day=0  # Timestamp refresh age per expiry day; at least one hour, at most one day
 debug_level=0
@@ -48,6 +56,7 @@ load_config() {
     config_get debug_level global debug_level '0'
     config_get strict_mode global strict_mode '0'
     config_get operational_mode global operational_mode 'dynamic'
+    config_get geolocation_mode global geolocation_mode 'frequent'
     config_get CHECK_INTERVAL global check_interval '1800'
     case "$CHECK_INTERVAL" in ''|*[!0-9]*) CHECK_INTERVAL=1800 ;; esac
     # Strip leading zeros before arithmetic (ash otherwise treats them as octal).
@@ -74,9 +83,11 @@ log_and_print() {
 # owner's PID, which ln creates atomically. The lock of an owner that is gone is taken
 # over by one waiter only: mkdir of a claim named after that owner is atomic, and only
 # the claim holder removes a lock of that owner, so no waiter deletes a newer lock.
-# A claim left by a process killed inside it is removed at the next service start
+# A claim left by a process killed inside it is removed at the next service start.
+# $1: seconds to wait, default 60. A caller that names them can do without the lock: it
+# gets no error message
 acquire_sets_lock() {
-    local owner claim took_over waited=0
+    local owner claim took_over waited=0 limit="${1:-60}"
     mkdir -p "$GEOMATE_TMP_DIR"
     until ln -snT "$$" "$SETS_LOCK" 2>/dev/null; do
         owner=$(readlink "$SETS_LOCK" 2>/dev/null)
@@ -92,8 +103,12 @@ acquire_sets_lock() {
             continue
         fi
         [ "$waited" -eq 0 ] && log_and_print "Waiting for lock $SETS_LOCK held by PID ${owner:-?}" 2
-        if [ "$waited" -ge 60 ]; then
-            log_and_print "Error: lock $SETS_LOCK still held by PID ${owner:-?} after 60 s" 0
+        if [ "$waited" -ge "$limit" ]; then
+            if [ -n "$1" ]; then
+                log_and_print "Lock $SETS_LOCK still held by PID ${owner:-?} after $limit s" 2
+            else
+                log_and_print "Error: lock $SETS_LOCK still held by PID ${owner:-?} after 60 s" 0
+            fi
             return 1
         fi
         sleep 1
@@ -275,6 +290,24 @@ create_empty_ip_list() {
     fi
 }
 
+# Return 0 when nft is 1.1.1 or newer. The fast geolocation reads one named counter every
+# few seconds, and an older nft has no cache filter for 'list counter': it loads the whole
+# ruleset of all tables with every set element for it. A version that cannot be read
+# counts as too old
+nft_lists_one_counter() {
+    local version
+    version=$(nft --version 2>/dev/null)
+    case "$version" in nftables\ v*) ;; *) return 1 ;; esac
+    version="${version#nftables v}"
+    version="${version%% *}"
+    case "$version" in
+        *[!0-9.]*|.*|*.|*..*) return 1 ;;
+        0.*|1.0|1.0.*|1.1|1.1.0) return 1 ;;
+        [0-9]*.[0-9]*) return 0 ;;
+    esac
+    return 1
+}
+
 # Set up nftables rules and filters
 setup_nftables_and_filters() {
     log_and_print "Setting up nftables rules and filters..." 1
@@ -295,6 +328,26 @@ setup_nftables_and_filters() {
     nft_exec add table inet geomate
     nft_exec add chain inet geomate forward { type filter hook forward priority -150 \; policy accept \; }
     nft_exec add chain inet geomate prerouting { type filter hook prerouting priority -150 \; policy accept \; }
+
+    # Fast geolocation: one counter for all filters, which rises with each server a filter
+    # adds to its _pending set (add_pending_set). Only where new servers are geolocated
+    # between the daily runs and reach an IP list: in frequent mode, outside static mode.
+    # nft is called directly: an entry in $NFT_ERROR_LOG would turn every later reload and
+    # reload_geo into a restart, while this failure only leaves the fast geolocation off.
+    # fast_lane_filters counts the filters that got their _pending set and rule
+    local error_output nl='
+'
+    fast_lane_on=0
+    fast_lane_filters=0
+    if [ "$geolocation_mode" = "frequent" ] && [ "$operational_mode" != "static" ]; then
+        if ! nft_lists_one_counter; then
+            log_and_print "Fast geolocation is off: needs nftables 1.1.1 or newer" 0
+        elif error_output=$(nft add counter inet geomate pending_new 2>&1); then
+            fast_lane_on=1
+        else
+            log_and_print "Fast geolocation is off: ${error_output%%"$nl"*}" 0
+        fi
+    fi
 
     # Set up filters from configuration
     config_load 'geomate'
@@ -759,6 +812,33 @@ add_filter_entries() {
     return 1
 }
 
+# Fast geolocation: set <set name>_pending of a filter and the forward rule that fills it.
+# $1: filter name, $2: set name prefix, $3: base rule. The rule adds each server the
+# filter's devices send to and that has no verdict to the set, where it stays for a
+# minute ('add' does not refresh it), and counts each new element in pending_new. It
+# follows the accept and the drop rule of the filter, so servers in _allowed and _blocked
+# never reach it; monitor mode has no drop rule and matches _blocked itself. A full set
+# ends the rule at 'add': the packet goes on to the next rule as without it. An element
+# with a timeout of its own, which only nft adds, keeps the rule from adding the address.
+# nft is called directly and a failure only logged, as for the counter: it leaves the fast
+# geolocation off for this filter and nothing else
+add_pending_set() {
+    local error_output not_blocked="" nl='
+'
+    [ "$operational_mode" != "monitor" ] || not_blocked="ip daddr != @${2}_blocked"
+    if error_output=$(nft add set inet geomate "${2}_pending" \
+        { type ipv4_addr\; size 256\; flags dynamic,timeout\; timeout 1m\; } 2>&1); then
+        if error_output=$(nft add rule inet geomate forward "$3" $not_blocked ip daddr != @"${2}"_pending \
+            add @"${2}"_pending { ip daddr } counter name pending_new 2>&1); then
+            fast_lane_filters=$((fast_lane_filters + 1))
+            return 0
+        fi
+        # Without its rule the set would tell the web interface that the filter has one
+        nft delete set inet geomate "${2}_pending" 2>/dev/null
+    fi
+    log_and_print "Fast geolocation is off for $1: ${error_output%%"$nl"*}" 0
+}
+
 # Set up a geo filter based on configuration
 setup_geo_filter() {
     local name protocol src_ip src_port dest_port enabled
@@ -838,9 +918,11 @@ setup_geo_filter() {
         log_and_print "Source IP of $name has exceptions only: the filter applies to all other devices" 0
 
     # Add forward rule for allowed IPs with error checking
+    local accept_ok=0
     log_and_print "Adding forward rule: $base_rule ip daddr @${set_name}_allowed counter accept" 2
     if nft_exec add rule inet geomate forward "$base_rule" ip daddr @"${set_name}"_allowed counter accept; then
         log_and_print "Successfully added forward rule for allowed IPs in $name" 2
+        accept_ok=1
     else
         log_and_print "ERROR: Failed to add forward rule for $name! Check $NFT_ERROR_LOG" 0
     fi
@@ -855,6 +937,12 @@ setup_geo_filter() {
         fi
     else
         log_and_print "Monitor mode: Not adding drop rule for blocked IPs in $name" 2
+    fi
+
+    # Fast geolocation: after the rules for the servers with a verdict, before the strict
+    # mode drop
+    if [ "$fast_lane_on" = "1" ] && [ "$accept_ok" -eq 1 ]; then
+        add_pending_set "$name" "$set_name" "$base_rule"
     fi
 
     # Strict mode rule - only apply if not in monitor mode
@@ -1248,8 +1336,14 @@ append_blocked_ip() {
 # we do everything in one pass: parse regions, calculate haversine, categorize IPs
 # Output format: First line = comma-separated allowed IPs, Second line = comma-separated blocked IPs,
 # third line = the numbers of IPs left out inside allowed and inside blocked entries
+# $5 (optional) = the filter's answers of the fast geolocation ($FAST_DIR/answers). Those
+# of the two files that exist are read, the geo data file first: an IP counts once, with
+# the coordinates of its first line
 split_geo_data() {
-    jq -r '. | [.query, .lat, .lon] | @tsv' "$1" 2>/dev/null | \
+    local geo_file="$1" answers_file="$5"
+    [ -f "$geo_file" ] || { geo_file="$answers_file"; answers_file=""; }
+    [ -f "$answers_file" ] || answers_file=""
+    jq -r '. | [.query, .lat, .lon] | @tsv' "$geo_file" ${answers_file:+"$answers_file"} 2>/dev/null | \
         awk -v regions="$2" -v allowed_cover="$3" -v blocked_cover="$4" "$AWK_IPV4_ENTRY"'
         # Load element list "list": its addresses as keys of ips[], its prefixes and ranges
         # into lo[] and hi[]. Returns the number of prefixes and ranges
@@ -1310,6 +1404,9 @@ split_geo_data() {
             
             # Skip invalid entries
             if (ip == "" || $2 == "" || $3 == "") next
+            # The first line of an IP counts (geo data file before the fast answers)
+            if (ip in seen) next
+            seen[ip] = 1
             
             # Check if IP is within ANY allowed region
             allowed = 0
@@ -1353,14 +1450,15 @@ process_geo_data() {
     local blocked_set="$3"
     local allowed_regions="$4"
     local geo_data_file="${GEOMATE_DATA_DIR}/${name}_geo_data.json"
+    local answers_file="${FAST_DIR}/answers/${name}.json"
 
-    [ ! -f "$geo_data_file" ] && { log_and_print "Geo data file not found: $geo_data_file" 0; return; }
+    [ ! -f "$geo_data_file" ] && [ ! -f "$answers_file" ] && { log_and_print "Geo data file not found: $geo_data_file" 0; return; }
     [ -z "$allowed_regions" ] && { log_and_print "No allowed regions specified for $name" 0; return; }
 
     log_and_print "Processing geo data for $name with allowed regions: $allowed_regions" 2
 
     local result
-    result=$(split_geo_data "$geo_data_file" "$allowed_regions" "$5" "$6")
+    result=$(split_geo_data "$geo_data_file" "$allowed_regions" "$5" "$6" "$answers_file")
 
     # Parse the result: allowed IPs, blocked IPs, the numbers left out
     local allowed_ips blocked_ips left_out
@@ -1432,7 +1530,7 @@ add_set_lines() {
 # before the file is read, to ${reload_batch}.stamps (save_reload_stamps).
 # $reload_label starts the log line, $reload_report is filter_set_entries' $4
 reload_filter_sets() {
-    local name enabled set_name result geo_data_file allowed_entries blocked_entries
+    local name enabled set_name result geo_data_file answers_file allowed_entries blocked_entries
     local allowed_regions="" geo_allowed="" geo_blocked=""
     local allowed_count=0 blocked_count=0
 
@@ -1449,8 +1547,9 @@ reload_filter_sets() {
     geo_data_file="${GEOMATE_DATA_DIR}/${name}_geo_data.json"
     printf '%s %s\n' "${set_name}.geo_stamp" "$(geo_file_stamp "$geo_data_file")" >> "${reload_batch}.stamps"
 
-    if [ -n "$allowed_regions" ] && [ -f "$geo_data_file" ]; then
-        result=$(split_geo_data "$geo_data_file" "$allowed_regions" "$allowed_entries" "$blocked_entries")
+    answers_file="${FAST_DIR}/answers/${name}.json"
+    if [ -n "$allowed_regions" ] && { [ -f "$geo_data_file" ] || [ -f "$answers_file" ]; }; then
+        result=$(split_geo_data "$geo_data_file" "$allowed_regions" "$allowed_entries" "$blocked_entries" "$answers_file")
         geo_allowed=$(echo "$result" | sed -n '1p')
         geo_blocked=$(echo "$result" | sed -n '2p')
     fi
@@ -1633,6 +1732,34 @@ select_changed_geo() {
     reload_sections="${reload_sections}$1 "
 }
 
+# Gates of a set update in place (reload_geo, fast geolocation), which needs sets that
+# match the configuration copy of the last start. Returns 1 with the reason in
+# $gate_reason. $1 = pending: the pending uci changes are those of the start; check it
+# before config_load, which applies them to the copy too. $1 = sets, after config_load of
+# the copy: the start had no nft errors, and no two enabled filters share their sets
+set_update_gate() {
+    case "$1" in
+        pending)
+            if [ -f "$UCI_PENDING_CHANGES" ]; then
+                cmp -s "$UCI_PENDING_CHANGES" "$BUILT_CONFIG_DIR/pending"
+            else
+                [ ! -s "$BUILT_CONFIG_DIR/pending" ]
+            fi && return 0
+            gate_reason="pending uci changes differ from the last start"
+            ;;
+        sets)
+            if [ -s "$NFT_ERROR_LOG" ]; then
+                gate_reason="the last start had nft errors"
+            elif [ -n "$(config_foreach print_enabled_set_name 'geo_filter' | sort | uniq -d)" ]; then
+                gate_reason="enabled filters share a set name"
+            else
+                return 0
+            fi
+            ;;
+    esac
+    return 1
+}
+
 # Body of reload_geo under the sets lock. Reads the configuration copy of the last start,
 # so the sets match the running rules, like the live reload does
 reload_geo_locked() {
@@ -1651,12 +1778,8 @@ reload_geo_locked() {
 
     # config_load applies pending UCI deltas to the saved file too. Check them
     # before selecting filters or renewing a stamp from a different configuration.
-    if [ -f "$UCI_PENDING_CHANGES" ]; then
-        cmp -s "$UCI_PENDING_CHANGES" "$BUILT_CONFIG_DIR/pending"
-    else
-        [ ! -s "$BUILT_CONFIG_DIR/pending" ]
-    fi || {
-        log_and_print "Geo data reload: pending uci changes differ from the last start, restarting" 1
+    set_update_gate pending || {
+        log_and_print "Geo data reload: $gate_reason, restarting" 1
         return 1
     }
 
@@ -1670,14 +1793,10 @@ reload_geo_locked() {
     # The gates of the live reload (reload_regions): after nft errors at start a filter
     # may lack its sets or entries, and the shared sets of two filters whose names differ
     # only in spaces and underscores cannot be refilled per filter.
-    if [ -s "$NFT_ERROR_LOG" ]; then
-        log_and_print "Geo data reload: the last start had nft errors, restarting" 1
+    set_update_gate sets || {
+        log_and_print "Geo data reload: $gate_reason, restarting" 1
         return 1
-    fi
-    if [ -n "$(config_foreach print_enabled_set_name 'geo_filter' | sort | uniq -d)" ]; then
-        log_and_print "Geo data reload: enabled filters share a set name, restarting" 1
-        return 1
-    fi
+    }
 
     config_foreach reload_filter_sets 'geo_filter'
     # The sets of a start that began meanwhile must not get the split of the old copy
@@ -1899,6 +2018,457 @@ verify_nftables_rules() {
     fi
 }
 
+# Fast geolocation: a second process next to the run loop ('geomate.sh fastlane', started
+# by run) that gives a new server its verdict within seconds instead of after the next
+# harvest and geolocation run. The kernel collects the servers without a verdict in the
+# _pending set of each filter (add_pending_set). Every FAST_TICK seconds the process reads
+# the counter pending_new and, when it has changed, makes a pass (fast_pass): it asks
+# ip-api for the new addresses at once ('geolocate.sh fast'), keeps the answers in RAM
+# ($FAST_DIR) and enters the verdicts into _allowed and _blocked in one nft batch
+# (fast_apply). The harvest, the trigger and 'geolocate.sh specific' work as without it
+# and take the answer from RAM instead of asking again; fast_prune then drops it there.
+# The process only brings a request forward: when it fails, everything works as without
+# it. It never restarts Geomate and never writes to $NFT_ERROR_LOG or to flash.
+# Files in $FAST_DIR, each with one writer:
+#   answers/<filter name>.json  answers the geo data file of the filter lacks (this process)
+#   last.json, ask              located answers and all addresses of the last answered
+#                               request (geolocate.sh fast, this process)
+#   retry_at                    uptime second from which a refused request may get through
+#                               (geolocate.sh fast)
+#   prune                       flag of the run loop: the geo data files may have new lines
+#   active                      PID of this process: while it lives, the other geolocate.sh
+#                               runs leave it requests
+#   pass, apply.json, batch.nft, *.new   work files of this process
+# $1: PID of the run loop that started the process
+fast_lane() {
+    local loop_pid="$1" pid counter last_counter="" now rest
+    # Every pass reads the configuration the sets were built from
+    local UCI_CONFIG_DIR="$BUILT_CONFIG_DIR"
+    case "$loop_pid" in ''|*[!0-9]*) return 1 ;; esac
+    # A geolocate.sh without the fast mode would take each request for a manual full run
+    if ! grep -q '^fast_request()' /etc/geolocate.sh 2>/dev/null; then
+        log_and_print "Fast geolocation is off: /etc/geolocate.sh has no fast mode" 0
+        return 1
+    fi
+    fast_retry_at=0      # Uptime second of the next pass without a new server, 0 for none
+    fast_ask_until=0     # No request before this uptime second
+    fast_batch_until=0   # No nft batch before this uptime second
+    fast_fails=0         # Failed requests in a row
+    fast_batch_failed=0  # 1 once a failed batch was logged as an error
+    fast_capped=0        # 1 while FAST_MAX_ANSWERS holds back a request
+    fast_prune_due=0     # 1 when a cleanup waits for the gates of a pass
+
+    mkdir -p "$FAST_DIR/answers" || return 1
+    rm -f "$FAST_DIR/pass" "$FAST_DIR/apply.json" "$FAST_DIR/batch.nft" "$FAST_DIR"/*.new "$FAST_DIR"/answers/*.new
+    echo "$$" > "$FAST_DIR/active.new" && mv "$FAST_DIR/active.new" "$FAST_DIR/active"
+    trap 'read -r pid 2>/dev/null < "$FAST_DIR/active"; [ "$pid" != "$$" ] || rm -f "$FAST_DIR/active"' EXIT
+    trap 'exit 0' INT TERM HUP
+    # The first pass drops what the previous process left that is on flash by now
+    : > "$FAST_DIR/prune"
+    fast_answers=$(cat "$FAST_DIR"/answers/*.json 2>/dev/null | wc -l)
+    log_and_print "Fast geolocation is on" 1
+
+    while :; do
+        # A stop deletes the table, a restart writes the PID of its own loop
+        pid=""
+        read -r pid 2>/dev/null < "$PID_FILE"
+        [ "$pid" = "$loop_pid" ] && [ -d "/proc/$loop_pid" ] || exit 0
+        counter=$(nft list counter inet geomate pending_new 2>/dev/null) || exit 0
+        read -r now rest < /proc/uptime
+        if [ "$counter" != "$last_counter" ] || [ -f "$FAST_DIR/prune" ] ||
+            { [ "$fast_retry_at" -ne 0 ] && [ "${now%%.*}" -ge "$fast_retry_at" ]; }; then
+            last_counter="$counter"
+            # An answered request is entered at once, by a second pass that asks nothing
+            fast_pass && fast_pass noask
+        fi
+        sleep "$FAST_TICK"
+    done
+}
+
+# Note uptime second $1 for the next pass that does not wait for a new server
+fast_retry() {
+    [ "$fast_retry_at" -ne 0 ] && [ "$fast_retry_at" -le "$1" ] || fast_retry_at="$1"
+}
+
+# Gates of a pass: a finished start, whose sets match its configuration copy
+# (set_update_gate). Loads that copy. Returns 1 with the reason in $gate_reason
+fast_gates() {
+    if [ -f "$LOADING_FLAG" ] || [ ! -f "$BUILT_CONFIG_DIR/geomate" ]; then
+        gate_reason="no finished start"
+        return 1
+    fi
+    set_update_gate pending || return 1
+    # A stop may have removed the copy by now: an empty configuration is no filter list
+    config_load 'geomate' || { gate_reason="no configuration copy of the last start"; return 1; }
+    set_update_gate sets
+}
+
+# config_foreach callback of fast_pass: for an enabled filter with a region and an IP list
+# print the line 'set <set name prefix>' and the listing of its _pending set. Without a
+# region there is no verdict, without a list the answer would never reach the geo data.
+# The regions are read as the set builders read them: 'list allowed_region' only
+fast_list_pending() {
+    local name enabled ip_list set_name allowed_regions=""
+    config_get enabled "$1" 'enabled' '0'
+    [ "$enabled" = "0" ] && return 0
+    config_get ip_list "$1" 'ip_list'
+    config_list_foreach "$1" 'allowed_region' append_allowed_region
+    [ -n "$ip_list" ] && [ -n "$allowed_regions" ] || return 0
+    config_get name "$1" 'name'
+    filter_set_name "$name" || return 0
+    printf 'set %s\n' "$set_name"
+    nft list set inet geomate "${set_name}_pending" 2>/dev/null
+}
+
+# One pass of the fast geolocation. A single awk reads the addresses of the last answered
+# request (ask), the answers in RAM and the _pending sets, and writes file pass with one
+# line per element, the first that applies:
+#   keep <set> <ip> <time left>   parked: the element has a timeout of its own
+#   park <set> <ip>   private or reserved address (the classes of is_valid_public_ip)
+#   apply <set> <ip>  an answer with coordinates is in RAM
+#   park <set> <ip>   the address was in the last answered request, without success
+#   ask <ip>          once per address, at most 100 (one ip-api request)
+# Then the verdicts (fast_apply), one request (fast_ask) and the cleanup (fast_prune).
+# A request waits when the verdicts could not be entered: the answers of the last one
+# are not all in answers/ yet. $1 = noask: send no request. Returns 0 when a request was
+# answered, 1 otherwise
+fast_pass() {
+    local noask="$1" now rest verdicts asks entered=1 answered=1
+    read -r now rest < /proc/uptime
+    now="${now%%.*}"
+    fast_retry_at=0
+
+    # A gate that is shut waits for the next new server and restarts nothing
+    if ! fast_gates; then
+        log_and_print "Fast geolocation waits: $gate_reason" 2
+        [ ! -f "$FAST_DIR/prune" ] || { rm -f "$FAST_DIR/prune"; fast_prune_due=1; }
+        return 1
+    fi
+
+    : > "$FAST_DIR/pass"
+    rm -f "$FAST_DIR/ask.new"
+    set -- $({
+        cat "$FAST_DIR/ask" "$FAST_DIR"/answers/*.json "$FAST_DIR/last.json" 2>/dev/null
+        config_foreach fast_list_pending 'geo_filter'
+    } | awk -v pass="$FAST_DIR/pass" -v ask="$FAST_DIR/ask.new" '
+        !set && /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { asked[$0] = 1; next }
+        !set && substr($0, 1, 1) == "{" {
+            if (/"lat":-?[0-9]/ && /"lon":-?[0-9]/ && match($0, /"query":"[^"]*"/))
+                answered[substr($0, RSTART + 9, RLENGTH - 10)] = 1
+            next
+        }
+        # A set is listed completely: park what fits next to its parked elements, which the
+        # batch adds again, at most 200 of the 256. A park beyond that is no verdict and
+        # causes no batch
+        function end_set(    i) {
+            for (i = 1; i <= parks && kept + i <= 200; i++) { print "park", set, park[i] > pass; verdicts++ }
+            parks = 0
+            kept = 0
+        }
+        $1 == "set" && NF == 2 { end_set(); set = $2; next }
+        set {
+            n = split($0, element, ",")
+            for (i = 1; i <= n; i++) {
+                if (!match(element[i], /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/)) continue
+                ip = substr(element[i], RSTART, RLENGTH)
+                if (element[i] ~ / timeout /) {
+                    left = match(element[i], /expires [0-9a-z]+/) ? substr(element[i], RSTART + 8, RLENGTH - 8) : ""
+                    print "keep", set, ip, left > pass
+                    kept++
+                    continue
+                }
+                split(ip, o, ".")
+                if (o[1] == 10 || o[1] == 127 || o[1] == 0 || o[1] >= 224 ||
+                    (o[1] == 172 && o[2] >= 16 && o[2] <= 31) ||
+                    (o[1] == 192 && o[2] == 168) || (o[1] == 169 && o[2] == 254)) {
+                    park[++parks] = ip
+                } else if (ip in answered) {
+                    print "apply", set, ip > pass; verdicts++
+                } else if (ip in asked) {
+                    park[++parks] = ip
+                } else if (!(ip in ask_seen) && asks < 100) {
+                    ask_seen[ip] = 1
+                    print "ask", ip > pass; print ip > ask; asks++
+                }
+            }
+        }
+        END { end_set(); print verdicts + 0, asks + 0 }')
+    verdicts="${1:-0}"
+    asks="${2:-0}"
+
+    if [ "$verdicts" -gt 0 ]; then
+        if [ "$now" -lt "$fast_batch_until" ]; then
+            fast_retry "$fast_batch_until"
+            entered=0
+        else
+            fast_apply || entered=0
+        fi
+    fi
+
+    if [ "$asks" -gt 0 ] && [ "$entered" -eq 1 ]; then
+        if [ -n "$noask" ]; then
+            # More addresses than one request takes, or new ones: the next tick asks
+            fast_retry "$now"
+        elif [ "$now" -lt "$fast_ask_until" ]; then
+            fast_retry "$fast_ask_until"
+        elif [ "$fast_answers" -ge "$FAST_MAX_ANSWERS" ]; then
+            # Until a geolocation run has written answers to the geo data (fast_prune)
+            [ "$fast_capped" -eq 1 ] || log_and_print "Fast geolocation holds $fast_answers answers in RAM, no request before the next cleanup" 1
+            fast_capped=1
+        else
+            fast_ask && answered=0
+        fi
+    fi
+
+    if [ -f "$FAST_DIR/prune" ] || [ "$fast_prune_due" -eq 1 ]; then
+        fast_prune
+    fi
+    return "$answered"
+}
+
+# Request of a pass: ask ip-api for the 'ask' addresses (ask.new). Returns 0 when the
+# request was answered. A failed request pauses all requests for FAST_FAIL_PAUSE seconds,
+# a refused one until the second geolocate.sh names. There is no state per address: what
+# is still in a _pending set after the pause is asked again
+fast_ask() {
+    local rv now rest pause n=0 retry="" pid=""
+    /etc/geolocate.sh fast "$FAST_DIR/ask.new" "$FAST_DIR/last.json.new"
+    rv=$?
+    # A restart during the request: the work files belong to the process of the new loop
+    read -r pid 2>/dev/null < "$PID_FILE"
+    [ "$pid" = "$loop_pid" ] || exit 0
+    # Exit 0 without the answer file is not the fast mode of geolocate.sh: a failed request
+    [ "$rv" -ne 0 ] || [ -f "$FAST_DIR/last.json.new" ] || rv=1
+    read -r now rest < /proc/uptime
+    now="${now%%.*}"
+    case "$rv" in
+        0)
+            # The answers first: a break between the two must not park answered addresses
+            mv "$FAST_DIR/last.json.new" "$FAST_DIR/last.json" && mv "$FAST_DIR/ask.new" "$FAST_DIR/ask" || return 1
+            fast_fails=0
+            return 0
+            ;;
+        2)
+            read -r retry 2>/dev/null < "$FAST_DIR/retry_at"
+            case "$retry" in ''|*[!0-9]*) retry=$((now + 4)) ;; esac
+            fast_ask_until="$retry"
+            log_and_print "Fast geolocation: no request free for $((retry - now)) s" 2
+            ;;
+        *)
+            fast_fails=$((fast_fails + 1))
+            for pause in $FAST_FAIL_PAUSE; do
+                n=$((n + 1))
+                [ "$n" -lt "$fast_fails" ] || break
+            done
+            fast_ask_until=$((now + pause))
+            log_and_print "Fast geolocation: request failed, the next one waits $pause s" 1
+            ;;
+    esac
+    fast_retry "$fast_ask_until"
+    return 1
+}
+
+# Number of entries of comma-separated list $1, in $list_count
+count_list() {
+    local IFS=,
+    set -- $1
+    list_count=$#
+}
+
+# config_foreach callback of fast_apply: append the commands for a filter with 'apply' or
+# 'park' lines to $fast_batch. The answer lines of its 'apply' addresses go to apply.json,
+# the first line per address, and those its file in answers/ lacks are added there, so
+# every later set build has them. split_geo_data gives the verdict as at start and reload,
+# from the configuration copy, and leaves out an address inside an allowed_ip or
+# blocked_ip entry: the entry decides, and 'add element' of an address inside a prefix
+# of the set would fail the whole batch. The _pending set is flushed ('delete element'
+# fails for an expired element) and gets its parked addresses back: a server that still
+# has no verdict returns with its next packet
+fast_apply_filter() {
+    local name enabled set_name line applies parked result added
+    local allowed_entries blocked_entries geo_allowed="" geo_blocked="" allowed_regions=""
+    local answers_file allowed_count=0 blocked_count=0 nl='
+'
+    config_get enabled "$1" 'enabled' '0'
+    [ "$enabled" = "0" ] && return 0
+    config_get name "$1" 'name'
+    filter_set_name "$name" || return 0
+    # Its line of $fast_sets: "<set> <number of apply lines> <elements to park>"
+    case "$nl$fast_sets" in *"$nl$set_name "*) ;; *) return 0 ;; esac
+    line="$nl$fast_sets"
+    line="${line#*"$nl$set_name "}"
+    line="${line%%"$nl"*}"
+    applies="${line%% *}"
+    parked="${line#* }"
+    [ "$parked" != "$line" ] || parked=""
+
+    # No verdict without a 'list allowed_region', as in every set build: a reload may have
+    # removed the last one since the pass, and split_geo_data would block every address
+    config_list_foreach "$1" 'allowed_region' append_allowed_region
+    if [ "$applies" -gt 0 ] && [ -n "$allowed_regions" ]; then
+        answers_file="$FAST_DIR/answers/${name}.json"
+        added=$({
+            cat "$FAST_DIR/pass"
+            echo '#own'
+            cat "$answers_file"
+            echo '#all'
+            cat "$FAST_DIR"/answers/*.json "$FAST_DIR/last.json"
+        } 2>/dev/null | awk -v set="$set_name" -v apply="$FAST_DIR/apply.json" -v own="$answers_file.new" '
+            BEGIN { printf "" > apply; printf "" > own }
+            $1 == "apply" { if ($2 == set) want[$3] = 1; next }
+            $0 == "#own" { part = 1; next }
+            $0 == "#all" { part = 2; next }
+            part == 1 { print > own }
+            part && match($0, /"query":"[^"]*"/) {
+                ip = substr($0, RSTART + 9, RLENGTH - 10)
+                if (!(ip in want) || (ip in done)) next
+                done[ip] = 1
+                print > apply
+                if (part == 2) { print > own; added++ }
+            }
+            END { print added + 0 }')
+        if [ "${added:-0}" -gt 0 ] && mv "$answers_file.new" "$answers_file"; then
+            fast_answers=$((fast_answers + added))
+        else
+            rm -f "$answers_file.new"
+        fi
+        filter_set_entries "$1" "$name" "$set_name" 0
+        result=$(split_geo_data "$FAST_DIR/apply.json" "$allowed_regions" "$allowed_entries" "$blocked_entries")
+        geo_allowed="${result%%"$nl"*}"
+        result="${result#*"$nl"}"
+        geo_blocked="${result%%"$nl"*}"
+        count_list "$geo_allowed"
+        allowed_count="$list_count"
+        count_list "$geo_blocked"
+        blocked_count="$list_count"
+        fast_log="${fast_log}Fast geolocation of $name: $allowed_count allowed, $blocked_count blocked$nl"
+    fi
+    {
+        print_set_elements "${set_name}_allowed" "$geo_allowed"
+        print_set_elements "${set_name}_blocked" "$geo_blocked"
+        printf 'flush set inet geomate %s\n' "${set_name}_pending"
+        [ -z "$parked" ] || printf 'add element inet geomate %s { %s }\n' "${set_name}_pending" "$parked"
+    } >> "$fast_batch"
+}
+
+# Verdicts of a pass: enter the 'apply' addresses of file pass into the sets of their
+# filters and park the 'park' addresses for an hour (private, reserved, not located), all
+# in one nft batch under the sets lock. $now is the uptime second of the pass. Returns 1
+# when the verdicts are not entered: without the lock the next tick tries again, a failed
+# batch pauses the batches for 60 s. Its answers are in answers/ by then, so the next set
+# build of start, reload or reload_geo enters them
+fast_apply() {
+    local line error_output nl='
+'
+    fast_batch="$FAST_DIR/batch.nft"
+    if ! acquire_sets_lock "$FAST_LOCK_WAIT"; then
+        fast_retry "$now"
+        return 1
+    fi
+    # Stop and start take no sets lock, and a reload has replaced the configuration copy:
+    # check again what may have changed during the wait
+    if reload_geo_superseded; then
+        release_sets_lock
+        return 1
+    fi
+    if ! fast_gates; then
+        log_and_print "Fast geolocation waits: $gate_reason" 2
+        release_sets_lock
+        return 1
+    fi
+
+    # Per set with verdicts: the number of its 'apply' lines and the elements to park.
+    # Those parked already come first, with the time they have left, so a batch does not
+    # renew their hour; then the new ones. fast_pass keeps both within 200 of the 256
+    fast_sets=$(awk '
+        $1 == "apply" { applies[$2]++; if (!($2 in seen)) { seen[$2] = 1; order[++n] = $2 } }
+        $1 == "park" { park[$2] = park[$2] ", " $3 " timeout 1h"; if (!($2 in seen)) { seen[$2] = 1; order[++n] = $2 } }
+        $1 == "keep" { keep[$2] = keep[$2] ", " $3 " timeout 1h" ($4 == "" ? "" : " expires " $4) }
+        END { for (i = 1; i <= n; i++) print order[i], applies[order[i]] + 0, substr(keep[order[i]] park[order[i]], 3) }' "$FAST_DIR/pass")
+    : > "$fast_batch"
+    fast_log=""
+    config_foreach fast_apply_filter 'geo_filter'
+
+    if [ -s "$fast_batch" ] && ! error_output=$(nft -f "$fast_batch" 2>&1); then
+        # A stop that began after the check has deleted the table
+        if ! reload_geo_superseded; then
+            if [ "$fast_batch_failed" -eq 0 ]; then
+                log_and_print "Error: fast geolocation batch failed: ${error_output%%"$nl"*}" 0
+                fast_batch_failed=1
+            else
+                log_and_print "Fast geolocation batch failed: ${error_output%%"$nl"*}" 2
+            fi
+            fast_batch_until=$((now + 60))
+            fast_retry "$fast_batch_until"
+        fi
+        release_sets_lock
+        return 1
+    fi
+    release_sets_lock
+    # The web interface looks the servers with a new verdict up again
+    [ -z "$fast_log" ] || rm -f "$IP_CACHE_FILE"
+    printf '%s' "$fast_log" | while IFS= read -r line; do
+        log_and_print "$line" 1
+    done
+    return 0
+}
+
+# config_foreach callback of fast_prune: add the name of an enabled filter to $fast_names
+fast_enabled_name() {
+    local name enabled
+    config_get enabled "$1" 'enabled' '0'
+    [ "$enabled" = "0" ] && return 0
+    config_get name "$1" 'name'
+    fast_names="${fast_names}${name}|"
+}
+
+# Cleanup of a pass, after each trigger run of the loop (flag file prune): drop the answers
+# in RAM that the geo data file of their filter holds by now, and the answers of filters
+# that are gone or disabled. Under the sets lock, like the set builds that read both
+# files; without it the next tick tries again. Then count the answers anew
+fast_prune() {
+    local file name geo_file
+    if ! acquire_sets_lock "$FAST_LOCK_WAIT"; then
+        : > "$FAST_DIR/prune"
+        return 1
+    fi
+    rm -f "$FAST_DIR/prune"
+    fast_prune_due=0
+    fast_names="|"
+    config_foreach fast_enabled_name 'geo_filter'
+    for file in "$FAST_DIR"/answers/*.json; do
+        [ -f "$file" ] || continue
+        name="${file##*/}"
+        name="${name%.json}"
+        case "$fast_names" in
+            *"|$name|"*) ;;
+            *) rm -f "$file"; continue ;;
+        esac
+        geo_file="${GEOMATE_DATA_DIR}/${name}_geo_data.json"
+        [ -s "$file" ] && [ -f "$geo_file" ] || continue
+        # Rewritten only when a line goes
+        if awk 'function query(line) {
+                return match(line, /"query":"[^"]*"/) ? substr(line, RSTART, RLENGTH) : line
+            }
+            FILENAME == ARGV[1] { on_flash[query($0)] = 1; next }
+            query($0) in on_flash { dropped = 1; next }
+            { print }
+            END { exit !dropped }' "$geo_file" "$file" > "$file.new"; then
+            mv "$file.new" "$file"
+            [ -s "$file" ] || rm -f "$file"
+        else
+            rm -f "$file.new"
+        fi
+    done
+    release_sets_lock
+    fast_answers=$(cat "$FAST_DIR"/answers/*.json 2>/dev/null | wc -l)
+    # Room for the request that FAST_MAX_ANSWERS held back
+    if [ "$fast_capped" -eq 1 ] && [ "$fast_answers" -lt "$FAST_MAX_ANSWERS" ]; then
+        fast_capped=0
+        fast_retry "$now"
+    fi
+}
+
 # Execute the Geomate trigger script, after the daily IP expiry when it is due.
 # geolocate.sh applies new geo data itself (reload_geo). GEOMATE_FROM_LOOP tells it the PID
 # of this loop: when reload_geo fails, it only leaves $GEO_RESTART_FLAG, and the loop
@@ -1914,15 +2484,31 @@ run_geomate_trigger() {
     restart_service || : > "$GEO_RESTART_FLAG"
 }
 
+# Remove what the start built for the fast geolocation, in one nft batch: the pending
+# rules, the _pending sets and the counter. Called when its process is not started or is
+# gone for good, so that a _pending set exists only while the process works on it. nft
+# is called directly: a failure leaves the sets and must not turn reloads into restarts
+remove_pending_sets() {
+    {
+        nft -a list chain inet geomate forward 2>/dev/null | \
+            sed -n 's/.* counter name "\{0,1\}pending_new"\{0,1\} # handle \([0-9][0-9]*\)$/delete rule inet geomate forward handle \1/p'
+        nft -t list table inet geomate 2>/dev/null | \
+            sed -n 's/^[[:space:]]*set \(geomate_[^ ]*_pending\) {$/delete set inet geomate \1/p'
+        echo 'delete counter inet geomate pending_new'
+    } | nft -f - 2>/dev/null || log_and_print "Fast geolocation: could not remove its sets and rules" 1
+}
+
 # Main function to run the service
 run() {
     # Copy of the configuration the sets are built from: the live reload compares
     # against it, the stop harvest takes the set names from it
     rm -rf "$BUILT_CONFIG_DIR" "${BUILT_CONFIG_DIR}.new"
     # Takeover claims of a process killed while taking over a stale sets lock, a restart
-    # request of the previous run loop (this start fulfills it) and status files a killed
-    # writer left on flash (write_geolocation_status)
-    rm -rf "${SETS_LOCK}.stale."* "$GEO_RESTART_FLAG" "${GEOMATE_RUNTIME_DIR}/geolocation_status.json.tmp."*
+    # request of the previous run loop (this start fulfills it), status files a killed
+    # writer left on flash (write_geolocation_status) and the PID file of a fast geolocation
+    # that was killed (a new one writes its own)
+    rm -rf "${SETS_LOCK}.stale."* "$GEO_RESTART_FLAG" "${GEOMATE_RUNTIME_DIR}/geolocation_status.json.tmp."* \
+        "$FAST_DIR/active"
     copy_config "${BUILT_CONFIG_DIR}.new" || log_and_print "Error: failed to copy the configuration" 0
 
     load_config
@@ -1964,6 +2550,21 @@ run() {
         done
     fi
     
+    # Fast geolocation next to the loop, when the start gave every filter its rules and at
+    # least one its _pending set. Its own call of the script, not a subshell: the sets
+    # lock names $$, which a subshell shares with the loop. Without the process its sets
+    # go: a _pending set tells the web interface that the fast geolocation works on it
+    local fast_pid="" fast_restarted=0
+    if [ "$fast_lane_on" = "1" ]; then
+        if [ "$fast_lane_filters" -gt 0 ] && [ ! -s "$NFT_ERROR_LOG" ]; then
+            /etc/geomate.sh fastlane "$$" &
+            fast_pid=$!
+        else
+            [ "$fast_lane_filters" -eq 0 ] || log_and_print "Fast geolocation is off: the start had nft errors" 0
+            remove_pending_sets
+        fi
+    fi
+
     SLEEP_DURATION=60  # Desired sleep duration
 
     last_check_time=$(date +%s)
@@ -1979,6 +2580,9 @@ run() {
             # Only perform dynamic updates in dynamic mode
             update_dynamic_ips
             run_geomate_trigger "$((current_time + CHECK_INTERVAL))"
+            # The fast geolocation drops the answers this run wrote to the geo data
+            [ -z "$fast_pid" ] || : > "$FAST_DIR/prune"
+            fast_restarted=0
             # After the trigger, so the status shows its geolocation run
             write_geolocation_status "$((current_time + CHECK_INTERVAL))"
             last_check_time=$current_time
@@ -1989,6 +2593,22 @@ run() {
         sleep_duration=$SLEEP_DURATION
         if [ $remaining_time -lt $SLEEP_DURATION ]; then
             sleep_duration=$remaining_time
+        fi
+
+        # A fast geolocation that has ended is started again, once per check interval. A
+        # second end in the same interval turns it off until the next start of the service
+        if [ -n "$fast_pid" ] && ! kill -0 "$fast_pid" 2>/dev/null; then
+            if [ "$fast_restarted" -eq 0 ]; then
+                log_and_print "Fast geolocation has ended, starting it again" 1
+                /etc/geomate.sh fastlane "$$" &
+                fast_pid=$!
+                fast_restarted=1
+            else
+                log_and_print "Fast geolocation has ended again: it stays off until the next start" 0
+                fast_pid=""
+                remove_pending_sets
+                rm -f "$FAST_DIR/active"
+            fi
         fi
 
         sleep $sleep_duration
@@ -2032,6 +2652,11 @@ case "$1" in
         run_reload_geo "$@"
         exit $?
         ;;
+    fastlane)
+        # Started by run only, next to its loop (fast_lane); $2: the PID of the loop
+        load_config
+        fast_lane "$2"
+        ;;
     capabilities)
         # Stable contract for the web interface: one line of space-separated feature
         # tokens. Tokens are only added, never renamed or removed. Reads no
@@ -2059,7 +2684,15 @@ case "$1" in
         # holds /tmp/geomate/update.lock (PID on line 1, start epoch on line 2), writes
         # /tmp/geomate/update_result.json before it releases the lock, and one started by
         # update_start writes its output to /tmp/geomate/update.log
-        printf '%s\n' 'src_ip_multi set_counters blocked_ip geolocate_status geo_reload check_interval rx_counters ui_update'
+        # fast_verdict: this backend has the fast geolocation (fast_lane), which gives a
+        # new server its verdict within seconds. Whether it runs shows the table: in
+        # dynamic and monitor mode with geolocation_mode frequent each enabled filter with
+        # working rules has a set _pending, and without that set it is off for the filter.
+        # The set exists only while the process of the fast geolocation runs: not with an
+        # nft before 1.1.1 and not after a start with nft errors.
+        # An element with a timeout of its own is parked (private, reserved or not
+        # located), every other one is a server that waits for its geolocation
+        printf '%s\n' 'src_ip_multi set_counters blocked_ip geolocate_status geo_reload check_interval rx_counters ui_update fast_verdict'
         ;;
     run)
         run

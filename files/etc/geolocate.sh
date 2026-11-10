@@ -21,6 +21,16 @@ BATCH_SIZE=100
 RATE_LIMIT=15
 RATE_LIMIT_WINDOW=60
 RATE_DIR="$GEOMATE_TMP_DIR/ratelimit"
+# Fast geolocation (geomate.sh): its ip-api answers that the geo data files lack so far,
+# answers/<filter name>.json and last.json, one object per line
+FAST_DIR="$GEOMATE_TMP_DIR/fast"
+# Its share of the request budget: at most FAST_RATE_LIMIT requests per window, FAST_BURST
+# of them at once and the others FAST_GAP seconds apart. While it runs, every other run
+# leaves FAST_RESERVE requests of the window free for it
+FAST_RATE_LIMIT=5
+FAST_BURST=2
+FAST_GAP=12
+FAST_RESERVE=2
 # Lock of the full runs (manual and daily): the owner's PID on line 1, its start time
 # (Unix epoch) on line 2. The web interface reads it to show a running geolocation
 LOCK_FILE="$GEOMATE_TMP_DIR/geolocation.lock"
@@ -29,6 +39,7 @@ EXIT_RUNNING=3       # Exit code: another full run is active, nothing was done
 EXIT_NO_LOCK=4       # Exit code: the full run could not create its lock, nothing was done
 FILTER_LOCK_FILE=""  # Per-filter lock of the 'specific' mode, removed on exit
 FAILED_BATCHES=0     # Batches without a usable API answer
+ANSWERED_BATCHES=0   # Batches with one
 RESERVE_FAILED=0     # Set to 1 when no request could be reserved: the run stops
 GEO_DATA_CHANGED=0   # Set to 1 when a geo data file was rewritten
 PID_FILE="/var/run/geomate.pid"  # PID of the run loop of the service
@@ -54,7 +65,7 @@ cleanup() {
 
 # Prints the PID of the full run that owns LOCK_FILE; returns 1 when there is none: no
 # lock, no PID in it (written by an older version), or the process is gone or is no
-# longer a full geolocate.sh run (PID reused, for example by a 'specific' run)
+# longer a full geolocate.sh run (PID reused, for example by a 'specific' or 'fast' run)
 full_run_owner() {
     local pid cmdline
     read -r pid 2>/dev/null < "$LOCK_FILE"
@@ -62,7 +73,7 @@ full_run_owner() {
     # Each argument ends with a NUL, so the converted cmdline ends with a space
     cmdline=$(tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline") || return 1
     case "$cmdline" in
-        *geolocate.sh\ specific\ *|*geolocate.sh\ start\ ) return 1 ;;
+        *geolocate.sh\ specific\ *|*geolocate.sh\ start\ |*geolocate.sh\ fast\ *) return 1 ;;
         *geolocate.sh\ *) printf '%s\n' "$pid" ;;
         *) return 1 ;;
     esac
@@ -176,9 +187,9 @@ rate_lock_owner_alive() {
 # Short, non-blocking lock shared by every geolocation process. A stale-owner claim
 # prevents two waiters from removing a lock that a third process just acquired. A claim
 # lasts milliseconds: one that stays for seconds while the lock still names the same
-# dead owner was left by a killed waiter and is removed
+# dead owner was left by a killed waiter and is removed. $1: seconds to wait, default 60
 acquire_rate_lock() {
-    local owner claim waited=0 stale_owner="" stale_for=0
+    local owner claim waited=0 stale_owner="" stale_for=0 limit="${1:-60}"
     mkdir -p "$RATE_DIR" || return 1
     until ln -snT "$$" "$RATE_DIR/lock" 2>/dev/null; do
         owner=$(readlink "$RATE_DIR/lock" 2>/dev/null)
@@ -204,7 +215,7 @@ acquire_rate_lock() {
                 stale_for=0
             fi
         fi
-        [ "$waited" -lt 60 ] || return 1
+        [ "$waited" -lt "$limit" ] || return 1
         sleep 1
         waited=$((waited + 1))
     done
@@ -214,13 +225,35 @@ release_rate_lock() {
     [ "$(readlink "$RATE_DIR/lock" 2>/dev/null)" != "$$" ] || rm -f "$RATE_DIR/lock"
 }
 
+# Return 0 while the fast geolocation of geomate.sh runs: $FAST_DIR/active holds its PID.
+# A killed process leaves the file, and another process may have that PID by now
+fast_lane_alive() {
+    local pid="" cmdline
+    read -r pid 2>/dev/null < "$FAST_DIR/active"
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    # Each argument ends with a NUL, so the converted cmdline ends with a space
+    cmdline=$(tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline") || return 1
+    case "$cmdline" in *geomate.sh\ fastlane\ *) return 0 ;; esac
+    return 1
+}
+
 # Reserve one request in the rolling window, including partial batches and retries.
 # Sleeping never holds the lock. The extra second covers the clock's whole-second
 # precision, so requests at the edges of a 60-second window cannot exceed the limit.
+# The window serves two classes. $1 = fast is the request of the fast geolocation, also
+# noted in $RATE_DIR/fast: it gets one while the window has room, no provider hint delays
+# requests, the window holds fewer than FAST_RATE_LIMIT of its requests and, from
+# FAST_BURST of them on, the newest is FAST_GAP seconds old. It never sleeps: without a
+# request it writes the second at which the last of these conditions ends to
+# $FAST_DIR/retry_at and returns 2. Every other run keeps FAST_RESERVE requests of the
+# window free while the fast geolocation runs, and sleeps as before
 reserve_request() {
-    local now count first wait_for until_time tmp="$RATE_DIR/requests.$$"
+    local class="$1" now count first wait_for until_time tmp="$RATE_DIR/requests.$$"
+    local fast_tmp="$RATE_DIR/fast.$$" fast_count fast_first fast_newest retry
+    # Note second $1 in retry when it lies ahead and after the one noted so far
+    later() { [ "$1" -le "$now" ] || [ "$1" -le "$retry" ] || retry="$1"; }
     while :; do
-        acquire_rate_lock || return 1
+        acquire_rate_lock ${class:+3} || return 1
         now=$(rate_now) || { release_rate_lock; return 1; }
         until_time=0
         read -r until_time 2>/dev/null < "$RATE_DIR/until"
@@ -232,8 +265,40 @@ reserve_request() {
                 "$RATE_DIR/requests" > "$tmp" || { release_rate_lock; return 1; }
         fi
         count=$(wc -l < "$tmp")
+        # The fast requests in the window: their number, the oldest and the newest. The
+        # fast class also gets them as the next content of the file
+        fast_count=0 fast_first=0 fast_newest=0
+        if [ -f "$RATE_DIR/fast" ]; then
+            set -- $(awk -v now="$now" -v window="$RATE_LIMIT_WINDOW" -v out="${class:+$fast_tmp}" '
+                $0 ~ /^[0-9]+$/ && now - $0 <= window {
+                    if (!n++) first = $0
+                    newest = $0
+                    if (out != "") print > out
+                }
+                END { print n + 0, first + 0, newest + 0 }' "$RATE_DIR/fast")
+            fast_count="${1:-0}" fast_first="${2:-0}" fast_newest="${3:-0}"
+        fi
+        if [ "$class" = fast ]; then
+            retry=0
+            later "$until_time"
+            [ "$count" -lt "$RATE_LIMIT" ] || { read -r first < "$tmp"; later $((first + RATE_LIMIT_WINDOW + 1)); }
+            [ "$fast_count" -lt "$FAST_RATE_LIMIT" ] || later $((fast_first + RATE_LIMIT_WINDOW + 1))
+            [ "$fast_count" -lt "$FAST_BURST" ] || later $((fast_newest + FAST_GAP))
+            if [ "$retry" -eq 0 ]; then
+                printf '%s\n' "$now" >> "$tmp" && mv "$tmp" "$RATE_DIR/requests" && \
+                    printf '%s\n' "$now" >> "$fast_tmp" && mv "$fast_tmp" "$RATE_DIR/fast" || {
+                    rm -f "$tmp" "$fast_tmp"; release_rate_lock; return 1; }
+                release_rate_lock
+                return 0
+            fi
+            rm -f "$tmp" "$fast_tmp"
+            printf '%s\n' "$retry" > "$FAST_DIR/retry_at.new" && mv "$FAST_DIR/retry_at.new" "$FAST_DIR/retry_at"
+            release_rate_lock
+            return 2
+        fi
         wait_for=$((until_time - now))
-        if [ "$count" -ge "$RATE_LIMIT" ]; then
+        if [ "$count" -ge "$RATE_LIMIT" ] || { [ $((count - fast_count)) -ge $((RATE_LIMIT - FAST_RESERVE)) ] &&
+            fast_lane_alive; }; then
             read -r first < "$tmp"
             [ "$wait_for" -ge $((first + RATE_LIMIT_WINDOW + 1 - now)) ] ||
                 wait_for=$((first + RATE_LIMIT_WINDOW + 1 - now))
@@ -253,6 +318,7 @@ reserve_request() {
 # Provider headers can delay requests, but never grant extra slots. Ignore malformed
 # hints and cap a wait at 65 seconds. Retry-After's numeric form also works with other
 # providers; the local rolling window remains authoritative when headers are absent.
+# $3: seconds to wait for the request lock, default 60
 record_rate_hint() {
     local headers="$1" status="$2" hint remaining ttl retry now old
     hint=$(awk '
@@ -275,7 +341,7 @@ EOF
         [ "$hint" -le 65 ] || hint=65
     fi
     [ "$hint" -gt 0 ] || return 0
-    acquire_rate_lock || return 1
+    acquire_rate_lock $3 || return 1
     now=$(rate_now) || { release_rate_lock; return 1; }
     old=0
     read -r old 2>/dev/null < "$RATE_DIR/until"
@@ -286,24 +352,35 @@ EOF
 
 # Retrieves geographic information for a batch of IPs. curl never retries on its
 # own: a 429 gets one separately budgeted attempt, with a fresh response body.
-# Returns 2 when no request could be reserved (mostly: no request lock in 60 s), else 1
+# Returns 2 when no request could be reserved (mostly: no request lock in 60 s), else 1.
+# $2 = fast: the request of the fast geolocation, which must not wait: reserved in its own
+# class (reserve_request), shorter curl timeouts, no second attempt after a 429
 get_geo_info_batch() {
-    local batch="$1" response status attempt=0 curl_status
+    local batch="$1" class="$2" response status attempt=0 curl_status
     local headers="$GEOMATE_TMP_DIR/geo_headers.$$" body="$GEOMATE_TMP_DIR/geo_body.$$"
+    local connect_timeout=10 max_time=30
+    [ -z "$class" ] || { connect_timeout=5; max_time=10; }
     while :; do
-        reserve_request || { log_and_print "Error: could not reserve a geolocation request" 0 >&2; return 2; }
+        if ! reserve_request $class; then
+            [ -n "$class" ] || log_and_print "Error: could not reserve a geolocation request" 0 >&2
+            return 2
+        fi
         : > "$headers"
         : > "$body"
         log_and_print "API request sent for $(echo "$batch" | wc -w) IPs" 2 >&2
-        status=$(curl -s --connect-timeout 10 --max-time 30 "$GEO_PROVIDER_URL" \
+        status=$(curl -s --connect-timeout "$connect_timeout" --max-time "$max_time" "$GEO_PROVIDER_URL" \
             -D "$headers" -o "$body" -w '%{http_code}' \
             -H "Content-Type: application/json" \
             -d "[$(echo "$batch" | sed 's/[[:space:]]\+/","/g' | sed 's/^/"/;s/$/"/')]" \
             2>/dev/null)
         curl_status=$?
-        record_rate_hint "$headers" "$status" || {
-            rm -f "$headers" "$body"; return 2; }
-        if [ "$curl_status" -eq 0 ] && [ "$status" = 429 ] && [ "$attempt" -eq 0 ]; then
+        record_rate_hint "$headers" "$status" ${class:+3} || {
+            rm -f "$headers" "$body"
+            # The fast request was sent: its caller counts a failed request
+            [ -z "$class" ] || return 1
+            return 2
+        }
+        if [ "$curl_status" -eq 0 ] && [ "$status" = 429 ] && [ "$attempt" -eq 0 ] && [ -z "$class" ]; then
             attempt=1
             continue
         fi
@@ -451,6 +528,7 @@ process_batch() {
             fi
         done
         log_and_print "Batch processed successfully" 2
+        ANSWERED_BATCHES=$((ANSWERED_BATCHES + 1))
         return 0
     else
         FAILED_BATCHES=$((FAILED_BATCHES + 1))
@@ -515,6 +593,21 @@ process_specific_ips() {
 
     : > "$temp_output_file"
 
+    # An IP the fast geolocation has asked already needs no second request: take the first
+    # answer line it holds for each IP and ask only for the rest
+    if [ -d "$FAST_DIR" ]; then
+        ips=$(cat "$FAST_DIR"/answers/*.json "$FAST_DIR/last.json" 2>/dev/null | \
+            awk -v ips="$ips" -v out="$temp_output_file" '
+                BEGIN { n = split(ips, order, " "); for (i = 1; i <= n; i++) want[order[i]] = 1 }
+                match($0, /"query":"[^"]*"/) {
+                    ip = substr($0, RSTART + 9, RLENGTH - 10)
+                    if ((ip in want) && want[ip] == 1) { want[ip] = 2; print > out }
+                }
+                END { for (i = 1; i <= n; i++) if (want[order[i]] == 1) printf "%s ", order[i] }')
+        [ ! -s "$temp_output_file" ] || \
+            log_and_print "Fast geolocation has answered $(wc -l < "$temp_output_file") of $total_ips IPs already" 2
+    fi
+
     local batch=""
     local count=0
     for ip in $ips; do
@@ -547,11 +640,33 @@ process_specific_ips() {
     FILTER_LOCK_FILE=""
 }
 
+# geolocate.sh fast <ask file> <answer file>: one request of the fast geolocation
+# (geomate.sh fastlane) for the addresses in <ask file>, one per line, at most BATCH_SIZE.
+# Writes the answers with "status":"success" to <answer file>, one object per line.
+# Returns 0: answered (the file is written, and empty when ip-api located no address);
+# 1: request sent, no usable answer; 2: nothing sent, because the window has no request
+# for it (reserve_request) or the request lock is busy. Takes neither the lock of the full
+# runs nor a filter lock and writes no geo data: the caller keeps the answers in RAM
+fast_request() {
+    local ask_file="$1" answer_file="$2" batch response rc
+    batch=$(awk -v max="$BATCH_SIZE" '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {
+        printf "%s%s", (n++ ? " " : ""), $0
+        if (n == max) exit }' "$ask_file" 2>/dev/null)
+    [ -n "$batch" ] || return 2
+    rm -f "$FAST_DIR/retry_at"
+    response=$(get_geo_info_batch "$batch" fast)
+    rc=$?
+    [ "$rc" -eq 0 ] || return "$rc"
+    printf '%s\n' "$response" | sed 's/^\[//;s/\]$//;s/},{/}\n{/g' | grep '"status":"success"' > "$answer_file"
+    [ -f "$answer_file" ]
+}
+
 # Main function to handle different execution modes:
 #   geolocate.sh             manual full run of all enabled filters
 #   geolocate.sh start       manual full run, detached; returns at once (exit 0, 3 or 1)
 #   geolocate.sh daily       full run of the trigger's daily update
 #   geolocate.sh specific <filter name> "<ip> ..."   new IPs of one filter (trigger)
+#   geolocate.sh fast <ask file> <answer file>       one request of the fast geolocation
 # Full runs share LOCK_FILE: while one is alive, another exits with 3 and does nothing;
 # a full run that cannot create the lock exits with 4
 main() {
@@ -568,6 +683,11 @@ main() {
         specific)
             shift
             process_specific_ips "$@"
+            ;;
+        fast)
+            # Ends here: its answers stay in RAM, so there is nothing to reload or restart
+            fast_request "$2" "$3"
+            exit $?
             ;;
         *)
             acquire_full_run_lock
@@ -628,5 +748,8 @@ fi
 # A run that stopped because no request could be reserved never requested its remaining
 # IPs: exit 1 keeps them in the trigger's queue, also when earlier batches changed geo data
 [ "$RESERVE_FAILED" = "0" ] || status=1
+# So does a run whose every request failed while answers of the fast geolocation changed
+# the geo data: without them the run would have changed nothing and ended with 1
+[ "$FAILED_BATCHES" -eq 0 ] || [ "$ANSWERED_BATCHES" -gt 0 ] || status=1
 
 exit $status
