@@ -50,6 +50,7 @@ MAIN_BRANCH_FRONTEND=main
 GEOMATE_UPD_DIR=/var/run/geomate-update
 GEOMATE_TMP_DIR=/tmp/geomate
 GEOMATE_UPD_LOCK="${GEOMATE_TMP_DIR}/update.lock"
+GEOMATE_UPD_INCOMPLETE="${GEOMATE_TMP_DIR}/update.incomplete"
 
 ### Components
 GEOMATE_COMPONENTS="BACKEND FRONTEND"
@@ -1367,6 +1368,7 @@ run_update() {
 	backend_updated= # a backend file was installed or deleted: Geomate restarts
 	rpcd_changed= # an acl.d or rpcd plugin file was installed or deleted: rpcd reloads
 	upd_post_failed= # a step after the installation failed: the run ends with 1
+	upd_repair= # the last run did not complete: this one installs everything again
 	while getopts ":s:v:c:U:W:fiy" opt; do
 		case ${opt} in
 			c) upd_component_arg=$OPTARG ;;
@@ -1391,8 +1393,19 @@ run_update() {
 	esac
 	req_upd_components="${upd_component_arg:-"$GEOMATE_COMPONENTS"}"
 
+	# The marker of a run that died or failed after it began to install makes this run a
+	# repair run: it does not ask, installs every requested component again, and restarts
+	# Geomate and reloads rpcd even when no file changes any more
+	if [ -f "$GEOMATE_UPD_INCOMPLETE" ]; then
+		force_update=1 upd_repair=1
+		case "$req_upd_components" in *BACKEND*) backend_updated=1 ;; esac
+		case "$req_upd_components" in *FRONTEND*) rpcd_changed=1 ;; esac
+	fi
+
 	# A run that asks first takes the lock after the answer, so nobody holds it at the question
 	[ -z "${force_update}${assume_yes}" ] || update_lock || return $?
+	# Logged under the lock: while another run is alive, the marker is its own
+	[ -z "$upd_repair" ] || log_msg -warn "The last update did not complete. Installing again."
 
 	if [ -n "$force_update" ]; then
 		upd_components="$req_upd_components"
@@ -1578,6 +1591,10 @@ run_update() {
 			{ error_out "Failed to restart Geomate."; upd_post_failed=1; }
 	fi
 	[ -z "$upd_post_failed" ] || return 1
+	# Everything is installed. A repair run of one component leaves the marker for the other
+	case "${upd_repair}:${upd_components}" in
+		:*|*BACKEND*FRONTEND*|*FRONTEND*BACKEND*) rm -f "$GEOMATE_UPD_INCOMPLETE"
+	esac
 	:
 }
 
@@ -1608,6 +1625,11 @@ install_geomate_files() {
 	local file preinst_path curr_files new_file_list new_file_list exec_files='' \
 		dist_dir main_file_path \
 		upper_dist_dir="$1" components="$2" version upd_channel
+
+	# From here on files change: until a run ends well, the next run installs again.
+	# printf, because a failed redirection of ':' would end the shell
+	printf '' > "$GEOMATE_UPD_INCOMPLETE" ||
+		{ error_out "Failed to create file '$GEOMATE_UPD_INCOMPLETE'."; return 1; }
 
 	for component in $components; do
 		log_msg "" "Installing new $component files..."
