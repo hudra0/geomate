@@ -1841,7 +1841,8 @@ expire_ips_if_due() {
 verify_nftables_rules() {
     log_and_print "Verifying nftables rules..." 1
     
-    local table_output=$(nft list table inet geomate)
+    # Without the set elements: the checks below read only rules and set headers
+    local table_output=$(nft -t list table inet geomate)
     log_and_print "Full table output:" 2
     echo "$table_output"
     
