@@ -1700,14 +1700,33 @@ install_geomate_files() {
 			fi
 		done
 
-		# Copy changed files
+		# The main file carries the version: copy it last, so the component counts as
+		# outdated until all of its files are in place
+		case "${_NL_}${changed_files}${_NL_}" in *"${_NL_}${main_file_path}${_NL_}"*)
+			changed_files="$(printf '%s\n' "$changed_files" | grep -vxF "$main_file_path")${_NL_}${main_file_path}"
+		esac
+
+		# Copy changed files, each through a temporary file in the target directory and a
+		# rename: a run that dies in between leaves the old file whole. cp gives its target
+		# the mode of the source cut by the umask, so the mode is set before the rename
+		local tmp_path file_mode
 		for file in $changed_files
 		do
 			preinst_path="${dist_dir}${file}"
+			tmp_path="${file}.gm-new"
+			case "${_NL_}${exec_files}${_NL_}" in
+				*"${_NL_}${file}${_NL_}"*) file_mode=755 ;;
+				*) file_mode=644
+			esac
 
 			log_msg "Copying file '${file}'."
-			try_mkdir -p "${file%/*}" && cp "$preinst_path" "$file" ||
-				{ inst_failed "Failed to copy file '$preinst_path' to '$file'."; return 1; }
+			try_mkdir -p "${file%/*}" && cp "$preinst_path" "$tmp_path" &&
+				chmod "$file_mode" "$tmp_path" && mv -f "$tmp_path" "$file" ||
+				{
+					rm -f "$tmp_path"
+					inst_failed "Failed to copy file '$preinst_path' to '$file'."
+					return 1
+				}
 			[ "$component" = FRONTEND ] && frontend_updated=1
 		done
 
