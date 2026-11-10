@@ -51,6 +51,8 @@ GEOMATE_UPD_DIR=/var/run/geomate-update
 GEOMATE_TMP_DIR=/tmp/geomate
 GEOMATE_UPD_LOCK="${GEOMATE_TMP_DIR}/update.lock"
 GEOMATE_UPD_INCOMPLETE="${GEOMATE_TMP_DIR}/update.incomplete"
+GEOMATE_UPD_RESULT="${GEOMATE_TMP_DIR}/update_result.json"
+GEOMATE_UPD_LOG="${GEOMATE_TMP_DIR}/update.log"
 
 ### Components
 GEOMATE_COMPONENTS="BACKEND FRONTEND"
@@ -133,7 +135,8 @@ try_mkdir() {
 
 check_util() { command -v "$1" 1>/dev/null; }
 
-error_out() { log_msg -err "${@}"; }
+# Logs an error. An update run reports the first one in its result file
+error_out() { [ -n "$UPD_FIRST_ERROR" ] || UPD_FIRST_ERROR="$1"; log_msg -err "${@}"; }
 
 # prints each argument to a separate line
 print_msg() {
@@ -810,14 +813,55 @@ update_lock() {
 	rm -f "$tmp_lock"
 	UPD_LOCK_HELD=1
 	trap 'update_unlock $?' EXIT
+	# A result file next to a lock always belongs to the run of that lock
+	rm -f "$GEOMATE_UPD_RESULT"
+	UPD_FIRST_ERROR=
+	UPD_BACKEND_BEFORE=$(installed_version BACKEND)
+	UPD_FRONTEND_BEFORE=$(installed_version FRONTEND)
 }
 
-# Releases the lock at the end of a run; also the EXIT trap. $1: exit status of the run
+# Writes the result of the run and then releases the lock; also the EXIT trap. $1: exit
+# status of the run
 update_unlock() {
 	[ -n "$UPD_LOCK_HELD" ] || return 0
 	UPD_LOCK_HELD=
 	trap - EXIT
+	write_update_result "$1"
 	rm -f "$GEOMATE_UPD_LOCK"
+}
+
+# Prints the version marker of the installed main file of component $1 (BACKEND|FRONTEND),
+# nothing when the file or the marker is missing. Unlike get_frontend_spec it logs no error
+# for a missing view.js (backend without the web interface)
+installed_version() {
+	case "$1" in
+		BACKEND) sed -n 's/^VERSION="\([A-Za-z0-9._-]*\)"$/\1/p' "$GEOMATE_SERVICE_PATH" ;;
+		FRONTEND)
+			sed -n "s/^[ 	]*const UI_VERSION[ 	]*=[ 	]*'\([A-Za-z0-9._-]*\)';.*/\1/p" \
+				"$GEOMATE_MAIN_FILE_FRONTEND" ;;
+	esac 2>/dev/null | head -n1
+}
+
+# Prints $1 as the content of a JSON string: control characters removed, '\' and '"' escaped
+json_str() { printf '%s' "$1" | tr -d '\000-\037' | sed 's/[\\"]/\\&/g'; }
+
+# Writes the result file of the run that holds the lock, for the web interface.
+# 1 - exit status of the run
+# One key per line, two spaces, this order: rpcd reads the file with jsonc, scripts with sed.
+# After an update the old init script in memory writes it, so later versions only append keys
+write_update_result() {
+	local error='' log='' tmp_result="${GEOMATE_UPD_RESULT}.$$"
+	# rc 0 never comes with an error: a message of a run that went on and ended well is no error
+	[ "$1" = 0 ] || error="$UPD_FIRST_ERROR"
+	# Only a run that update_start started writes the log: its stdout is that file
+	[ ! "/proc/$$/fd/1" -ef "$GEOMATE_UPD_LOG" ] || log="$GEOMATE_UPD_LOG"
+	printf '{\n  "rc": %s,\n  "started": %s,\n  "finished": %s,\n' "$1" "$UPD_STARTED" "$(date +%s)" > "$tmp_result" &&
+	printf '  "%s": "%s",\n' \
+		backend_before "$UPD_BACKEND_BEFORE" backend_after "$(installed_version BACKEND)" \
+		frontend_before "$UPD_FRONTEND_BEFORE" frontend_after "$(installed_version FRONTEND)" \
+		error "$(json_str "$error")" backup_dir "$(json_str "$upd_backup_dir")" >> "$tmp_result" &&
+	printf '  "log": "%s"\n}\n' "$(json_str "$log")" >> "$tmp_result" &&
+	mv -f "$tmp_result" "$GEOMATE_UPD_RESULT" || rm -f "$tmp_result"
 }
 
 # 1 - component: <BACKEND|FRONTEND>
