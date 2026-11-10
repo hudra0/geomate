@@ -1299,6 +1299,7 @@ check_version() {
 # -U <update_channel> : force this update channel (overrides the upd. channel derived from '-v' option)
 # -W <version> : force this version (overrides the version derived from '-v' option)
 # -f : force update
+# -y : install newer versions without the question
 # -i : ignore previous cache results
 # Return codes: 0 - done or nothing to do, 1 - error, 3 - another update run is alive,
 # 4 - the lock could not be created
@@ -1357,10 +1358,11 @@ run_update() {
 	local file origin new_file_list exec_files sim_path='' req_ver='' ver_type ver_str_arg='' \
 		extract_dir='' dist_dir='' upd_version='' tarball_url='' file_list_query_path \
 		backend_upd_req='' upd_component_arg='' upd_components='' req_upd_components='' \
-		req_upd_channel upd_channel='' def_upd_channel='' force_upd_channel='' force_ver='' force_update=''
+		req_upd_channel upd_channel='' def_upd_channel='' force_upd_channel='' force_ver='' force_update='' \
+		assume_yes=''
 
 	IGNORE_CACHE=
-	while getopts ":s:v:c:U:W:fi" opt; do
+	while getopts ":s:v:c:U:W:fiy" opt; do
 		case ${opt} in
 			c) upd_component_arg=$OPTARG ;;
 			s) sim_path=$OPTARG ;;
@@ -1368,6 +1370,7 @@ run_update() {
 			U) force_upd_channel=$OPTARG force_update=1 ;;
 			W) force_ver=$OPTARG force_update=1 ;;
 			f) force_update=1 ;;
+			y) assume_yes=1 ;;
 			i) IGNORE_CACHE=1 ;; # global var
 			*) unexp_arg "$OPTARG"; return 1
 		esac
@@ -1384,7 +1387,7 @@ run_update() {
 	req_upd_components="${upd_component_arg:-"$GEOMATE_COMPONENTS"}"
 
 	# A run that asks first takes the lock after the answer, so nobody holds it at the question
-	[ -z "$force_update" ] || update_lock || return $?
+	[ -z "${force_update}${assume_yes}" ] || update_lock || return $?
 
 	if [ -n "$force_update" ]; then
 		upd_components="$req_upd_components"
@@ -1394,14 +1397,16 @@ run_update() {
 			0) return 0 ;;
 			1) return 1 ;;
 			254)
-				print_msg "Updates available. Do you want to update? [y/N] "
-				read -r answer
-				case "$answer" in
-					y|Y) update_lock || return $? ;;
-					*)
-						print_msg "Update cancelled."
-						return 0
-				esac
+				if [ -z "$assume_yes" ]; then
+					print_msg "Updates available. Do you want to update? [y/N] "
+					read -r answer
+					case "$answer" in
+						y|Y) update_lock || return $? ;;
+						*)
+							print_msg "Update cancelled."
+							return 0
+					esac
+				fi
 		esac
 		for component in $req_upd_components; do
 			eval "[ -n \"\${${component}_upd_avail}\" ]" && upd_components="${upd_components}${component} "
