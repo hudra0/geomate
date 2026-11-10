@@ -2684,7 +2684,15 @@ case "$1" in
         # holds /tmp/geomate/update.lock (PID on line 1, start epoch on line 2), writes
         # /tmp/geomate/update_result.json before it releases the lock, and one started by
         # update_start writes its output to /tmp/geomate/update.log
-        printf '%s\n' 'src_ip_multi set_counters blocked_ip geolocate_status geo_reload check_interval rx_counters ui_update'
+        # fast_verdict: this backend has the fast geolocation (fast_lane), which gives a
+        # new server its verdict within seconds. Whether it runs shows the table: in
+        # dynamic and monitor mode with geolocation_mode frequent each enabled filter with
+        # working rules has a set _pending, and without that set it is off for the filter.
+        # The set exists only while the process of the fast geolocation runs: not with an
+        # nft before 1.1.1 and not after a start with nft errors.
+        # An element with a timeout of its own is parked (private, reserved or not
+        # located), every other one is a server that waits for its geolocation
+        printf '%s\n' 'src_ip_multi set_counters blocked_ip geolocate_status geo_reload check_interval rx_counters ui_update fast_verdict'
         ;;
     run)
         run
