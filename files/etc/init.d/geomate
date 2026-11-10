@@ -10,11 +10,12 @@ UPD_CHANNEL="release"
 START=95
 STOP=01
 
-EXTRA_COMMANDS="status geolocate check_version update health_check cleanup_ips"
+EXTRA_COMMANDS="status geolocate check_version update update_start health_check cleanup_ips"
 EXTRA_HELP="        status          Get detailed service status
         geolocate       Run geolocation for IP addresses
         check_version   Check for updates
         update          Update geomate
+        update_start    Start an update in the background (web interface)
         health_check    Check if Geomate is properly configured
         cleanup_ips     Remove private/invalid IPs from all IP lists"
 
@@ -51,6 +52,8 @@ GEOMATE_UPD_DIR=/var/run/geomate-update
 GEOMATE_TMP_DIR=/tmp/geomate
 GEOMATE_UPD_LOCK="${GEOMATE_TMP_DIR}/update.lock"
 GEOMATE_UPD_INCOMPLETE="${GEOMATE_TMP_DIR}/update.incomplete"
+GEOMATE_UPD_RESULT="${GEOMATE_TMP_DIR}/update_result.json"
+GEOMATE_UPD_LOG="${GEOMATE_TMP_DIR}/update.log"
 
 ### Components
 GEOMATE_COMPONENTS="BACKEND FRONTEND"
@@ -133,7 +136,8 @@ try_mkdir() {
 
 check_util() { command -v "$1" 1>/dev/null; }
 
-error_out() { log_msg -err "${@}"; }
+# Logs an error. An update run reports the first one in its result file
+error_out() { [ -n "$UPD_FIRST_ERROR" ] || UPD_FIRST_ERROR="$1"; log_msg -err "${@}"; }
 
 # prints each argument to a separate line
 print_msg() {
@@ -151,7 +155,7 @@ print_msg() {
 # logs each argument separately and prints to a separate line
 # optional arguments: '-err', '-warn' to set logged error level
 log_msg() {
-	local msgs_prefix='' _arg err_l=info msgs_dest
+	local msgs_prefix='' _arg err_l=info
 
 	local IFS="$DEFAULT_IFS"
 	for _arg in "$@"
@@ -161,11 +165,12 @@ log_msg() {
 			"-warn") err_l=warn msgs_prefix="Warning: " ;;
 			'') printf '\n' ;; # print out empty lines
 			*)
+				# Write to the open descriptors: opening /dev/stdout again truncates a regular
+				# file, such as the log of update_start, with every message
 				case "$err_l" in
-					err|warn) msgs_dest="/dev/stderr" ;;
-					*) msgs_dest="/dev/stdout"
+					err|warn) printf '%s\n' "${msgs_prefix}${_arg}" >&2 ;;
+					*) printf '%s\n' "${msgs_prefix}${_arg}"
 				esac
-				printf '%s\n' "${msgs_prefix}${_arg}" > "$msgs_dest"
 				logger -t geomate -p user."$err_l" "${msgs_prefix}${_arg}"
 				msgs_prefix=''
 		esac
@@ -810,14 +815,55 @@ update_lock() {
 	rm -f "$tmp_lock"
 	UPD_LOCK_HELD=1
 	trap 'update_unlock $?' EXIT
+	# A result file next to a lock always belongs to the run of that lock
+	rm -f "$GEOMATE_UPD_RESULT"
+	UPD_FIRST_ERROR=
+	UPD_BACKEND_BEFORE=$(installed_version BACKEND)
+	UPD_FRONTEND_BEFORE=$(installed_version FRONTEND)
 }
 
-# Releases the lock at the end of a run; also the EXIT trap. $1: exit status of the run
+# Writes the result of the run and then releases the lock; also the EXIT trap. $1: exit
+# status of the run
 update_unlock() {
 	[ -n "$UPD_LOCK_HELD" ] || return 0
 	UPD_LOCK_HELD=
 	trap - EXIT
+	write_update_result "$1"
 	rm -f "$GEOMATE_UPD_LOCK"
+}
+
+# Prints the version marker of the installed main file of component $1 (BACKEND|FRONTEND),
+# nothing when the file or the marker is missing. Unlike get_frontend_spec it logs no error
+# for a missing view.js (backend without the web interface)
+installed_version() {
+	case "$1" in
+		BACKEND) sed -n 's/^VERSION="\([A-Za-z0-9._-]*\)"$/\1/p' "$GEOMATE_SERVICE_PATH" ;;
+		FRONTEND)
+			sed -n "s/^[ 	]*const UI_VERSION[ 	]*=[ 	]*'\([A-Za-z0-9._-]*\)';.*/\1/p" \
+				"$GEOMATE_MAIN_FILE_FRONTEND" ;;
+	esac 2>/dev/null | head -n1
+}
+
+# Prints $1 as the content of a JSON string: control characters removed, '\' and '"' escaped
+json_str() { printf '%s' "$1" | tr -d '\000-\037' | sed 's/[\\"]/\\&/g'; }
+
+# Writes the result file of the run that holds the lock, for the web interface.
+# 1 - exit status of the run
+# One key per line, two spaces, this order: rpcd reads the file with jsonc, scripts with sed.
+# After an update the old init script in memory writes it, so later versions only append keys
+write_update_result() {
+	local error='' log='' tmp_result="${GEOMATE_UPD_RESULT}.$$"
+	# rc 0 never comes with an error: a message of a run that went on and ended well is no error
+	[ "$1" = 0 ] || error="$UPD_FIRST_ERROR"
+	# Only a run that update_start started writes the log: its stdout is that file
+	[ ! "/proc/$$/fd/1" -ef "$GEOMATE_UPD_LOG" ] || log="$GEOMATE_UPD_LOG"
+	printf '{\n  "rc": %s,\n  "started": %s,\n  "finished": %s,\n' "$1" "$UPD_STARTED" "$(date +%s)" > "$tmp_result" &&
+	printf '  "%s": "%s",\n' \
+		backend_before "$UPD_BACKEND_BEFORE" backend_after "$(installed_version BACKEND)" \
+		frontend_before "$UPD_FRONTEND_BEFORE" frontend_after "$(installed_version FRONTEND)" \
+		error "$(json_str "$error")" backup_dir "$(json_str "$upd_backup_dir")" >> "$tmp_result" &&
+	printf '  "log": "%s"\n}\n' "$(json_str "$log")" >> "$tmp_result" &&
+	mv -f "$tmp_result" "$GEOMATE_UPD_RESULT" || rm -f "$tmp_result"
 }
 
 # 1 - component: <BACKEND|FRONTEND>
@@ -1607,6 +1653,53 @@ update() {
 	return "$rv"
 }
 
+# Starts 'update' with the given options detached from the caller and returns at once, for
+# the web interface: a request that runs the whole update would time out. The output of the
+# run goes to $GEOMATE_UPD_LOG, its result to $GEOMATE_UPD_RESULT.
+# Accepts exactly: -y | -v release | -v snapshot
+# Prints one line. Return codes: 0 - started (the run may have ended already),
+# 3 - an update is running already, 1 - not started
+update_start() {
+	local pid child rc waited=0
+	case "$#:$1:$2" in
+		1:-y:|2:-v:release|2:-v:snapshot) ;;
+		*) error_out "Usage: $GEOMATE_SERVICE_PATH update_start -y | -v release | -v snapshot"; return 1 ;;
+	esac
+	# rpcd hands down umask 0077: the lock, the log and every file the run creates would
+	# be readable by root only
+	umask 022
+	mkdir -p "$GEOMATE_TMP_DIR" && chmod 755 "$GEOMATE_TMP_DIR" ||
+		{ error_out "Failed to start the update."; return 1; }
+	if pid=$(update_lock_owner); then
+		log_msg "An update is already running (PID $pid)"
+		return 3
+	fi
+	# The subshell redirects with exec before it starts the run, and the exec keeps its PID
+	# (see start_detached in geolocate.sh)
+	if check_util setsid; then
+		( exec </dev/null >"$GEOMATE_UPD_LOG" 2>&1; exec setsid "$GEOMATE_SERVICE_PATH" update "$@" ) &
+	else
+		( exec </dev/null >"$GEOMATE_UPD_LOG" 2>&1; exec "$GEOMATE_SERVICE_PATH" update "$@" ) &
+	fi
+	child=$!
+	# Wait until the run owns the lock or has ended
+	while [ "$waited" -lt 50 ]; do
+		pid=$(update_lock_owner) && [ "$pid" = "$child" ] && break
+		kill -0 "$child" 2>/dev/null || break
+		sleep 0.1 2>/dev/null || sleep 1
+		waited=$((waited + 1))
+	done
+	if [ "$pid" != "$child" ] && ! kill -0 "$child" 2>/dev/null; then
+		wait "$child"
+		rc=$?
+		case "$rc" in
+			3) log_msg "An update is already running"; return 3 ;;
+			4) error_out "Failed to start the update."; return 1 ;;
+		esac
+	fi
+	log_msg "Update started (PID $child)"
+}
+
 # 1 - path to upper distribution dir (containing a dir for each component)
 # 2 - component(s): <BACKEND|FRONTEND|"BACKEND FRONTEND">
 install_geomate_files() {
@@ -1825,8 +1918,12 @@ case "$1" in
 	update|print_file_list|post_update_1|post_update_2) action="$1"; shift
 esac
 
+# These actions run here, also under rc.common: before it loads procd.sh, which takes the
+# procd lock of the service. A run started by update_start would inherit that lock and hold
+# it to its end, and every other call of this script (enabled, status, a second
+# update_start) would wait that long
 case "$action" in
-	update|print_file_list|post_update_1|post_update_2) "$action" "$@"; exit $? ;;
+	update|update_start|print_file_list|post_update_1|post_update_2) "$action" "$@"; exit $? ;;
 esac
 
 :

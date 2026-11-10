@@ -2067,7 +2067,13 @@ case "$1" in
         # devices and ports while they sent to it (_ui_dynamic), from the first such packet
         # until it was idle for an hour. A filter without working rules (see the nft errors)
         # or whose protocol is an nft expression has none: its count is unknown
-        printf '%s\n' 'src_ip_multi set_counters blocked_ip geolocate_status geo_reload check_interval rx_counters'
+        # ui_update: '/etc/init.d/geomate update -y' installs newer versions without the
+        # question; 'update_start -y | -v release | -v snapshot' starts that update detached
+        # (exit 0 started, 3 running already, 1 not started or any other argument). A run
+        # holds /tmp/geomate/update.lock (PID on line 1, start epoch on line 2), writes
+        # /tmp/geomate/update_result.json before it releases the lock, and one started by
+        # update_start writes its output to /tmp/geomate/update.log
+        printf '%s\n' 'src_ip_multi set_counters blocked_ip geolocate_status geo_reload check_interval rx_counters ui_update'
         ;;
     run)
         run
