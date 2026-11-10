@@ -48,6 +48,8 @@ MAIN_BRANCH_FRONTEND=main
 
 # Local path of JS files
 GEOMATE_UPD_DIR=/var/run/geomate-update
+GEOMATE_TMP_DIR=/tmp/geomate
+GEOMATE_UPD_LOCK="${GEOMATE_TMP_DIR}/update.lock"
 
 ### Components
 GEOMATE_COMPONENTS="BACKEND FRONTEND"
@@ -759,6 +761,55 @@ cleanup_ips() {
 
 ### Update-related functions
 
+# Prints the PID of the update run that owns the lock; returns 1 when there is none: no lock,
+# no PID in it, or the process is gone, is this process or is no run of this init script
+update_lock_owner() {
+	local pid cmdline
+	read -r pid 2>/dev/null < "$GEOMATE_UPD_LOCK"
+	case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$pid" != "$$" ] || return 1
+	# Each argument ends with a NUL, so the converted cmdline ends with a space
+	cmdline=$(tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline") || return 1
+	case "$cmdline" in
+		*init.d/geomate\ update_start\ *) return 1 ;;
+		*init.d/geomate\ *) printf '%s\n' "$pid" ;;
+		*) return 1 ;;
+	esac
+}
+
+# Takes the lock for this process. Returns 3 while another run is alive, 4 when the lock
+# cannot be created. A lock without a living owner is taken over
+update_lock() {
+	local tmp_lock="${GEOMATE_UPD_LOCK}.$$" pid tries=0
+	[ -z "$UPD_LOCK_HELD" ] || return 0
+	mkdir -p "$GEOMATE_TMP_DIR" && chmod 755 "$GEOMATE_TMP_DIR"
+	UPD_STARTED=$(date +%s)
+	printf '%s\n%s\n' "$$" "$UPD_STARTED" > "$tmp_lock" ||
+		{ error_out "Failed to create lock file '$tmp_lock'."; return 4; }
+	until ln "$tmp_lock" "$GEOMATE_UPD_LOCK" 2>/dev/null; do
+		if pid=$(update_lock_owner); then
+			rm -f "$tmp_lock"
+			error_out "An update is already running (PID $pid)."
+			return 3
+		fi
+		tries=$((tries + 1))
+		[ "$tries" -le 3 ] ||
+			{ rm -f "$tmp_lock"; error_out "Failed to take lock file '$GEOMATE_UPD_LOCK'."; return 4; }
+		rm -f "$GEOMATE_UPD_LOCK"
+	done
+	rm -f "$tmp_lock"
+	UPD_LOCK_HELD=1
+	trap 'update_unlock $?' EXIT
+}
+
+# Releases the lock at the end of a run; also the EXIT trap. $1: exit status of the run
+update_unlock() {
+	[ -n "$UPD_LOCK_HELD" ] || return 0
+	UPD_LOCK_HELD=
+	trap - EXIT
+	rm -f "$GEOMATE_UPD_LOCK"
+}
+
 # 1 - component: <BACKEND|FRONTEND>
 # return codes:
 # 0 - OK
@@ -1240,7 +1291,9 @@ check_version() {
 # -W <version> : force this version (overrides the version derived from '-v' option)
 # -f : force update
 # -i : ignore previous cache results
-update() {
+# Return codes: 0 - done or nothing to do, 1 - error, 3 - another update run is alive,
+# 4 - the lock could not be created
+run_update() {
 	upd_failed() {
 		rm -rf "${GEOMATE_UPD_DIR:-?}"
 		[ -n "$*" ] && error_out "$@"
@@ -1321,6 +1374,9 @@ update() {
 	esac
 	req_upd_components="${upd_component_arg:-"$GEOMATE_COMPONENTS"}"
 
+	# A run that asks first takes the lock after the answer, so nobody holds it at the question
+	[ -z "$force_update" ] || update_lock || return $?
+
 	if [ -n "$force_update" ]; then
 		upd_components="$req_upd_components"
 	else
@@ -1332,7 +1388,7 @@ update() {
 				print_msg "Updates available. Do you want to update? [y/N] "
 				read -r answer
 				case "$answer" in
-					y|Y) ;;
+					y|Y) update_lock || return $? ;;
 					*)
 						print_msg "Update cancelled."
 						return 0
@@ -1502,6 +1558,15 @@ update() {
     	${GEOMATE_SERVICE_PATH} restart
 	fi
 	:
+}
+
+# Runs an update (options: see run_update) and releases the lock on every way out of it
+update() {
+	local rv
+	run_update "$@"
+	rv=$?
+	update_unlock "$rv"
+	return "$rv"
 }
 
 # 1 - path to upper distribution dir (containing a dir for each component)
