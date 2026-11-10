@@ -1364,6 +1364,8 @@ run_update() {
 	IGNORE_CACHE=
 	# global vars, set during the run
 	upd_backup_dir= # backup dir, once a manually modified file was saved there
+	backend_updated= # a backend file was installed or deleted: Geomate restarts
+	upd_post_failed= # a step after the installation failed: the run ends with 1
 	while getopts ":s:v:c:U:W:fiy" opt; do
 		case ${opt} in
 			c) upd_component_arg=$OPTARG ;;
@@ -1569,10 +1571,12 @@ run_update() {
 
 	log_msg "Geomate components '$upd_components' have been successfully updated."
 
-	if [ -n "$backend_upd_req" ] && "$GEOMATE_SERVICE_PATH" enabled; then
+	if [ -n "$backend_upd_req" ] && [ -n "$backend_updated" ] && "$GEOMATE_SERVICE_PATH" enabled; then
 		log_msg "" "Restarting Geomate."
-    	${GEOMATE_SERVICE_PATH} restart
+    	${GEOMATE_SERVICE_PATH} restart ||
+			{ error_out "Failed to restart Geomate."; upd_post_failed=1; }
 	fi
+	[ -z "$upd_post_failed" ] || return 1
 	:
 }
 
@@ -1591,6 +1595,12 @@ install_geomate_files() {
 	inst_failed() {
 		[ -n "$1" ] && error_out "$1"
 		error_out "Failed to install new $component files."
+	}
+
+	# Notes what the installed or deleted file $1 asks for after the installation
+	note_file_change() {
+		[ "$component" = BACKEND ] && backend_updated=1
+		:
 	}
 
 	local file preinst_path curr_files new_file_list new_file_list exec_files='' \
@@ -1735,6 +1745,7 @@ install_geomate_files() {
 					inst_failed "Failed to copy file '$preinst_path' to '$file'."
 					return 1
 				}
+			note_file_change "$file"
 			[ "$component" = FRONTEND ] && frontend_updated=1
 		done
 
@@ -1751,6 +1762,7 @@ install_geomate_files() {
 				*)
 					log_msg "Deleting obsolete file '$file'."
 					rm -f "$file"
+					note_file_change "$file"
 			esac
 		done
 
