@@ -10,11 +10,12 @@ UPD_CHANNEL="release"
 START=95
 STOP=01
 
-EXTRA_COMMANDS="status geolocate check_version update health_check cleanup_ips"
+EXTRA_COMMANDS="status geolocate check_version update update_start health_check cleanup_ips"
 EXTRA_HELP="        status          Get detailed service status
         geolocate       Run geolocation for IP addresses
         check_version   Check for updates
         update          Update geomate
+        update_start    Start an update in the background (web interface)
         health_check    Check if Geomate is properly configured
         cleanup_ips     Remove private/invalid IPs from all IP lists"
 
@@ -154,7 +155,7 @@ print_msg() {
 # logs each argument separately and prints to a separate line
 # optional arguments: '-err', '-warn' to set logged error level
 log_msg() {
-	local msgs_prefix='' _arg err_l=info msgs_dest
+	local msgs_prefix='' _arg err_l=info
 
 	local IFS="$DEFAULT_IFS"
 	for _arg in "$@"
@@ -164,11 +165,12 @@ log_msg() {
 			"-warn") err_l=warn msgs_prefix="Warning: " ;;
 			'') printf '\n' ;; # print out empty lines
 			*)
+				# Write to the open descriptors: opening /dev/stdout again truncates a regular
+				# file, such as the log of update_start, with every message
 				case "$err_l" in
-					err|warn) msgs_dest="/dev/stderr" ;;
-					*) msgs_dest="/dev/stdout"
+					err|warn) printf '%s\n' "${msgs_prefix}${_arg}" >&2 ;;
+					*) printf '%s\n' "${msgs_prefix}${_arg}"
 				esac
-				printf '%s\n' "${msgs_prefix}${_arg}" > "$msgs_dest"
 				logger -t geomate -p user."$err_l" "${msgs_prefix}${_arg}"
 				msgs_prefix=''
 		esac
@@ -1651,6 +1653,53 @@ update() {
 	return "$rv"
 }
 
+# Starts 'update' with the given options detached from the caller and returns at once, for
+# the web interface: a request that runs the whole update would time out. The output of the
+# run goes to $GEOMATE_UPD_LOG, its result to $GEOMATE_UPD_RESULT.
+# Accepts exactly: -y | -v release | -v snapshot
+# Prints one line. Return codes: 0 - started (the run may have ended already),
+# 3 - an update is running already, 1 - not started
+update_start() {
+	local pid child rc waited=0
+	case "$#:$1:$2" in
+		1:-y:|2:-v:release|2:-v:snapshot) ;;
+		*) error_out "Usage: $GEOMATE_SERVICE_PATH update_start -y | -v release | -v snapshot"; return 1 ;;
+	esac
+	# rpcd hands down umask 0077: the lock, the log and every file the run creates would
+	# be readable by root only
+	umask 022
+	mkdir -p "$GEOMATE_TMP_DIR" && chmod 755 "$GEOMATE_TMP_DIR" ||
+		{ error_out "Failed to start the update."; return 1; }
+	if pid=$(update_lock_owner); then
+		log_msg "An update is already running (PID $pid)"
+		return 3
+	fi
+	# The subshell redirects with exec before it starts the run, and the exec keeps its PID
+	# (see start_detached in geolocate.sh)
+	if check_util setsid; then
+		( exec </dev/null >"$GEOMATE_UPD_LOG" 2>&1; exec setsid "$GEOMATE_SERVICE_PATH" update "$@" ) &
+	else
+		( exec </dev/null >"$GEOMATE_UPD_LOG" 2>&1; exec "$GEOMATE_SERVICE_PATH" update "$@" ) &
+	fi
+	child=$!
+	# Wait until the run owns the lock or has ended
+	while [ "$waited" -lt 50 ]; do
+		pid=$(update_lock_owner) && [ "$pid" = "$child" ] && break
+		kill -0 "$child" 2>/dev/null || break
+		sleep 0.1 2>/dev/null || sleep 1
+		waited=$((waited + 1))
+	done
+	if [ "$pid" != "$child" ] && ! kill -0 "$child" 2>/dev/null; then
+		wait "$child"
+		rc=$?
+		case "$rc" in
+			3) log_msg "An update is already running"; return 3 ;;
+			4) error_out "Failed to start the update."; return 1 ;;
+		esac
+	fi
+	log_msg "Update started (PID $child)"
+}
+
 # 1 - path to upper distribution dir (containing a dir for each component)
 # 2 - component(s): <BACKEND|FRONTEND|"BACKEND FRONTEND">
 install_geomate_files() {
@@ -1869,8 +1918,12 @@ case "$1" in
 	update|print_file_list|post_update_1|post_update_2) action="$1"; shift
 esac
 
+# These actions run here, also under rc.common: before it loads procd.sh, which takes the
+# procd lock of the service. A run started by update_start would inherit that lock and hold
+# it to its end, and every other call of this script (enabled, status, a second
+# update_start) would wait that long
 case "$action" in
-	update|print_file_list|post_update_1|post_update_2) "$action" "$@"; exit $? ;;
+	update|update_start|print_file_list|post_update_1|post_update_2) "$action" "$@"; exit $? ;;
 esac
 
 :
