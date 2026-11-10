@@ -1667,9 +1667,13 @@ install_geomate_files() {
 				' - "${dist_dir}/new_file_list"
 			)"
 
-			# Detect manually modified files
-			man_changed_files="$(md5sum -c "$curr_reg_file" 2>/dev/null |
-				sed -n "/:\s*FAILED\s*$/{s/\s*:\s*FAILED\s*$//;p;}")"
+			# Detect manually modified files. One that the new version no longer lists has no
+			# new copy: it is deleted as obsolete below
+			man_changed_files="$(
+				md5sum -c "$curr_reg_file" 2>/dev/null |
+				sed -n "/:\s*FAILED\s*$/{s/\s*:\s*FAILED\s*$//;p;}" |
+				awk 'NR == FNR {new[$0]; next} $0 in new {print}' "${dist_dir}/new_file_list" -
+			)"
 
 			# Add manually modified files to changed files
 			if [ -n "$man_changed_files" ]; then
