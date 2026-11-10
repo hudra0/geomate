@@ -1362,6 +1362,8 @@ run_update() {
 		assume_yes=''
 
 	IGNORE_CACHE=
+	# global vars, set during the run
+	upd_backup_dir= # backup dir, once a manually modified file was saved there
 	while getopts ":s:v:c:U:W:fiy" opt; do
 		case ${opt} in
 			c) upd_component_arg=$OPTARG ;;
@@ -1689,12 +1691,18 @@ install_geomate_files() {
 			log_msg "File '$file' did not change - not updating."
 		done
 
-		local mod_files_bk_dir="/tmp/geomate_old_modified_files"
+		# Backups keep the full path: both luci-app-geomate.json files share a basename
+		local mod_files_bk_dir="/tmp/geomate_old_modified_files" bk_path
 		for file in $man_changed_files; do
 			[ -n "$file" ] && [ -f "$file" ] || continue
+			# A run that did not complete replaced this file already. Saving it would
+			# overwrite the backup of the modified file with the new version
+			cmp -s "$file" "${dist_dir}${file}" && continue
+			bk_path="${mod_files_bk_dir}${file}"
 			log_msg -warn "File '$file' was manually modified - overwriting."
-			if try_mkdir -p "$mod_files_bk_dir" && cp "$file" "${mod_files_bk_dir}/${file##*/}"; then
-				log_msg "Saved a backup copy of manually modified file to ${mod_files_bk_dir}/${file##*/}"
+			if try_mkdir -p "${bk_path%/*}" && cp "$file" "$bk_path"; then
+				log_msg "Saved a backup copy of manually modified file to $bk_path"
+				upd_backup_dir="$mod_files_bk_dir"
 			else
 				log_msg -warn "Can not create a backup copy of manually modified file '$file' - overwriting anyway."
 			fi
