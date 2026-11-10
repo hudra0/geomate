@@ -229,7 +229,7 @@ start_service() {
     if [ ! -f /etc/config/geomate ]; then
         log_msg -warn "Config file missing, downloading default configuration from repository"
         local config_url="${GEOMATE_GH_RAW_URL_BACKEND_MAIN}/files/etc/config/geomate"
-        if uclient-fetch "$config_url" -O /etc/config/geomate 2>/dev/null; then
+        if uclient-fetch -T 10 "$config_url" -O /etc/config/geomate 2>/dev/null; then
             chmod 644 /etc/config/geomate
             log_msg "Default configuration downloaded successfully"
         else
@@ -911,7 +911,7 @@ fetch_geomate_component() {
 	rm -rf "${upd_dir}/${GEOMATE_REPO_AUTHOR}-${repo_name}-"*
 	try_mkdir -p "$upd_dir" || return 1
 
-	uclient-fetch "$fetch_tarball_url" -O "${tarball}" 2> "$ucl_err_file" &&
+	uclient-fetch -T 60 "$fetch_tarball_url" -O "${tarball}" 2> "$ucl_err_file" &&
 	grep -q "Download completed" "$ucl_err_file" &&
 	tar -C "${upd_dir}" -xzf "${tarball}" &&
 	extract_dir="$(find "${upd_dir}/" -type d -name "${GEOMATE_REPO_AUTHOR}-${repo_name}-*")" &&
@@ -1059,7 +1059,7 @@ get_gh_ref_data() {
 				gh_ref="$gh_hash"
 			else
 				branches="$(
-					uclient-fetch "${gh_url_api}/branches" -O-  2> "$ref_ucl_err_file" |
+					uclient-fetch -T 10 "${gh_url_api}/branches" -O-  2> "$ref_ucl_err_file" |
 						{ jsonfilter -e '@[@]["name"]'; cat 1>/dev/null; }
 				)"
 				[ -n "$branches" ] || {
@@ -1081,7 +1081,7 @@ get_gh_ref_data() {
 	[ -z "$gh_ref" ] && gh_ref="$(
 		case "$gh_channel" in
 			release)
-				uclient-fetch "${gh_url_api}/releases" -O- 2> "$ref_ucl_err_file" | {
+				uclient-fetch -T 10 "${gh_url_api}/releases" -O- 2> "$ref_ucl_err_file" | {
 					jsonfilter -e '@[@.prerelease=false]' |
 					jsonfilter -a -e "@[@.target_commitish=\"${main_branch}\"].tag_name"
 					cat 1>/dev/null
@@ -1089,7 +1089,7 @@ get_gh_ref_data() {
 			snapshot|branch=*|commit=*)
 				for branch in $branches; do
 					ref_fetch_url="${gh_url_api}/commits?sha=${branch}"
-					uclient-fetch "${ref_fetch_url}" -O- 2> "$ref_ucl_err_file" | {
+					uclient-fetch -T 10 "${ref_fetch_url}" -O- 2> "$ref_ucl_err_file" | {
 						jsonfilter -e '@[@.commit]["url"]' |
 						sed 's/.*\///' # only leave the commit hash
 						cat 1>/dev/null
