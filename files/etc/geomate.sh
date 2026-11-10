@@ -52,6 +52,7 @@ load_config() {
     config_get debug_level global debug_level '0'
     config_get strict_mode global strict_mode '0'
     config_get operational_mode global operational_mode 'dynamic'
+    config_get geolocation_mode global geolocation_mode 'frequent'
     config_get CHECK_INTERVAL global check_interval '1800'
     case "$CHECK_INTERVAL" in ''|*[!0-9]*) CHECK_INTERVAL=1800 ;; esac
     # Strip leading zeros before arithmetic (ash otherwise treats them as octal).
@@ -279,6 +280,24 @@ create_empty_ip_list() {
     fi
 }
 
+# Return 0 when nft is 1.1.1 or newer. The fast geolocation reads one named counter every
+# few seconds, and an older nft has no cache filter for 'list counter': it loads the whole
+# ruleset of all tables with every set element for it. A version that cannot be read
+# counts as too old
+nft_lists_one_counter() {
+    local version
+    version=$(nft --version 2>/dev/null)
+    case "$version" in nftables\ v*) ;; *) return 1 ;; esac
+    version="${version#nftables v}"
+    version="${version%% *}"
+    case "$version" in
+        *[!0-9.]*|.*|*.|*..*) return 1 ;;
+        0.*|1.0|1.0.*|1.1|1.1.0) return 1 ;;
+        [0-9]*.[0-9]*) return 0 ;;
+    esac
+    return 1
+}
+
 # Set up nftables rules and filters
 setup_nftables_and_filters() {
     log_and_print "Setting up nftables rules and filters..." 1
@@ -299,6 +318,26 @@ setup_nftables_and_filters() {
     nft_exec add table inet geomate
     nft_exec add chain inet geomate forward { type filter hook forward priority -150 \; policy accept \; }
     nft_exec add chain inet geomate prerouting { type filter hook prerouting priority -150 \; policy accept \; }
+
+    # Fast geolocation: one counter for all filters, which rises with each server a filter
+    # adds to its _pending set (add_pending_set). Only where new servers are geolocated
+    # between the daily runs and reach an IP list: in frequent mode, outside static mode.
+    # nft is called directly: an entry in $NFT_ERROR_LOG would turn every later reload and
+    # reload_geo into a restart, while this failure only leaves the fast geolocation off.
+    # fast_lane_filters counts the filters that got their _pending set and rule
+    local error_output nl='
+'
+    fast_lane_on=0
+    fast_lane_filters=0
+    if [ "$geolocation_mode" = "frequent" ] && [ "$operational_mode" != "static" ]; then
+        if ! nft_lists_one_counter; then
+            log_and_print "Fast geolocation is off: needs nftables 1.1.1 or newer" 0
+        elif error_output=$(nft add counter inet geomate pending_new 2>&1); then
+            fast_lane_on=1
+        else
+            log_and_print "Fast geolocation is off: ${error_output%%"$nl"*}" 0
+        fi
+    fi
 
     # Set up filters from configuration
     config_load 'geomate'
@@ -763,6 +802,33 @@ add_filter_entries() {
     return 1
 }
 
+# Fast geolocation: set <set name>_pending of a filter and the forward rule that fills it.
+# $1: filter name, $2: set name prefix, $3: base rule. The rule adds each server the
+# filter's devices send to and that has no verdict to the set, where it stays for a
+# minute ('add' does not refresh it), and counts each new element in pending_new. It
+# follows the accept and the drop rule of the filter, so servers in _allowed and _blocked
+# never reach it; monitor mode has no drop rule and matches _blocked itself. A full set
+# ends the rule at 'add': the packet goes on to the next rule as without it. An element
+# with a timeout of its own, which only nft adds, keeps the rule from adding the address.
+# nft is called directly and a failure only logged, as for the counter: it leaves the fast
+# geolocation off for this filter and nothing else
+add_pending_set() {
+    local error_output not_blocked="" nl='
+'
+    [ "$operational_mode" != "monitor" ] || not_blocked="ip daddr != @${2}_blocked"
+    if error_output=$(nft add set inet geomate "${2}_pending" \
+        { type ipv4_addr\; size 256\; flags dynamic,timeout\; timeout 1m\; } 2>&1); then
+        if error_output=$(nft add rule inet geomate forward "$3" $not_blocked ip daddr != @"${2}"_pending \
+            add @"${2}"_pending { ip daddr } counter name pending_new 2>&1); then
+            fast_lane_filters=$((fast_lane_filters + 1))
+            return 0
+        fi
+        # Without its rule the set would tell the web interface that the filter has one
+        nft delete set inet geomate "${2}_pending" 2>/dev/null
+    fi
+    log_and_print "Fast geolocation is off for $1: ${error_output%%"$nl"*}" 0
+}
+
 # Set up a geo filter based on configuration
 setup_geo_filter() {
     local name protocol src_ip src_port dest_port enabled
@@ -842,9 +908,11 @@ setup_geo_filter() {
         log_and_print "Source IP of $name has exceptions only: the filter applies to all other devices" 0
 
     # Add forward rule for allowed IPs with error checking
+    local accept_ok=0
     log_and_print "Adding forward rule: $base_rule ip daddr @${set_name}_allowed counter accept" 2
     if nft_exec add rule inet geomate forward "$base_rule" ip daddr @"${set_name}"_allowed counter accept; then
         log_and_print "Successfully added forward rule for allowed IPs in $name" 2
+        accept_ok=1
     else
         log_and_print "ERROR: Failed to add forward rule for $name! Check $NFT_ERROR_LOG" 0
     fi
@@ -859,6 +927,12 @@ setup_geo_filter() {
         fi
     else
         log_and_print "Monitor mode: Not adding drop rule for blocked IPs in $name" 2
+    fi
+
+    # Fast geolocation: after the rules for the servers with a verdict, before the strict
+    # mode drop
+    if [ "$fast_lane_on" = "1" ] && [ "$accept_ok" -eq 1 ]; then
+        add_pending_set "$name" "$set_name" "$base_rule"
     fi
 
     # Strict mode rule - only apply if not in monitor mode
