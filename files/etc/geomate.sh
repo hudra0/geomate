@@ -1376,57 +1376,19 @@ process_geo_data() {
     [ "${left_out:-0 0}" = "0 0" ] || \
         log_and_print "Geo processing for $name: left out ${left_out% *} IPs inside allowed_ip entries, ${left_out#* } IPs inside blocked_ip and blocked_ips entries" 2
 
-    # Batch update the sets - handling potential large IP lists
-    add_ips_to_set() {
-        local set_name="$1"
-        local ip_list="$2"
-        local chunk_size=1000
-        local total_ips
-        local start=1
-        local success=1
-        local end chunk error_output ret nl='
-'
-        
-        [ -z "$ip_list" ] && return 0
-        
-        total_ips=$(echo "$ip_list" | tr ',' '\n' | wc -l)
-        log_and_print "Adding IPs to $set_name, total IPs: $total_ips" 2
-        
-        # Process in smaller chunks to avoid command line limits
-        while [ "$start" -le "$total_ips" ]; do
-            end=$((start + chunk_size - 1))
-            [ "$end" -gt "$total_ips" ] && end="$total_ips"
-            
-            # Extract chunk of IPs
-            chunk=$(echo "$ip_list" | tr ',' '\n' | sed -n "${start},${end}p" | tr '\n' ',' | sed 's/,$//')
-            
-            log_and_print "Processing IPs $start to $end of $total_ips" 3
-            
-            # Add this chunk to the set (no eval: the set name comes from the filter name)
-            error_output=$(nft add element inet geomate "$set_name" { "$chunk" } 2>&1)
-            ret=$?
-            
-            if [ "$ret" -ne 0 ]; then
-                log_and_print "ERROR: Failed to add IPs (chunk $start-$end) to set $set_name: $error_output" 0
-                # First line only: nft repeats the whole command after it. The set
-                # reference marks the filter in the status like an nft_exec error
-                printf '[%s] nft add element inet geomate %s { IPs %s-%s of %s } -> Error: %s (@%s)\n' \
-                    "$(date '+%Y-%m-%d %H:%M:%S')" "$set_name" "$start" "$end" "$total_ips" \
-                    "${error_output%%"$nl"*}" "$set_name" >> "$NFT_ERROR_LOG"
-                success=0
-            fi
-            
-            start=$((end + 1))
-        done
-        
-        return "$success"
-    }
-    
-    # Add allowed IPs to set
-    [ -n "$allowed_ips" ] && add_ips_to_set "$allowed_set" "$allowed_ips"
-    
-    # Add blocked IPs to set
-    [ -n "$blocked_ips" ] && add_ips_to_set "$blocked_set" "$blocked_ips"
+    # Load both sets with one nft call. A call per 1000 IPs would read the interval
+    # elements that are in the table already again each time
+    local batch="${GEOMATE_TMP_DIR}/start_sets.nft"
+    [ -n "$allowed_ips" ] && log_and_print "Adding IPs to $allowed_set, total IPs: $allowed_count" 2
+    [ -n "$blocked_ips" ] && log_and_print "Adding IPs to $blocked_set, total IPs: $blocked_count" 2
+    {
+        print_set_elements "$allowed_set" "$allowed_ips"
+        print_set_elements "$blocked_set" "$blocked_ips"
+    } > "$batch"
+    if [ -s "$batch" ]; then
+        nft -f "$batch" 2>/dev/null || add_set_lines "$batch"
+    fi
+    rm -f "$batch"
 
     log_and_print "Finished processing geo data for $name" 2
 }
@@ -1435,9 +1397,32 @@ process_geo_data() {
 print_set_elements() {
     [ -n "$2" ] || return 0
     printf '%s\n' "$2" | tr ',' '\n' | awk -v set="$1" '
-        { chunk = chunk (n++ % 1000 ? "," : "") $0 }
-        n % 1000 == 0 { print "add element inet geomate " set " { " chunk " }"; chunk = "" }
-        END { if (chunk != "") print "add element inet geomate " set " { " chunk " }" }'
+        { printf "%s%s", (n++ % 1000 ? "," : "add element inet geomate " set " { "), $0 }
+        n % 1000 == 0 { print " }" }
+        END { if (n % 1000) print " }" }'
+}
+
+# Run the 'add element' commands of file $1 (print_set_elements) with one nft call per
+# line, after nft rejected them as one batch. A batch is all or nothing, a single call
+# leaves out only its own 1000 IPs. Each rejected line is logged and added to
+# $NFT_ERROR_LOG with the set reference that marks the filter in the status
+add_set_lines() {
+    local first last total line set_name error_output nl='
+'
+    # Each command with the positions of its IPs among those of its set
+    awk 'NR == FNR { total[$5] += split($0, ip, ","); next }
+        { n = split($0, ip, ","); print seen[$5] + 1, seen[$5] + n, total[$5], $0; seen[$5] += n }' "$1" "$1" | \
+    while read -r first last total line; do
+        error_output=$(nft "$line" 2>&1) && continue
+        set_name="${line#add element inet geomate }"
+        set_name="${set_name%% *}"
+        log_and_print "ERROR: Failed to add IPs (chunk $first-$last) to set $set_name: $error_output" 0
+        # First line only: nft repeats the whole command after it. The set
+        # reference marks the filter in the status like an nft_exec error
+        printf '[%s] nft add element inet geomate %s { IPs %s-%s of %s } -> Error: %s (@%s)\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S')" "$set_name" "$first" "$last" "$total" \
+            "${error_output%%"$nl"*}" "$set_name" >> "$NFT_ERROR_LOG"
+    done
 }
 
 # config_foreach callback of reload_regions and reload_geo: for a changed, enabled filter
