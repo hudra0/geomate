@@ -21,6 +21,9 @@ BATCH_SIZE=100
 RATE_LIMIT=15
 RATE_LIMIT_WINDOW=60
 RATE_DIR="$GEOMATE_TMP_DIR/ratelimit"
+# Fast geolocation (geomate.sh): its ip-api answers that the geo data files lack so far,
+# answers/<filter name>.json and last.json, one object per line
+FAST_DIR="$GEOMATE_TMP_DIR/fast"
 # Lock of the full runs (manual and daily): the owner's PID on line 1, its start time
 # (Unix epoch) on line 2. The web interface reads it to show a running geolocation
 LOCK_FILE="$GEOMATE_TMP_DIR/geolocation.lock"
@@ -29,6 +32,7 @@ EXIT_RUNNING=3       # Exit code: another full run is active, nothing was done
 EXIT_NO_LOCK=4       # Exit code: the full run could not create its lock, nothing was done
 FILTER_LOCK_FILE=""  # Per-filter lock of the 'specific' mode, removed on exit
 FAILED_BATCHES=0     # Batches without a usable API answer
+ANSWERED_BATCHES=0   # Batches with one
 RESERVE_FAILED=0     # Set to 1 when no request could be reserved: the run stops
 GEO_DATA_CHANGED=0   # Set to 1 when a geo data file was rewritten
 PID_FILE="/var/run/geomate.pid"  # PID of the run loop of the service
@@ -451,6 +455,7 @@ process_batch() {
             fi
         done
         log_and_print "Batch processed successfully" 2
+        ANSWERED_BATCHES=$((ANSWERED_BATCHES + 1))
         return 0
     else
         FAILED_BATCHES=$((FAILED_BATCHES + 1))
@@ -514,6 +519,21 @@ process_specific_ips() {
     FILTER_LOCK_FILE="$lock_file"
 
     : > "$temp_output_file"
+
+    # An IP the fast geolocation has asked already needs no second request: take the first
+    # answer line it holds for each IP and ask only for the rest
+    if [ -d "$FAST_DIR" ]; then
+        ips=$(cat "$FAST_DIR"/answers/*.json "$FAST_DIR/last.json" 2>/dev/null | \
+            awk -v ips="$ips" -v out="$temp_output_file" '
+                BEGIN { n = split(ips, order, " "); for (i = 1; i <= n; i++) want[order[i]] = 1 }
+                match($0, /"query":"[^"]*"/) {
+                    ip = substr($0, RSTART + 9, RLENGTH - 10)
+                    if ((ip in want) && want[ip] == 1) { want[ip] = 2; print > out }
+                }
+                END { for (i = 1; i <= n; i++) if (want[order[i]] == 1) printf "%s ", order[i] }')
+        [ ! -s "$temp_output_file" ] || \
+            log_and_print "Fast geolocation has answered $(wc -l < "$temp_output_file") of $total_ips IPs already" 2
+    fi
 
     local batch=""
     local count=0
@@ -628,5 +648,8 @@ fi
 # A run that stopped because no request could be reserved never requested its remaining
 # IPs: exit 1 keeps them in the trigger's queue, also when earlier batches changed geo data
 [ "$RESERVE_FAILED" = "0" ] || status=1
+# So does a run whose every request failed while answers of the fast geolocation changed
+# the geo data: without them the run would have changed nothing and ended with 1
+[ "$FAILED_BATCHES" -eq 0 ] || [ "$ANSWERED_BATCHES" -gt 0 ] || status=1
 
 exit $status
