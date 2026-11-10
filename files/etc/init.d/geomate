@@ -186,13 +186,21 @@ log_and_print() {
     echo "geomate: $1"
 }
 
+# Returns 0 and warns while an update run holds the lock: the start then repairs nothing.
+# The update restarts the service itself, and a repair would end with 'already running'
+# and leave the service stopped. 1 - the components that are not repaired
+skip_repair_during_update() {
+	update_lock_owner >/dev/null || return 1
+	log_msg -warn "An update is running: not repairing $1 files now."
+}
+
 start_service() {
 	# handle first run after installation or update from older versions
-	if [ "$VERSION" = dev ]; then
+	if [ "$VERSION" = dev ] && ! skip_repair_during_update "$GEOMATE_COMPONENTS"; then
 		log_msg "" "Completing the upgrade of the update mechanism..."
 		update -f || return 1
 		# shellcheck disable=SC1090
-		. "${GEOMATE_SERVICE_PATH}" # source updated init script 
+		. "${GEOMATE_SERVICE_PATH}" # source updated init script
 	fi
 
 	for component in $GEOMATE_COMPONENTS; do
@@ -201,6 +209,7 @@ start_service() {
 			0) ;; # integrity OK
 			1) return 1 ;;
 			2) # missing files
+				skip_repair_during_update "$component" && continue
 				local fix_upd_channel='' fix_version='' force_version=''
 				case "$component" in
 					BACKEND) fix_version="$VERSION" fix_upd_channel="$UPD_CHANNEL" ;;
