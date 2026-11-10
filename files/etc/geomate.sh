@@ -24,6 +24,10 @@ PID_FILE="/var/run/geomate.pid"                    # PID of the run loop, writte
 LOADING_FLAG="/tmp/geomate_loading"                # Present while a start builds the table
 IP_CACHE_FILE="/tmp/geomate_ip_cache.json"         # Lookup cache of the web interface (luci.geomate)
 GEO_RESTART_FLAG="${GEOMATE_TMP_DIR}/geo_restart_needed"  # geolocate.sh under the loop: reload_geo failed
+# Fast geolocation: answers/<filter name>.json holds the ip-api answers of a filter that
+# its geo data file lacks so far, in the line format of that file. RAM only, kept across
+# stop and start
+FAST_DIR="${GEOMATE_TMP_DIR}/fast"
 CHECK_INTERVAL=1800  # Default loop interval in seconds, loaded from UCI
 harvest_refresh_per_day=0  # Timestamp refresh age per expiry day; at least one hour, at most one day
 debug_level=0
@@ -1248,8 +1252,14 @@ append_blocked_ip() {
 # we do everything in one pass: parse regions, calculate haversine, categorize IPs
 # Output format: First line = comma-separated allowed IPs, Second line = comma-separated blocked IPs,
 # third line = the numbers of IPs left out inside allowed and inside blocked entries
+# $5 (optional) = the filter's answers of the fast geolocation ($FAST_DIR/answers). Those
+# of the two files that exist are read, the geo data file first: an IP counts once, with
+# the coordinates of its first line
 split_geo_data() {
-    jq -r '. | [.query, .lat, .lon] | @tsv' "$1" 2>/dev/null | \
+    local geo_file="$1" answers_file="$5"
+    [ -f "$geo_file" ] || { geo_file="$answers_file"; answers_file=""; }
+    [ -f "$answers_file" ] || answers_file=""
+    jq -r '. | [.query, .lat, .lon] | @tsv' "$geo_file" ${answers_file:+"$answers_file"} 2>/dev/null | \
         awk -v regions="$2" -v allowed_cover="$3" -v blocked_cover="$4" "$AWK_IPV4_ENTRY"'
         # Load element list "list": its addresses as keys of ips[], its prefixes and ranges
         # into lo[] and hi[]. Returns the number of prefixes and ranges
@@ -1310,6 +1320,9 @@ split_geo_data() {
             
             # Skip invalid entries
             if (ip == "" || $2 == "" || $3 == "") next
+            # The first line of an IP counts (geo data file before the fast answers)
+            if (ip in seen) next
+            seen[ip] = 1
             
             # Check if IP is within ANY allowed region
             allowed = 0
@@ -1353,14 +1366,15 @@ process_geo_data() {
     local blocked_set="$3"
     local allowed_regions="$4"
     local geo_data_file="${GEOMATE_DATA_DIR}/${name}_geo_data.json"
+    local answers_file="${FAST_DIR}/answers/${name}.json"
 
-    [ ! -f "$geo_data_file" ] && { log_and_print "Geo data file not found: $geo_data_file" 0; return; }
+    [ ! -f "$geo_data_file" ] && [ ! -f "$answers_file" ] && { log_and_print "Geo data file not found: $geo_data_file" 0; return; }
     [ -z "$allowed_regions" ] && { log_and_print "No allowed regions specified for $name" 0; return; }
 
     log_and_print "Processing geo data for $name with allowed regions: $allowed_regions" 2
 
     local result
-    result=$(split_geo_data "$geo_data_file" "$allowed_regions" "$5" "$6")
+    result=$(split_geo_data "$geo_data_file" "$allowed_regions" "$5" "$6" "$answers_file")
 
     # Parse the result: allowed IPs, blocked IPs, the numbers left out
     local allowed_ips blocked_ips left_out
@@ -1432,7 +1446,7 @@ add_set_lines() {
 # before the file is read, to ${reload_batch}.stamps (save_reload_stamps).
 # $reload_label starts the log line, $reload_report is filter_set_entries' $4
 reload_filter_sets() {
-    local name enabled set_name result geo_data_file allowed_entries blocked_entries
+    local name enabled set_name result geo_data_file answers_file allowed_entries blocked_entries
     local allowed_regions="" geo_allowed="" geo_blocked=""
     local allowed_count=0 blocked_count=0
 
@@ -1449,8 +1463,9 @@ reload_filter_sets() {
     geo_data_file="${GEOMATE_DATA_DIR}/${name}_geo_data.json"
     printf '%s %s\n' "${set_name}.geo_stamp" "$(geo_file_stamp "$geo_data_file")" >> "${reload_batch}.stamps"
 
-    if [ -n "$allowed_regions" ] && [ -f "$geo_data_file" ]; then
-        result=$(split_geo_data "$geo_data_file" "$allowed_regions" "$allowed_entries" "$blocked_entries")
+    answers_file="${FAST_DIR}/answers/${name}.json"
+    if [ -n "$allowed_regions" ] && { [ -f "$geo_data_file" ] || [ -f "$answers_file" ]; }; then
+        result=$(split_geo_data "$geo_data_file" "$allowed_regions" "$allowed_entries" "$blocked_entries" "$answers_file")
         geo_allowed=$(echo "$result" | sed -n '1p')
         geo_blocked=$(echo "$result" | sed -n '2p')
     fi
