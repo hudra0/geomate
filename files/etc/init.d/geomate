@@ -48,6 +48,9 @@ MAIN_BRANCH_FRONTEND=main
 
 # Local path of JS files
 GEOMATE_UPD_DIR=/var/run/geomate-update
+GEOMATE_TMP_DIR=/tmp/geomate
+GEOMATE_UPD_LOCK="${GEOMATE_TMP_DIR}/update.lock"
+GEOMATE_UPD_INCOMPLETE="${GEOMATE_TMP_DIR}/update.incomplete"
 
 ### Components
 GEOMATE_COMPONENTS="BACKEND FRONTEND"
@@ -184,13 +187,21 @@ log_and_print() {
     echo "geomate: $1"
 }
 
+# Returns 0 and warns while an update run holds the lock: the start then repairs nothing.
+# The update restarts the service itself, and a repair would end with 'already running'
+# and leave the service stopped. 1 - the components that are not repaired
+skip_repair_during_update() {
+	update_lock_owner >/dev/null || return 1
+	log_msg -warn "An update is running: not repairing $1 files now."
+}
+
 start_service() {
 	# handle first run after installation or update from older versions
-	if [ "$VERSION" = dev ]; then
+	if [ "$VERSION" = dev ] && ! skip_repair_during_update "$GEOMATE_COMPONENTS"; then
 		log_msg "" "Completing the upgrade of the update mechanism..."
 		update -f || return 1
 		# shellcheck disable=SC1090
-		. "${GEOMATE_SERVICE_PATH}" # source updated init script 
+		. "${GEOMATE_SERVICE_PATH}" # source updated init script
 	fi
 
 	for component in $GEOMATE_COMPONENTS; do
@@ -199,6 +210,7 @@ start_service() {
 			0) ;; # integrity OK
 			1) return 1 ;;
 			2) # missing files
+				skip_repair_during_update "$component" && continue
 				local fix_upd_channel='' fix_version='' force_version=''
 				case "$component" in
 					BACKEND) fix_version="$VERSION" fix_upd_channel="$UPD_CHANNEL" ;;
@@ -218,7 +230,7 @@ start_service() {
     if [ ! -f /etc/config/geomate ]; then
         log_msg -warn "Config file missing, downloading default configuration from repository"
         local config_url="${GEOMATE_GH_RAW_URL_BACKEND_MAIN}/files/etc/config/geomate"
-        if uclient-fetch "$config_url" -O /etc/config/geomate 2>/dev/null; then
+        if uclient-fetch -T 10 "$config_url" -O /etc/config/geomate 2>/dev/null; then
             chmod 644 /etc/config/geomate
             log_msg "Default configuration downloaded successfully"
         else
@@ -759,6 +771,55 @@ cleanup_ips() {
 
 ### Update-related functions
 
+# Prints the PID of the update run that owns the lock; returns 1 when there is none: no lock,
+# no PID in it, or the process is gone, is this process or is no run of this init script
+update_lock_owner() {
+	local pid cmdline
+	read -r pid 2>/dev/null < "$GEOMATE_UPD_LOCK"
+	case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$pid" != "$$" ] || return 1
+	# Each argument ends with a NUL, so the converted cmdline ends with a space
+	cmdline=$(tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline") || return 1
+	case "$cmdline" in
+		*init.d/geomate\ update_start\ *) return 1 ;;
+		*init.d/geomate\ *) printf '%s\n' "$pid" ;;
+		*) return 1 ;;
+	esac
+}
+
+# Takes the lock for this process. Returns 3 while another run is alive, 4 when the lock
+# cannot be created. A lock without a living owner is taken over
+update_lock() {
+	local tmp_lock="${GEOMATE_UPD_LOCK}.$$" pid tries=0
+	[ -z "$UPD_LOCK_HELD" ] || return 0
+	mkdir -p "$GEOMATE_TMP_DIR" && chmod 755 "$GEOMATE_TMP_DIR"
+	UPD_STARTED=$(date +%s)
+	printf '%s\n%s\n' "$$" "$UPD_STARTED" > "$tmp_lock" ||
+		{ error_out "Failed to create lock file '$tmp_lock'."; return 4; }
+	until ln "$tmp_lock" "$GEOMATE_UPD_LOCK" 2>/dev/null; do
+		if pid=$(update_lock_owner); then
+			rm -f "$tmp_lock"
+			error_out "An update is already running (PID $pid)."
+			return 3
+		fi
+		tries=$((tries + 1))
+		[ "$tries" -le 3 ] ||
+			{ rm -f "$tmp_lock"; error_out "Failed to take lock file '$GEOMATE_UPD_LOCK'."; return 4; }
+		rm -f "$GEOMATE_UPD_LOCK"
+	done
+	rm -f "$tmp_lock"
+	UPD_LOCK_HELD=1
+	trap 'update_unlock $?' EXIT
+}
+
+# Releases the lock at the end of a run; also the EXIT trap. $1: exit status of the run
+update_unlock() {
+	[ -n "$UPD_LOCK_HELD" ] || return 0
+	UPD_LOCK_HELD=
+	trap - EXIT
+	rm -f "$GEOMATE_UPD_LOCK"
+}
+
 # 1 - component: <BACKEND|FRONTEND>
 # return codes:
 # 0 - OK
@@ -851,7 +912,7 @@ fetch_geomate_component() {
 	rm -rf "${upd_dir}/${GEOMATE_REPO_AUTHOR}-${repo_name}-"*
 	try_mkdir -p "$upd_dir" || return 1
 
-	uclient-fetch "$fetch_tarball_url" -O "${tarball}" 2> "$ucl_err_file" &&
+	uclient-fetch -T 60 "$fetch_tarball_url" -O "${tarball}" 2> "$ucl_err_file" &&
 	grep -q "Download completed" "$ucl_err_file" &&
 	tar -C "${upd_dir}" -xzf "${tarball}" &&
 	extract_dir="$(find "${upd_dir}/" -type d -name "${GEOMATE_REPO_AUTHOR}-${repo_name}-*")" &&
@@ -999,7 +1060,7 @@ get_gh_ref_data() {
 				gh_ref="$gh_hash"
 			else
 				branches="$(
-					uclient-fetch "${gh_url_api}/branches" -O-  2> "$ref_ucl_err_file" |
+					uclient-fetch -T 10 "${gh_url_api}/branches" -O-  2> "$ref_ucl_err_file" |
 						{ jsonfilter -e '@[@]["name"]'; cat 1>/dev/null; }
 				)"
 				[ -n "$branches" ] || {
@@ -1021,7 +1082,7 @@ get_gh_ref_data() {
 	[ -z "$gh_ref" ] && gh_ref="$(
 		case "$gh_channel" in
 			release)
-				uclient-fetch "${gh_url_api}/releases" -O- 2> "$ref_ucl_err_file" | {
+				uclient-fetch -T 10 "${gh_url_api}/releases" -O- 2> "$ref_ucl_err_file" | {
 					jsonfilter -e '@[@.prerelease=false]' |
 					jsonfilter -a -e "@[@.target_commitish=\"${main_branch}\"].tag_name"
 					cat 1>/dev/null
@@ -1029,7 +1090,7 @@ get_gh_ref_data() {
 			snapshot|branch=*|commit=*)
 				for branch in $branches; do
 					ref_fetch_url="${gh_url_api}/commits?sha=${branch}"
-					uclient-fetch "${ref_fetch_url}" -O- 2> "$ref_ucl_err_file" | {
+					uclient-fetch -T 10 "${ref_fetch_url}" -O- 2> "$ref_ucl_err_file" | {
 						jsonfilter -e '@[@.commit]["url"]' |
 						sed 's/.*\///' # only leave the commit hash
 						cat 1>/dev/null
@@ -1239,8 +1300,11 @@ check_version() {
 # -U <update_channel> : force this update channel (overrides the upd. channel derived from '-v' option)
 # -W <version> : force this version (overrides the version derived from '-v' option)
 # -f : force update
+# -y : install newer versions without the question
 # -i : ignore previous cache results
-update() {
+# Return codes: 0 - done or nothing to do, 1 - error, 3 - another update run is alive,
+# 4 - the lock could not be created
+run_update() {
 	upd_failed() {
 		rm -rf "${GEOMATE_UPD_DIR:-?}"
 		[ -n "$*" ] && error_out "$@"
@@ -1295,10 +1359,17 @@ update() {
 	local file origin new_file_list exec_files sim_path='' req_ver='' ver_type ver_str_arg='' \
 		extract_dir='' dist_dir='' upd_version='' tarball_url='' file_list_query_path \
 		backend_upd_req='' upd_component_arg='' upd_components='' req_upd_components='' \
-		req_upd_channel upd_channel='' def_upd_channel='' force_upd_channel='' force_ver='' force_update=''
+		req_upd_channel upd_channel='' def_upd_channel='' force_upd_channel='' force_ver='' force_update='' \
+		assume_yes=''
 
 	IGNORE_CACHE=
-	while getopts ":s:v:c:U:W:fi" opt; do
+	# global vars, set during the run
+	upd_backup_dir= # backup dir, once a manually modified file was saved there
+	backend_updated= # a backend file was installed or deleted: Geomate restarts
+	rpcd_changed= # an acl.d or rpcd plugin file was installed or deleted: rpcd reloads
+	upd_post_failed= # a step after the installation failed: the run ends with 1
+	upd_repair= # the last run did not complete: this one installs everything again
+	while getopts ":s:v:c:U:W:fiy" opt; do
 		case ${opt} in
 			c) upd_component_arg=$OPTARG ;;
 			s) sim_path=$OPTARG ;;
@@ -1306,6 +1377,7 @@ update() {
 			U) force_upd_channel=$OPTARG force_update=1 ;;
 			W) force_ver=$OPTARG force_update=1 ;;
 			f) force_update=1 ;;
+			y) assume_yes=1 ;;
 			i) IGNORE_CACHE=1 ;; # global var
 			*) unexp_arg "$OPTARG"; return 1
 		esac
@@ -1321,6 +1393,20 @@ update() {
 	esac
 	req_upd_components="${upd_component_arg:-"$GEOMATE_COMPONENTS"}"
 
+	# The marker of a run that died or failed after it began to install makes this run a
+	# repair run: it does not ask, installs every requested component again, and restarts
+	# Geomate and reloads rpcd even when no file changes any more
+	if [ -f "$GEOMATE_UPD_INCOMPLETE" ]; then
+		force_update=1 upd_repair=1
+		case "$req_upd_components" in *BACKEND*) backend_updated=1 ;; esac
+		case "$req_upd_components" in *FRONTEND*) rpcd_changed=1 ;; esac
+	fi
+
+	# A run that asks first takes the lock after the answer, so nobody holds it at the question
+	[ -z "${force_update}${assume_yes}" ] || update_lock || return $?
+	# Logged under the lock: while another run is alive, the marker is its own
+	[ -z "$upd_repair" ] || log_msg -warn "The last update did not complete. Installing again."
+
 	if [ -n "$force_update" ]; then
 		upd_components="$req_upd_components"
 	else
@@ -1329,14 +1415,16 @@ update() {
 			0) return 0 ;;
 			1) return 1 ;;
 			254)
-				print_msg "Updates available. Do you want to update? [y/N] "
-				read -r answer
-				case "$answer" in
-					y|Y) ;;
-					*)
-						print_msg "Update cancelled."
-						return 0
-				esac
+				if [ -z "$assume_yes" ]; then
+					print_msg "Updates available. Do you want to update? [y/N] "
+					read -r answer
+					case "$answer" in
+						y|Y) update_lock || return $? ;;
+						*)
+							print_msg "Update cancelled."
+							return 0
+					esac
+				fi
 		esac
 		for component in $req_upd_components; do
 			eval "[ -n \"\${${component}_upd_avail}\" ]" && upd_components="${upd_components}${component} "
@@ -1497,11 +1585,26 @@ update() {
 
 	log_msg "Geomate components '$upd_components' have been successfully updated."
 
-	if [ -n "$backend_upd_req" ] && "$GEOMATE_SERVICE_PATH" enabled; then
+	if [ -n "$backend_upd_req" ] && [ -n "$backend_updated" ] && "$GEOMATE_SERVICE_PATH" enabled; then
 		log_msg "" "Restarting Geomate."
-    	${GEOMATE_SERVICE_PATH} restart
+    	${GEOMATE_SERVICE_PATH} restart ||
+			{ error_out "Failed to restart Geomate."; upd_post_failed=1; }
 	fi
+	[ -z "$upd_post_failed" ] || return 1
+	# Everything is installed. A repair run of one component leaves the marker for the other
+	case "${upd_repair}:${upd_components}" in
+		:*|*BACKEND*FRONTEND*|*FRONTEND*BACKEND*) rm -f "$GEOMATE_UPD_INCOMPLETE"
+	esac
 	:
+}
+
+# Runs an update (options: see run_update) and releases the lock on every way out of it
+update() {
+	local rv
+	run_update "$@"
+	rv=$?
+	update_unlock "$rv"
+	return "$rv"
 }
 
 # 1 - path to upper distribution dir (containing a dir for each component)
@@ -1512,9 +1615,21 @@ install_geomate_files() {
 		error_out "Failed to install new $component files."
 	}
 
+	# Notes what the installed or deleted file $1 asks for after the installation
+	note_file_change() {
+		[ "$component" = BACKEND ] && backend_updated=1
+		case "$1" in */usr/share/rpcd/acl.d/*|*/usr/libexec/rpcd/*) rpcd_changed=1 ;; esac
+		:
+	}
+
 	local file preinst_path curr_files new_file_list new_file_list exec_files='' \
-		dist_dir main_file_path frontend_updated='' \
+		dist_dir main_file_path \
 		upper_dist_dir="$1" components="$2" version upd_channel
+
+	# From here on files change: until a run ends well, the next run installs again.
+	# printf, because a failed redirection of ':' would end the shell
+	printf '' > "$GEOMATE_UPD_INCOMPLETE" ||
+		{ error_out "Failed to create file '$GEOMATE_UPD_INCOMPLETE'."; return 1; }
 
 	for component in $components; do
 		log_msg "" "Installing new $component files..."
@@ -1588,9 +1703,13 @@ install_geomate_files() {
 				' - "${dist_dir}/new_file_list"
 			)"
 
-			# Detect manually modified files
-			man_changed_files="$(md5sum -c "$curr_reg_file" 2>/dev/null |
-				sed -n "/:\s*FAILED\s*$/{s/\s*:\s*FAILED\s*$//;p;}")"
+			# Detect manually modified files. One that the new version no longer lists has no
+			# new copy: it is deleted as obsolete below
+			man_changed_files="$(
+				md5sum -c "$curr_reg_file" 2>/dev/null |
+				sed -n "/:\s*FAILED\s*$/{s/\s*:\s*FAILED\s*$//;p;}" |
+				awk 'NR == FNR {new[$0]; next} $0 in new {print}' "${dist_dir}/new_file_list" -
+			)"
 
 			# Add manually modified files to changed files
 			if [ -n "$man_changed_files" ]; then
@@ -1606,26 +1725,51 @@ install_geomate_files() {
 			log_msg "File '$file' did not change - not updating."
 		done
 
-		local mod_files_bk_dir="/tmp/geomate_old_modified_files"
+		# Backups keep the full path: both luci-app-geomate.json files share a basename
+		local mod_files_bk_dir="/tmp/geomate_old_modified_files" bk_path
 		for file in $man_changed_files; do
 			[ -n "$file" ] && [ -f "$file" ] || continue
+			# A run that did not complete replaced this file already. Saving it would
+			# overwrite the backup of the modified file with the new version
+			cmp -s "$file" "${dist_dir}${file}" && continue
+			bk_path="${mod_files_bk_dir}${file}"
 			log_msg -warn "File '$file' was manually modified - overwriting."
-			if try_mkdir -p "$mod_files_bk_dir" && cp "$file" "${mod_files_bk_dir}/${file##*/}"; then
-				log_msg "Saved a backup copy of manually modified file to ${mod_files_bk_dir}/${file##*/}"
+			if try_mkdir -p "${bk_path%/*}" && cp "$file" "$bk_path"; then
+				log_msg "Saved a backup copy of manually modified file to $bk_path"
+				upd_backup_dir="$mod_files_bk_dir"
 			else
 				log_msg -warn "Can not create a backup copy of manually modified file '$file' - overwriting anyway."
 			fi
 		done
 
-		# Copy changed files
+		# The main file carries the version: copy it last, so the component counts as
+		# outdated until all of its files are in place
+		case "${_NL_}${changed_files}${_NL_}" in *"${_NL_}${main_file_path}${_NL_}"*)
+			changed_files="$(printf '%s\n' "$changed_files" | grep -vxF "$main_file_path")${_NL_}${main_file_path}"
+		esac
+
+		# Copy changed files, each through a temporary file in the target directory and a
+		# rename: a run that dies in between leaves the old file whole. cp gives its target
+		# the mode of the source cut by the umask, so the mode is set before the rename
+		local tmp_path file_mode
 		for file in $changed_files
 		do
 			preinst_path="${dist_dir}${file}"
+			tmp_path="${file}.gm-new"
+			case "${_NL_}${exec_files}${_NL_}" in
+				*"${_NL_}${file}${_NL_}"*) file_mode=755 ;;
+				*) file_mode=644
+			esac
 
 			log_msg "Copying file '${file}'."
-			try_mkdir -p "${file%/*}" && cp "$preinst_path" "$file" ||
-				{ inst_failed "Failed to copy file '$preinst_path' to '$file'."; return 1; }
-			[ "$component" = FRONTEND ] && frontend_updated=1
+			try_mkdir -p "${file%/*}" && cp "$preinst_path" "$tmp_path" &&
+				chmod "$file_mode" "$tmp_path" && mv -f "$tmp_path" "$file" ||
+				{
+					rm -f "$tmp_path"
+					inst_failed "Failed to copy file '$preinst_path' to '$file'."
+					return 1
+				}
+			note_file_change "$file"
 		done
 
 		# delete obsolete files
@@ -1641,6 +1785,7 @@ install_geomate_files() {
 				*)
 					log_msg "Deleting obsolete file '$file'."
 					rm -f "$file"
+					note_file_change "$file"
 			esac
 		done
 
@@ -1661,8 +1806,15 @@ install_geomate_files() {
 		IFS="$DEFAULT_IFS"
 	done
 
-    # Restart rpcd only if frontend files were updated
-    [ -n "$frontend_updated" ] && /etc/init.d/rpcd restart
+	# rpcd reads acl.d and its plugins when it starts. reload is SIGHUP: rpcd starts again with
+	# the same PID and keeps the LuCI sessions. Never restart it here: a run started through
+	# rpcd can die with it
+	if [ -n "$rpcd_changed" ]; then
+		/etc/init.d/rpcd reload || {
+			error_out "Failed to reload rpcd. Run '/etc/init.d/rpcd restart' and log in to LuCI again."
+			upd_post_failed=1
+		}
+	fi
 	:
 }
 

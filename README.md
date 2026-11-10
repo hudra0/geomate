@@ -757,6 +757,13 @@ Example: If you want to play COD with friends from both Europe and USA:
      - `cat /tmp/geomate/geolocation.lock` shows the PID and the start time (Unix time) of the run in progress. The file is gone when the run has ended
      - If the run hangs, end it with `kill <PID>`. The next run takes over the lock
 
+6. **An Update Is Already Running**
+   - Cause: only one update runs at a time. A second `/etc/init.d/geomate update` prints "Error: An update is already running (PID n)." and exits with 3. It changes nothing. A service start during an update repairs no missing files and logs "An update is running: not repairing … files now."
+   - Solutions:
+     - Wait for the end of the run. `cat /tmp/geomate/update.lock` shows its PID and its start time (Unix time). The file is gone when the run has ended
+     - A lock whose process is gone, for example after the run was killed, needs no cleanup. The next update takes it over
+     - If a run ended after it began to install files, run the update again. It logs "The last update did not complete. Installing again.", installs both components again, restarts Geomate and reloads rpcd
+
 ### Game-Specific Network Analysis
 - Use QoSmate for monitoring game connections
 - Consider Wireshark for detailed packet analysis
@@ -957,7 +964,15 @@ This command will:
 
 Geomate will preserve your existing configuration settings during updates.
 
-After an update of the web interface, log in to LuCI again if a notification on the View tab says "Log in again after an update of the web interface." (see [Known Servers](#known-servers)). The update restarts rpcd, but an open session does not get the new method `getKnownServers` until you log in again. For the same reason **Download List** can say "No permission to read …" and the server panel "Server measurements unavailable. Log in again after an update of the web interface." until you log in again (see [Server details](#server-details)).
+When a newer version is available, the update asks before it installs. With `-y` it installs without the question.
+
+The updater reloads rpcd when it installed a new access list (`acl.d`) or a new `luci.geomate`. Open LuCI sessions stay logged in, keep their unsaved changes and get the new permissions without a new login. An update that changes only the pages or the menu does not touch rpcd. If the reload fails, the update prints "Failed to reload rpcd", goes on and exits with 1: run `/etc/init.d/rpcd restart` and log in to LuCI again.
+
+The first update to this version is still done by the older updater, which restarts rpcd. Log in to LuCI again after it. Until then a notification on the View tab can say "Log in again after an update of the web interface." (see [Known Servers](#known-servers)), **Download List** can say "No permission to read …" and the server panel "Server measurements unavailable. Log in again after an update of the web interface." (see [Server details](#server-details)).
+
+Geomate restarts only when the update installed or removed a backend file. If the restart fails, the update prints "Failed to restart Geomate." and exits with 1.
+
+An update overwrites files that were changed by hand. It first saves each of them under its full path in `/tmp/geomate_old_modified_files`, for example `/tmp/geomate_old_modified_files/etc/geomate.sh`. The folder is in RAM and is gone after a reboot.
 
 #### Advanced Update Options
 
@@ -972,6 +987,7 @@ For more control over the update process, Geomate supports several command-line 
 | `-c COMPONENT` | Update only a specific component (BACKEND or FRONTEND) | `-c BACKEND` |
 | `-v VERSION_OR_CHANNEL` | Specify version or channel in various formats:<br>- Version number: `-v 1.2.0`<br>- Channel selection: `-v release`, `-v snapshot`<br>- Branch selection: `-v branch=dev`<br>- Commit hash: `-v commit=a1b2c3d4` | `-v 1.2.0` |
 | `-f` | Force update even if no newer version is available | `-f` |
+| `-y` | Install newer versions without the question. Like the plain update it installs only components with a newer version, each on its own channel | `-y` |
 | `-i` | Ignore cache results | `-i` |
 | `-U CHANNEL` | Override update channel (takes precedence over `-v`) | `-U snapshot` |
 
